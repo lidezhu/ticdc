@@ -1637,6 +1637,11 @@ jobs:
         run: |
           pwd && ls -l bin/ && ls -l tools/bin/
           export TICDC_NEWARCH=true && make integration_test CASE=multi_source
+      
+      - name: Test multi_source
+        run: |
+          pwd && ls -l bin/ && ls -l tools/bin/
+          export TICDC_NEWARCH=true && make integration_test CASE=multi_source
 
       - name: Upload test logs
         if: always()
