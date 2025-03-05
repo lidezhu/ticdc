@@ -19,6 +19,7 @@ runs:
         mkdir -p ./logs/$CASE
         cat $DIR/stdout.log || true
         tail -n 10 $DIR/cdc.log || true
+        grep "dispatcher not reset" $DIR/cdc.log || true
         sudo cp -r -L $DIR/*.log ./logs/$CASE/ || true
         sudo cp -r -L $DIR/sync_diff ./logs/$CASE/ || true
         sudo chown -R runner ./logs 
