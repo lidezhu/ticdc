@@ -276,7 +276,7 @@ func newDispatcherSession(
 // Control-plane request entry points.
 
 func (s *dispatcherSession) startLocalRegistration() {
-	s.beginRegisterToLocal()
+	s.connState.beginRegisterToLocal()
 	s.sendRegisterRequest(s.localServerID)
 }
 
@@ -310,14 +310,10 @@ func (s *dispatcherSession) sendRegisterRequest(serverID node.ID) {
 // same time.
 func (s *dispatcherSession) beginRegister(serverID node.ID) {
 	if serverID == s.localServerID {
-		s.beginRegisterToLocal()
+		s.connState.beginRegisterToLocal()
 		return
 	}
 	s.connState.beginRegisterToRemote(serverID)
-}
-
-func (s *dispatcherSession) beginRegisterToLocal() {
-	s.connState.beginRegisterToLocal()
 }
 
 // commitReady is used to notify the event service to start sending events.
