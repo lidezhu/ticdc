@@ -187,12 +187,6 @@ func (d *dispatcherConnState) getCurrentEventServiceID() node.ID {
 	return d.currentEventServiceID
 }
 
-func (d *dispatcherConnState) isCurrentEventService(serverID node.ID) bool {
-	d.RLock()
-	defer d.RUnlock()
-	return d.currentEventServiceID == serverID
-}
-
 func (d *dispatcherConnState) isReceivingDataEvent() bool {
 	d.RLock()
 	defer d.RUnlock()
@@ -281,9 +275,18 @@ func newDispatcherSession(
 
 // Control-plane request entry points.
 
-// registerTo records the in-flight register state, then sends the register
-// request to the target event service.
-func (s *dispatcherSession) registerTo(serverID node.ID) {
+func (s *dispatcherSession) startLocalRegistration() {
+	s.beginRegisterToLocal()
+	s.sendRegisterRequest(s.localServerID)
+}
+
+func (s *dispatcherSession) retryCurrentRegistration() {
+	serverID := s.connState.getCurrentEventServiceID()
+	if serverID.IsEmpty() {
+		log.Panic("current event service should not be empty when retrying registration",
+			zap.Stringer("changefeedID", s.target.GetChangefeedID()),
+			zap.Stringer("dispatcher", s.target.GetId()))
+	}
 	s.beginRegister(serverID)
 	s.sendRegisterRequest(serverID)
 }
@@ -307,10 +310,14 @@ func (s *dispatcherSession) sendRegisterRequest(serverID node.ID) {
 // same time.
 func (s *dispatcherSession) beginRegister(serverID node.ID) {
 	if serverID == s.localServerID {
-		s.connState.beginRegisterToLocal()
+		s.beginRegisterToLocal()
 		return
 	}
 	s.connState.beginRegisterToRemote(serverID)
+}
+
+func (s *dispatcherSession) beginRegisterToLocal() {
+	s.connState.beginRegisterToLocal()
 }
 
 // commitReady is used to notify the event service to start sending events.
@@ -530,8 +537,8 @@ func (s *dispatcherSession) newDispatcherRemoveRequest(serverID string) *messagi
 	}
 }
 
-// Auxiliary control-plane entry point used by the log coordinator callback.
-func (s *dispatcherSession) setRemoteCandidates(nodes []string) {
+// startRemoteProbing begins probing reusable remote event services one by one.
+func (s *dispatcherSession) startRemoteProbing(nodes []string) {
 	candidate, ok := s.connState.beginRemoteProbing(nodes)
 	if !ok {
 		return
@@ -547,10 +554,6 @@ func (s *dispatcherSession) setRemoteCandidates(nodes []string) {
 // Read-only session queries.
 func (s *dispatcherSession) getEventServiceID() node.ID {
 	return s.connState.getCurrentEventServiceID()
-}
-
-func (s *dispatcherSession) isCurrentEventService(serverID node.ID) bool {
-	return s.connState.isCurrentEventService(serverID)
 }
 
 func (s *dispatcherSession) isReceivingDataEvent() bool {
