@@ -357,3 +357,63 @@ func TestGroupHeartbeatResetThenHandshake(t *testing.T) {
 	require.Equal(t, uint64(210), heartbeat.DispatcherProgresses[0].CheckpointTs)
 	require.Equal(t, uint64(1), heartbeat.DispatcherProgresses[0].Epoch)
 }
+
+func TestGroupDispatcherReconcileUsesCurrentTargetAndClamp(t *testing.T) {
+	ctx := context.Background()
+	serverInfo := node.NewInfo("127.0.0.1:18300", "")
+	mc := messaging.NewMessageCenter(ctx, serverInfo.ID, config.NewDefaultMessageCenterConfig(serverInfo.AdvertiseAddr), nil)
+	mc.Run(ctx)
+	defer mc.Close()
+	appcontext.SetService(appcontext.MessageCenter, mc)
+
+	c := New(serverInfo.ID)
+
+	dispatcherID := common.NewDispatcherID()
+	mockDisp := &mockEventDispatcher{
+		id:           dispatcherID,
+		tableSpan:    &heartbeatpb.TableSpan{TableID: 1},
+		changefeedID: common.NewChangefeedID4Test("default", "cf"),
+		checkpointTs: 220,
+	}
+	c.AddDispatcher(mockDisp, 1024)
+	stat := c.getDispatcherStatByID(dispatcherID)
+	require.NotNil(t, stat)
+	markSessionReceiving(stat.session, serverInfo.ID)
+	stat.currentEpoch.Store(newDispatcherEpochState(3, 1, 180))
+
+	grouped := c.groupDispatcherReconcile()
+	require.Len(t, grouped, 1)
+	require.Len(t, grouped[serverInfo.ID], 1)
+
+	request := grouped[serverInfo.ID][0]
+	require.Equal(t, eventpb.ActionType_ACTION_TYPE_RESET, request.ActionType)
+	require.Equal(t, uint64(180), request.StartTs)
+	require.Equal(t, uint64(3), request.Epoch)
+	require.Equal(t, uint64(0), request.Generation)
+	require.Equal(t, serverInfo.ID.String(), request.ServerId)
+}
+
+func TestHandleDispatcherHeartbeatResponseIgnoresRemoved(t *testing.T) {
+	localServerID := node.ID("local-server")
+	remoteServerID := node.ID("remote-server")
+	collector := newTestEventCollector(localServerID)
+
+	dispatcherID := common.NewDispatcherID()
+	mockDisp := newMockDispatcher(dispatcherID, 100)
+	mockDisp.generation = 7
+	collector.AddDispatcher(mockDisp, 1024)
+	readDispatcherRequests(t, collector, 1)
+
+	stat := collector.getDispatcherStatByID(dispatcherID)
+	require.NotNil(t, stat)
+	markSessionReceiving(stat.session, remoteServerID)
+
+	response := commonEvent.NewDispatcherHeartbeatResponse()
+	response.Append(commonEvent.NewDispatcherState(dispatcherID, commonEvent.DSStateRemoved, 7))
+	collector.handleDispatcherHeartbeatResponse(&messaging.TargetMessage{
+		From:    remoteServerID,
+		Message: []messaging.IOTypeT{response},
+	})
+
+	requireNoDispatcherRequest(t, collector)
+}

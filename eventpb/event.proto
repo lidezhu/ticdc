@@ -77,6 +77,16 @@ message IntegrityConfig {
 	string CorruptionHandleLevel  = 2;
 }
 
+// DispatcherReconcileRequest is a full owner-scoped snapshot sent from
+// EventCollector to EventService. It is the authoritative desired dispatcher
+// set for one collector session on one EventService target.
+message DispatcherReconcileRequest {
+    uint64 cluster_id = 1;
+    string session_id = 2;
+    uint64 seq = 3;
+    repeated DispatcherRequest dispatchers = 4;
+}
+
 // DispatcherRequest is used to send a dispatcher request to the event service.
 // A request can be a register, remove, reset dispatcher request.
 message DispatcherRequest {

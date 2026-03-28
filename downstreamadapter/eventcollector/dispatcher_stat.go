@@ -564,6 +564,14 @@ func (d *dispatcherStat) getHeartbeatReport() (node.ID, uint64, uint64, uint64, 
 	return eventServiceID, checkpointTs, state.epoch, d.target.GetGeneration(), true
 }
 
+func (d *dispatcherStat) getReconcileRequest() (node.ID, *messaging.DispatcherRequest, bool) {
+	eventServiceID, checkpointTs, epoch, _, ok := d.getHeartbeatReport()
+	if !ok {
+		return "", nil, false
+	}
+	return eventServiceID, d.session.newDispatcherResetRequest(d.eventCollector.getLocalServerID().String(), checkpointTs, epoch), true
+}
+
 func (d *dispatcherStat) getCurrentEventServiceTarget() (node.ID, bool) {
 	eventServiceID := d.currentEventServiceID()
 	if eventServiceID.IsEmpty() {
@@ -612,16 +620,4 @@ func (d *dispatcherStat) handleSignalEvent(event dispatcher.DispatcherEvent) {
 		return
 	}
 	d.session.handleSignalEvent(event)
-}
-
-func (d *dispatcherStat) retryCurrentRegistrationIfRemovedFrom(serverID node.ID, generation uint64) bool {
-	if d.currentEventServiceID() != serverID || !d.matchesTargetGeneration(generation) {
-		return false
-	}
-	log.Info("dispatcher removed in current event service, retry registration",
-		zap.Stringer("changefeedID", d.target.GetChangefeedID()),
-		zap.Stringer("dispatcherID", d.getDispatcherID()),
-		zap.Stringer("eventServiceID", serverID))
-	d.session.retryCurrentRegistration()
-	return true
 }

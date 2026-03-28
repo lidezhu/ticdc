@@ -76,6 +76,9 @@ type eventBroker struct {
 
 	// dispatcherID -> dispatcherStat map, track all table trigger dispatchers.
 	tableTriggerDispatchers sync.Map
+	// ownerSessions tracks the latest reconcile session/sequence observed from
+	// each EventCollector owner server.
+	ownerSessions map[node.ID]*ownerSessionState
 
 	// taskChan is used to send the scan tasks to the scan workers.
 	taskChan []chan scanTask
@@ -94,6 +97,11 @@ type eventBroker struct {
 
 	scanRateLimiter  *rate.Limiter
 	scanLimitInBytes uint64
+}
+
+type ownerSessionState struct {
+	sessionID string
+	lastSeq   uint64
 }
 
 func newEventBroker(
@@ -133,6 +141,7 @@ func newEventBroker(
 		changefeedMap:           sync.Map{},
 		dispatchers:             sync.Map{},
 		tableTriggerDispatchers: sync.Map{},
+		ownerSessions:           make(map[node.ID]*ownerSessionState),
 		msgSender:               mc,
 		taskChan:                make([]chan scanTask, scanWorkerCount),
 		messageCh:               make([]chan *wrapEvent, sendMessageWorkerCount),
@@ -799,6 +808,125 @@ func generationMatches(current, incoming uint64) bool {
 	return compareGeneration(current, incoming) == 0
 }
 
+type ownedDispatcher struct {
+	stat    *dispatcherStat
+	statPtr interface{}
+}
+
+func (c *eventBroker) shouldApplyReconcile(owner node.ID, sessionID string, seq uint64) bool {
+	current, ok := c.ownerSessions[owner]
+	if !ok || current.sessionID != sessionID {
+		c.ownerSessions[owner] = &ownerSessionState{
+			sessionID: sessionID,
+			lastSeq:   seq,
+		}
+		return true
+	}
+	if seq <= current.lastSeq {
+		return false
+	}
+	current.lastSeq = seq
+	return true
+}
+
+func (c *eventBroker) collectOwnerDispatchers(owner node.ID) map[common.DispatcherID]ownedDispatcher {
+	res := make(map[common.DispatcherID]ownedDispatcher)
+	collect := func(statMap *sync.Map) {
+		statMap.Range(func(key, value interface{}) bool {
+			statPtr := value.(*atomic.Pointer[dispatcherStat])
+			stat := statPtr.Load()
+			if node.ID(stat.info.GetServerID()) != owner {
+				return true
+			}
+			res[stat.id] = ownedDispatcher{
+				stat:    stat,
+				statPtr: statPtr,
+			}
+			return true
+		})
+	}
+	collect(&c.dispatchers)
+	collect(&c.tableTriggerDispatchers)
+	return res
+}
+
+func (c *eventBroker) reconcileDispatchers(owner node.ID, request *messaging.DispatcherReconcileRequest) {
+	if request == nil {
+		return
+	}
+	if !c.shouldApplyReconcile(owner, request.GetSessionID(), request.GetSeq()) {
+		log.Info("ignore stale dispatcher reconcile request",
+			zap.Stringer("owner", owner),
+			zap.String("sessionID", request.GetSessionID()),
+			zap.Uint64("seq", request.GetSeq()))
+		return
+	}
+
+	desired := make(map[common.DispatcherID]DispatcherInfo, len(request.Dispatchers))
+	for _, dispatcher := range request.GetDispatchers() {
+		if dispatcher.GetServerID() != "" && node.ID(dispatcher.GetServerID()) != owner {
+			log.Warn("ignore dispatcher reconcile entry from mismatched owner",
+				zap.Stringer("owner", owner),
+				zap.String("entryOwner", dispatcher.GetServerID()),
+				zap.Stringer("dispatcherID", dispatcher.GetID()))
+			continue
+		}
+		desired[dispatcher.GetID()] = dispatcher
+	}
+
+	actual := c.collectOwnerDispatchers(owner)
+	for dispatcherID, existing := range actual {
+		info, ok := desired[dispatcherID]
+		if !ok {
+			log.Info("remove dispatcher not present in reconcile request",
+				zap.Stringer("owner", owner),
+				zap.Stringer("dispatcherID", dispatcherID))
+			c.removeDispatcherInternal(existing.stat, existing.statPtr)
+			continue
+		}
+
+		switch compareGeneration(existing.stat.generation, info.GetGeneration()) {
+		case -1:
+			// Reconcile snapshot is stale for this dispatcher, keep the newer local state.
+			continue
+		case 1:
+			existing.stat.isRemoved.Store(true)
+			c.removeDispatcherInternal(existing.stat, existing.statPtr)
+			if err := c.addDispatcher(info); err != nil {
+				log.Warn("reconcile add dispatcher failed",
+					zap.Stringer("owner", owner),
+					zap.Stringer("dispatcherID", dispatcherID),
+					zap.Error(err))
+			}
+			continue
+		}
+
+		if existing.stat.epoch > info.GetEpoch() {
+			continue
+		}
+		if existing.stat.epoch < info.GetEpoch() {
+			if err := c.resetDispatcher(info); err != nil {
+				log.Warn("reconcile reset dispatcher failed",
+					zap.Stringer("owner", owner),
+					zap.Stringer("dispatcherID", dispatcherID),
+					zap.Error(err))
+			}
+		}
+	}
+
+	for dispatcherID, info := range desired {
+		if _, ok := actual[dispatcherID]; ok {
+			continue
+		}
+		if err := c.addDispatcher(info); err != nil {
+			log.Warn("reconcile create dispatcher failed",
+				zap.Stringer("owner", owner),
+				zap.Stringer("dispatcherID", dispatcherID),
+				zap.Error(err))
+		}
+	}
+}
+
 func (c *eventBroker) runSendMessageWorker(ctx context.Context, workerIndex int, topic string) error {
 	ticker := time.NewTicker(defaultFlushResolvedTsInterval)
 	defer ticker.Stop()
@@ -921,41 +1049,19 @@ func (c *eventBroker) sendMsg(ctx context.Context, tMsg *messaging.TargetMessage
 func (c *eventBroker) reportDispatcherStatToStore(ctx context.Context, tickInterval time.Duration) error {
 	ticker := time.NewTicker(tickInterval)
 	log.Info("update dispatcher send ts goroutine is started")
-	isInactiveDispatcher := func(d *dispatcherStat) bool {
-		return d.isHandshaked() && time.Since(time.Unix(d.lastReceivedHeartbeatTime.Load(), 0)) > heartbeatTimeout
-	}
 	for {
 		select {
 		case <-ctx.Done():
 			return context.Cause(ctx)
 		case <-ticker.C:
-			inActiveDispatchers := make([]*dispatcherStat, 0)
 			c.dispatchers.Range(func(key, value interface{}) bool {
 				dispatcher := value.(*atomic.Pointer[dispatcherStat]).Load()
 				checkpointTs := dispatcher.checkpointTs.Load()
 				if checkpointTs > 0 && checkpointTs < dispatcher.sentResolvedTs.Load() {
 					c.eventStore.UpdateDispatcherCheckpointTs(dispatcher.id, checkpointTs)
 				}
-				if isInactiveDispatcher(dispatcher) {
-					inActiveDispatchers = append(inActiveDispatchers, dispatcher)
-				}
 				return true
 			})
-
-			c.tableTriggerDispatchers.Range(func(key, value interface{}) bool {
-				dispatcher := value.(*atomic.Pointer[dispatcherStat]).Load()
-				if isInactiveDispatcher(dispatcher) {
-					inActiveDispatchers = append(inActiveDispatchers, dispatcher)
-				}
-				return true
-			})
-
-			for _, d := range inActiveDispatchers {
-				log.Warn("remove in-active dispatcher",
-					zap.Stringer("changefeedID", d.changefeedStat.changefeedID),
-					zap.Stringer("dispatcherID", d.id), zap.Time("lastReceivedHeartbeatTime", time.Unix(d.lastReceivedHeartbeatTime.Load(), 0)))
-				c.removeDispatcher(d.info)
-			}
 		}
 	}
 }

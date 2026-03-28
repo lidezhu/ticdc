@@ -21,6 +21,7 @@ import (
 
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/downstreamadapter/dispatcher"
+	"github.com/pingcap/ticdc/eventpb"
 	"github.com/pingcap/ticdc/pkg/common"
 	appcontext "github.com/pingcap/ticdc/pkg/common/context"
 	"github.com/pingcap/ticdc/pkg/common/event"
@@ -29,6 +30,7 @@ import (
 	"github.com/pingcap/ticdc/pkg/messaging"
 	"github.com/pingcap/ticdc/pkg/metrics"
 	"github.com/pingcap/ticdc/pkg/node"
+	"github.com/pingcap/ticdc/pkg/uuid"
 	"github.com/pingcap/ticdc/utils/chann"
 	"github.com/pingcap/ticdc/utils/dynstream"
 	"github.com/prometheus/client_golang/prometheus"
@@ -112,8 +114,10 @@ EventCollector is an instance-level component.
 */
 type EventCollector struct {
 	serverId      node.ID
+	reconcileSID  string
 	dispatcherMap sync.Map // key: dispatcherID, value: dispatcherStat
 	changefeedMap sync.Map // key: changefeedID.GID, value: *changefeedStat
+	reconcileSeq  atomic.Uint64
 
 	mc messaging.MessageCenter
 
@@ -157,6 +161,7 @@ func New(serverId node.ID) *EventCollector {
 	}
 	eventCollector := &EventCollector{
 		serverId:                             serverId,
+		reconcileSID:                         uuid.NewGenerator().NewString(),
 		dispatcherMap:                        sync.Map{},
 		dispatcherMessageChan:                chann.NewAutoDrainChann[DispatcherMessage](),
 		mc:                                   appcontext.GetService[messaging.MessageCenter](appcontext.MessageCenter),
@@ -348,6 +353,8 @@ func isRepeatedMsgType(msg *messaging.TargetMessage) bool {
 	switch msg.Message[0].(type) {
 	case *event.DispatcherHeartbeat:
 		return true
+	case *messaging.DispatcherReconcileRequest:
+		return true
 	default:
 		return false
 	}
@@ -390,6 +397,7 @@ func (c *EventCollector) sendEventServiceHeartbeats(ctx context.Context) error {
 			return context.Cause(ctx)
 		case <-ticker.C:
 			c.sendDispatcherHeartbeat()
+			c.sendDispatcherReconcile()
 		}
 	}
 }
@@ -398,6 +406,33 @@ func (c *EventCollector) sendDispatcherHeartbeat() {
 	groupedHeartbeats := c.groupHeartbeat()
 	for serverID, heartbeat := range groupedHeartbeats {
 		msg := messaging.NewSingleTargetMessage(serverID, messaging.EventServiceTopic, heartbeat)
+		c.enqueueMessageForSend(msg)
+	}
+}
+
+func (c *EventCollector) sendDispatcherReconcile() {
+	groupedRequests := c.groupDispatcherReconcile()
+	if len(groupedRequests) == 0 {
+		return
+	}
+	seq := c.reconcileSeq.Add(1)
+	for serverID, requests := range groupedRequests {
+		clusterID := uint64(0)
+		if len(requests) > 0 {
+			clusterID = requests[0].ClusterId
+		}
+		msg := messaging.NewSingleTargetMessage(
+			serverID,
+			messaging.EventServiceTopic,
+			&messaging.DispatcherReconcileRequest{
+				DispatcherReconcileRequest: &eventpb.DispatcherReconcileRequest{
+					ClusterId:   clusterID,
+					SessionId:   c.reconcileSID,
+					Seq:         seq,
+					Dispatchers: requests,
+				},
+			},
+		)
 		c.enqueueMessageForSend(msg)
 	}
 }
@@ -431,6 +466,20 @@ func (c *EventCollector) groupHeartbeat() map[node.ID]*event.DispatcherHeartbeat
 	})
 
 	return groupedHeartbeats
+}
+
+func (c *EventCollector) groupDispatcherReconcile() map[node.ID][]*eventpb.DispatcherRequest {
+	grouped := make(map[node.ID][]*eventpb.DispatcherRequest)
+	c.dispatcherMap.Range(func(_, value interface{}) bool {
+		stat := value.(*dispatcherStat)
+		serverID, request, ok := stat.getReconcileRequest()
+		if !ok {
+			return true
+		}
+		grouped[serverID] = append(grouped[serverID], request.DispatcherRequest)
+		return true
+	})
+	return grouped
 }
 
 func (c *EventCollector) processDSFeedback(ctx context.Context) error {
@@ -499,14 +548,11 @@ func (c *EventCollector) handleDispatcherHeartbeatResponse(targetMessage *messag
 
 	response := targetMessage.Message[0].(*event.DispatcherHeartbeatResponse)
 	for _, ds := range response.DispatcherStates {
-		// This means that the dispatcher is removed in the event service we have to reset it.
 		if ds.State == event.DSStateRemoved {
-			v, ok := c.dispatcherMap.Load(ds.DispatcherID)
-			if !ok {
-				continue
-			}
-			stat := v.(*dispatcherStat)
-			stat.retryCurrentRegistrationIfRemovedFrom(targetMessage.From, ds.Generation)
+			log.Warn("event service reported dispatcher removed, ignore and wait for reconcile",
+				zap.Stringer("dispatcherID", ds.DispatcherID),
+				zap.Stringer("eventServiceID", targetMessage.From),
+				zap.Uint64("generation", ds.Generation))
 		}
 	}
 }

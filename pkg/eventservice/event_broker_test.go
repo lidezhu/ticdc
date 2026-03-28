@@ -59,6 +59,46 @@ type notifyMsg struct {
 	latestCommitTs uint64
 }
 
+func newReconcileRequest(sessionID string, seq uint64, infos ...*mockDispatcherInfo) *messaging.DispatcherReconcileRequest {
+	dispatchers := make([]*eventpb.DispatcherRequest, 0, len(infos))
+	clusterID := uint64(0)
+	for _, info := range infos {
+		clusterID = info.clusterID
+		dispatchers = append(dispatchers, &eventpb.DispatcherRequest{
+			ClusterId:    info.clusterID,
+			ChangefeedId: info.changefeedID.ToPB(),
+			DispatcherId: info.id.ToPB(),
+			TableSpan:    info.span,
+			StartTs:      info.startTs,
+			ServerId:     info.serverID,
+			ActionType:   info.actionType,
+			FilterConfig: &eventpb.FilterConfig{
+				FilterConfig: &eventpb.InnerFilterConfig{
+					Rules: []string{"*.*"},
+				},
+			},
+			EnableSyncPoint:      info.enableSyncPoint,
+			SyncPointTs:          info.nextSyncPoint,
+			SyncPointInterval:    uint64(info.syncPointInterval.Seconds()),
+			BdrMode:              info.bdrMode,
+			Timezone:             info.tz.String(),
+			Epoch:                info.epoch,
+			Mode:                 info.mode,
+			Generation:           info.generation,
+			OutputRawChangeEvent: info.IsOutputRawChangeEvent(),
+			TxnAtomicity:         string(info.GetTxnAtomicity()),
+		})
+	}
+	return &messaging.DispatcherReconcileRequest{
+		DispatcherReconcileRequest: &eventpb.DispatcherReconcileRequest{
+			ClusterId:   clusterID,
+			SessionId:   sessionID,
+			Seq:         seq,
+			Dispatchers: dispatchers,
+		},
+	}
+}
+
 func TestCheckNeedScan(t *testing.T) {
 	broker, _, _, _ := newEventBrokerForTest()
 	// Close the broker, so we can catch all message in the test.
@@ -621,7 +661,7 @@ func TestHandleResolvedTs(t *testing.T) {
 	require.Equal(t, msg.Type, messaging.TypeBatchResolvedTs)
 }
 
-func TestHandleDispatcherHeartbeat_InactiveDispatcherCleanup(t *testing.T) {
+func TestReportDispatcherStatToStoreDoesNotRemoveInactiveDispatcher(t *testing.T) {
 	broker, _, _, outputCh := newEventBrokerForTest()
 	defer broker.close()
 
@@ -660,56 +700,97 @@ func TestHandleDispatcherHeartbeat_InactiveDispatcherCleanup(t *testing.T) {
 	require.GreaterOrEqual(t, dispatcher.checkpointTs.Load(), uint64(100))
 	require.Greater(t, dispatcher.lastReceivedHeartbeatTime.Load(), int64(0))
 
-	// Now Set this dispatcher lastReceivedHeartbeatTime to a time in the past
-	// it should be considered as inactive and removed
-	dispatcher.lastReceivedHeartbeatTime.Store(time.Now().Add(-heartbeatTimeout * 2).Unix())
+	// Set the heartbeat time to the past. This should no longer trigger
+	// dispatcher removal; stale lifecycle is handled by reconcile.
+	dispatcher.lastReceivedHeartbeatTime.Store(time.Now().Add(-2 * time.Hour).Unix())
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	go broker.reportDispatcherStatToStore(ctx, time.Millisecond)
 	time.Sleep(100 * time.Millisecond)
+	require.NotNil(t, broker.getDispatcher(dispInfo.GetID()))
+	require.Empty(t, outputCh)
+}
 
-	// Create a heartbeat for the now-removed (inactive) dispatcher
-	heartbeatForInactiveDispatcher := &DispatcherHeartBeatWithServerID{
-		serverID: "test-server-1",
-		heartbeat: &event.DispatcherHeartbeat{
-			Version:         event.DispatcherHeartbeatVersion1,
-			ClusterID:       0,
-			DispatcherCount: 1,
-			DispatcherProgressesLegacy: []event.DispatcherProgressLegacy{
-				{
-					DispatcherID: dispInfo.GetID(), // Same dispatcher ID but it's removed
-					CheckpointTs: 200,
-				},
-			},
-		},
-	}
+func TestReconcileRemovesStaleDispatcher(t *testing.T) {
+	broker, _, _, _ := newEventBrokerForTest()
+	defer broker.close()
 
-	// Mock the message center to capture the response
-	// Handle heartbeat for the removed dispatcher
-	// This should generate a response indicating the dispatcher should be removed
-	broker.handleDispatcherHeartbeat(heartbeatForInactiveDispatcher)
+	info := newMockDispatcherInfoForTest(t)
+	info.serverID = "owner-1"
+	info.generation = 3
+	info.epoch = 2
+	require.NoError(t, broker.addDispatcher(info))
+	require.NotNil(t, broker.getDispatcher(info.GetID()))
 
-	// Verify dispatcher is removed
-	removedDispatcher := broker.getDispatcher(dispInfo.GetID())
-	require.Nil(t, removedDispatcher)
+	broker.reconcileDispatchers(node.ID(info.serverID), newReconcileRequest("session-1", 1))
+	require.Nil(t, broker.getDispatcher(info.GetID()))
+}
 
-	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	// Verify that a response was sent indicating the dispatcher is removed
-	select {
-	case msg := <-outputCh:
-		require.Equal(t, messaging.TypeDispatcherHeartbeatResponse, msg.Type)
-		// The response should contain a dispatcher state indicating removal
-		require.Len(t, msg.Message, 1)
-		response := msg.Message[0].(*event.DispatcherHeartbeatResponse)
-		require.NotNil(t, response)
-		states := response.DispatcherStates
-		require.Len(t, states, 1)
-		require.Equal(t, dispInfo.GetID(), states[0].DispatcherID)
-		require.Equal(t, event.DSStateRemoved, states[0].State)
-	case <-ctx.Done():
-		require.Fail(t, "Expected to receive a dispatcher heartbeat response")
-	}
+func TestReconcileCreatesMissingDispatcher(t *testing.T) {
+	broker, _, _, _ := newEventBrokerForTest()
+	defer broker.close()
+
+	info := newMockDispatcherInfoForTest(t)
+	info.serverID = "owner-1"
+	info.startTs = 180
+	info.epoch = 4
+	info.generation = 5
+	info.actionType = eventpb.ActionType_ACTION_TYPE_RESET
+
+	broker.reconcileDispatchers(node.ID(info.serverID), newReconcileRequest("session-1", 1, info))
+
+	statPtr := broker.getDispatcher(info.GetID())
+	require.NotNil(t, statPtr)
+	stat := statPtr.Load()
+	require.Equal(t, info.startTs, stat.startTs)
+	require.Equal(t, info.epoch, stat.epoch)
+	require.Equal(t, info.generation, stat.generation)
+}
+
+func TestReconcileIgnoresStaleSeq(t *testing.T) {
+	broker, _, _, _ := newEventBrokerForTest()
+	defer broker.close()
+
+	info := newMockDispatcherInfoForTest(t)
+	info.serverID = "owner-1"
+	info.epoch = 2
+	info.generation = 3
+	require.NoError(t, broker.addDispatcher(info))
+
+	broker.reconcileDispatchers(node.ID(info.serverID), newReconcileRequest("session-1", 2, info))
+	broker.reconcileDispatchers(node.ID(info.serverID), newReconcileRequest("session-1", 1))
+
+	require.NotNil(t, broker.getDispatcher(info.GetID()))
+}
+
+func TestReconcileNewSessionReplacesOldSessionState(t *testing.T) {
+	broker, _, _, _ := newEventBrokerForTest()
+	defer broker.close()
+
+	info := newMockDispatcherInfoForTest(t)
+	info.serverID = "owner-1"
+	info.epoch = 2
+	info.generation = 3
+	require.NoError(t, broker.addDispatcher(info))
+
+	broker.reconcileDispatchers(node.ID(info.serverID), newReconcileRequest("session-1", 2, info))
+	broker.reconcileDispatchers(node.ID(info.serverID), newReconcileRequest("session-2", 1))
+
+	require.Nil(t, broker.getDispatcher(info.GetID()))
+}
+
+func TestReconcileIgnoresMismatchedOwnerEntry(t *testing.T) {
+	broker, _, _, _ := newEventBrokerForTest()
+	defer broker.close()
+
+	info := newMockDispatcherInfoForTest(t)
+	info.serverID = "owner-2"
+	info.epoch = 2
+	info.generation = 3
+
+	broker.reconcileDispatchers(node.ID("owner-1"), newReconcileRequest("session-1", 1, info))
+
+	require.Nil(t, broker.getDispatcher(info.GetID()))
 }
 
 func TestHandleDispatcherHeartbeatEpochFilter(t *testing.T) {

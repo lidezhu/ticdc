@@ -68,29 +68,37 @@ type DispatcherHeartBeatWithServerID struct {
 	heartbeat *event.DispatcherHeartbeat
 }
 
+type DispatcherReconcileWithServerID struct {
+	serverID  string
+	reconcile *messaging.DispatcherReconcileRequest
+}
+
 // EventService accepts the requests of pulling events.
 // The EventService is a singleton in the system.
 type eventService struct {
 	mc          messaging.MessageCenter
 	eventStore  eventstore.EventStore
 	schemaStore schemastore.SchemaStore
+	runCtx      context.Context
 	// clusterID -> eventBroker
 	brokers map[uint64]*eventBroker
 
 	// TODO: use a better way to cache the acceptorInfos
-	dispatcherInfoChan  chan DispatcherInfo
-	dispatcherHeartbeat chan *DispatcherHeartBeatWithServerID
+	dispatcherInfoChan      chan DispatcherInfo
+	dispatcherHeartbeat     chan *DispatcherHeartBeatWithServerID
+	dispatcherReconcileChan chan *DispatcherReconcileWithServerID
 }
 
 func New(eventStore eventstore.EventStore, schemaStore schemastore.SchemaStore) common.SubModule {
 	mc := appcontext.GetService[messaging.MessageCenter](appcontext.MessageCenter)
 	es := &eventService{
-		mc:                  mc,
-		eventStore:          eventStore,
-		schemaStore:         schemaStore,
-		brokers:             make(map[uint64]*eventBroker),
-		dispatcherInfoChan:  make(chan DispatcherInfo, 32),
-		dispatcherHeartbeat: make(chan *DispatcherHeartBeatWithServerID, 32),
+		mc:                      mc,
+		eventStore:              eventStore,
+		schemaStore:             schemaStore,
+		brokers:                 make(map[uint64]*eventBroker),
+		dispatcherInfoChan:      make(chan DispatcherInfo, 32),
+		dispatcherHeartbeat:     make(chan *DispatcherHeartBeatWithServerID, 32),
+		dispatcherReconcileChan: make(chan *DispatcherReconcileWithServerID, 32),
 	}
 	es.mc.RegisterHandler(messaging.EventServiceTopic, es.handleMessage)
 	return es
@@ -105,11 +113,13 @@ func (s *eventService) Run(ctx context.Context) error {
 	defer func() {
 		log.Info("event service exited")
 	}()
+	s.runCtx = ctx
 
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	dispatcherChanSize := metrics.EventServiceChannelSizeGauge.WithLabelValues("dispatcherInfo")
 	heartbeatChanSize := metrics.EventServiceChannelSizeGauge.WithLabelValues("heartbeat")
+	reconcileChanSize := metrics.EventServiceChannelSizeGauge.WithLabelValues("reconcile")
 	for {
 		select {
 		case <-ctx.Done():
@@ -117,6 +127,7 @@ func (s *eventService) Run(ctx context.Context) error {
 		case <-ticker.C:
 			dispatcherChanSize.Set(float64(len(s.dispatcherInfoChan)))
 			heartbeatChanSize.Set(float64(len(s.dispatcherHeartbeat)))
+			reconcileChanSize.Set(float64(len(s.dispatcherReconcileChan)))
 		case info := <-s.dispatcherInfoChan:
 			switch info.GetActionType() {
 			case eventpb.ActionType_ACTION_TYPE_REGISTER:
@@ -130,6 +141,8 @@ func (s *eventService) Run(ctx context.Context) error {
 			}
 		case heartbeat := <-s.dispatcherHeartbeat:
 			s.handleDispatcherHeartbeat(heartbeat)
+		case reconcile := <-s.dispatcherReconcileChan:
+			s.handleDispatcherReconcile(reconcile)
 		}
 	}
 }
@@ -165,6 +178,19 @@ func (s *eventService) handleMessage(ctx context.Context, msg *messaging.TargetM
 		case s.dispatcherHeartbeat <- &DispatcherHeartBeatWithServerID{
 			serverID:  msg.From.String(),
 			heartbeat: heartbeat,
+		}:
+		}
+	case messaging.TypeDispatcherReconcileRequest:
+		if len(msg.Message) != 1 {
+			log.Warn("invalid dispatcher reconcile request, ignore it", zap.Any("msg", msg))
+		}
+		reconcile := msg.Message[0].(*messaging.DispatcherReconcileRequest)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case s.dispatcherReconcileChan <- &DispatcherReconcileWithServerID{
+			serverID:  msg.From.String(),
+			reconcile: reconcile,
 		}:
 		}
 	case messaging.TypeCongestionControl:
@@ -220,6 +246,25 @@ func (s *eventService) handleDispatcherHeartbeat(heartbeat *DispatcherHeartBeatW
 		return
 	}
 	c.handleDispatcherHeartbeat(heartbeat)
+}
+
+func (s *eventService) handleDispatcherReconcile(reconcile *DispatcherReconcileWithServerID) {
+	clusterID := reconcile.reconcile.GetClusterID()
+	c, ok := s.brokers[clusterID]
+	if !ok {
+		dispatchers := reconcile.reconcile.GetDispatchers()
+		if len(dispatchers) == 0 {
+			return
+		}
+		first := dispatchers[0]
+		brokerCtx := s.runCtx
+		if brokerCtx == nil {
+			brokerCtx = context.Background()
+		}
+		c = newEventBroker(brokerCtx, clusterID, s.eventStore, s.schemaStore, s.mc, first.GetTimezone(), first.GetIntegrity())
+		s.brokers[clusterID] = c
+	}
+	c.reconcileDispatchers(node.ID(reconcile.serverID), reconcile.reconcile)
 }
 
 func (s *eventService) handleCongestionControl(from node.ID, m *event.CongestionControl) {

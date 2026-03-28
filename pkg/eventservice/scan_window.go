@@ -76,9 +76,8 @@ const (
 	// hasn't sent heartbeat updates. This prevents stale dispatchers (for example,
 	// after frequent table truncate) from blocking scan window advancement for the
 	// whole changefeed.
-	//
-	// Note: This is intentionally much smaller than heartbeatTimeout, which is
-	// used for actual dispatcher removal.
+	// This only affects scan window base-ts calculation; dispatcher lifecycle is
+	// reconciled by EventCollector rather than heartbeat timeout.
 	scanWindowStaleDispatcherHeartbeatThreshold = 1 * time.Minute
 )
 

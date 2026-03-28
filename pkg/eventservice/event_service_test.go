@@ -157,6 +157,39 @@ func TestEventServiceBasic(t *testing.T) {
 	}
 }
 
+func TestHandleDispatcherReconcileCreatesBroker(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mockStore := newMockEventStore(100)
+	_ = mockStore.Run(ctx)
+
+	mc := messaging.NewMockMessageCenter()
+	esImpl := startEventService(ctx, t, mc, mockStore)
+	defer func() { _ = esImpl.Close(ctx) }()
+
+	dispatcherInfo := newMockDispatcherInfo(t, 200, common.NewDispatcherID(), 1, eventpb.ActionType_ACTION_TYPE_RESET)
+	dispatcherInfo.serverID = "owner-1"
+	dispatcherInfo.epoch = 3
+	dispatcherInfo.generation = 5
+	dispatcherInfo.txnAtomicity = config.AtomicityLevel("table")
+
+	esImpl.handleDispatcherReconcile(&DispatcherReconcileWithServerID{
+		serverID:  dispatcherInfo.serverID,
+		reconcile: newReconcileRequest("session-1", 1, dispatcherInfo),
+	})
+
+	broker := esImpl.brokers[dispatcherInfo.GetClusterID()]
+	require.NotNil(t, broker)
+	statPtr := broker.getDispatcher(dispatcherInfo.GetID())
+	require.NotNil(t, statPtr)
+	stat := statPtr.Load()
+	require.Equal(t, dispatcherInfo.startTs, stat.startTs)
+	require.Equal(t, dispatcherInfo.epoch, stat.epoch)
+	require.Equal(t, dispatcherInfo.generation, stat.generation)
+	require.Equal(t, dispatcherInfo.txnAtomicity, stat.txnAtomicity)
+}
+
 var _ eventstore.EventStore = &mockEventStore{}
 
 // mockEventStore is a mock implementation of the EventStore interface
@@ -396,6 +429,7 @@ type mockDispatcherInfo struct {
 	mode              int64
 	epoch             uint64
 	generation        uint64
+	txnAtomicity      config.AtomicityLevel
 	enableSyncPoint   bool
 	nextSyncPoint     uint64
 	syncPointInterval time.Duration
@@ -512,6 +546,9 @@ func (m *mockDispatcherInfo) IsOutputRawChangeEvent() bool {
 }
 
 func (m *mockDispatcherInfo) GetTxnAtomicity() config.AtomicityLevel {
+	if m.txnAtomicity != "" {
+		return m.txnAtomicity
+	}
 	return config.DefaultAtomicityLevel()
 }
 

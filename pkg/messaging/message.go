@@ -104,6 +104,7 @@ const (
 	TypeRedoResolvedTsForwardMessage       IOType = 39
 	TypeDispatcherSetChecksumUpdateRequest IOType = 40
 	TypeDispatcherSetChecksumAckResponse   IOType = 41
+	TypeDispatcherReconcileRequest         IOType = 42
 )
 
 func (t IOType) String() string {
@@ -182,6 +183,8 @@ func (t IOType) String() string {
 		return "DispatcherSetChecksumUpdateRequest"
 	case TypeDispatcherSetChecksumAckResponse:
 		return "DispatcherSetChecksumAckResponse"
+	case TypeDispatcherReconcileRequest:
+		return "DispatcherReconcileRequest"
 	case TypeDispatcherHeartbeatResponse:
 		return "DispatcherHeartbeatResponse"
 	case TypeCongestionControl:
@@ -303,6 +306,38 @@ func (r DispatcherRequest) GetTxnAtomicity() config.AtomicityLevel {
 	return config.AtomicityLevel(r.TxnAtomicity)
 }
 
+type DispatcherReconcileRequest struct {
+	*eventpb.DispatcherReconcileRequest
+}
+
+func (r DispatcherReconcileRequest) Marshal() ([]byte, error) {
+	return r.DispatcherReconcileRequest.Marshal()
+}
+
+func (r DispatcherReconcileRequest) Unmarshal(data []byte) error {
+	return r.DispatcherReconcileRequest.Unmarshal(data)
+}
+
+func (r DispatcherReconcileRequest) GetClusterID() uint64 {
+	return r.ClusterId
+}
+
+func (r DispatcherReconcileRequest) GetSessionID() string {
+	return r.SessionId
+}
+
+func (r DispatcherReconcileRequest) GetSeq() uint64 {
+	return r.Seq
+}
+
+func (r DispatcherReconcileRequest) GetDispatchers() []DispatcherRequest {
+	res := make([]DispatcherRequest, 0, len(r.Dispatchers))
+	for _, dispatcher := range r.Dispatchers {
+		res = append(res, DispatcherRequest{DispatcherRequest: dispatcher})
+	}
+	return res
+}
+
 type IOTypeT interface {
 	Unmarshal(data []byte) error
 	Marshal() (data []byte, err error)
@@ -354,6 +389,10 @@ func decodeIOType(ioType IOType, value []byte) (IOTypeT, error) {
 	case TypeDispatcherRequest:
 		m = &DispatcherRequest{
 			DispatcherRequest: &eventpb.DispatcherRequest{},
+		}
+	case TypeDispatcherReconcileRequest:
+		m = &DispatcherReconcileRequest{
+			DispatcherReconcileRequest: &eventpb.DispatcherReconcileRequest{},
 		}
 	case TypeMaintainerBootstrapResponse:
 		m = &heartbeatpb.MaintainerBootstrapResponse{}
@@ -469,6 +508,8 @@ func NewSingleTargetMessage(To node.ID, Topic string, Message IOTypeT, Group ...
 		ioType = TypeCoordinatorBootstrapResponse
 	case *DispatcherRequest:
 		ioType = TypeDispatcherRequest
+	case *DispatcherReconcileRequest:
+		ioType = TypeDispatcherReconcileRequest
 	case *heartbeatpb.MaintainerBootstrapResponse:
 		ioType = TypeMaintainerBootstrapResponse
 	case *heartbeatpb.MaintainerPostBootstrapRequest:

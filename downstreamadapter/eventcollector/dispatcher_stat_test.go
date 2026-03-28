@@ -40,6 +40,7 @@ type mockDispatcher struct {
 	startTs      uint64
 	id           common.DispatcherID
 	generation   uint64
+	txnAtomicity config.AtomicityLevel
 	changefeedID common.ChangeFeedID
 	handleEvents func(events []dispatcher.DispatcherEvent, wakeCallback func()) (block bool)
 	events       []dispatcher.DispatcherEvent
@@ -122,6 +123,9 @@ func (m *mockDispatcher) GetCheckpointTs() uint64 {
 }
 
 func (m *mockDispatcher) GetTxnAtomicity() config.AtomicityLevel {
+	if m.txnAtomicity != "" {
+		return m.txnAtomicity
+	}
 	return config.DefaultAtomicityLevel()
 }
 
@@ -1093,19 +1097,6 @@ func TestHandleDataEventsIgnoresStaleGeneration(t *testing.T) {
 	require.Empty(t, mockDisp.events)
 }
 
-func TestRetryCurrentRegistrationIfRemovedFromIgnoresStaleGeneration(t *testing.T) {
-	localServerID := node.ID("local-server")
-	remoteServerID := node.ID("remote-server")
-	mockDisp := newMockDispatcher(common.NewDispatcherID(), 100)
-	mockDisp.generation = 7
-	mockEventCollector := newTestEventCollector(localServerID)
-	stat := newDispatcherStat(mockDisp, mockEventCollector, nil)
-	markSessionReceiving(stat.session, remoteServerID)
-
-	require.False(t, stat.retryCurrentRegistrationIfRemovedFrom(remoteServerID, 6))
-	requireNoDispatcherRequest(t, mockEventCollector)
-}
-
 func createNodeID(id string) *node.ID {
 	nid := node.ID(id)
 	return &nid
@@ -1451,6 +1442,16 @@ func TestNewDispatcherResetRequest(t *testing.T) {
 			require.Equal(t, tc.expectedSyncPointTs, resetReq.SyncPointTs)
 		})
 	}
+}
+
+func TestNewDispatcherResetRequestCarriesTxnAtomicity(t *testing.T) {
+	mockDisp := newMockDispatcher(common.NewDispatcherID(), 100)
+	mockDisp.txnAtomicity = config.AtomicityLevel("table")
+
+	stat := newDispatcherStatForTest(mockDisp, nil)
+	resetReq := stat.session.newDispatcherResetRequest("local", 120, 3)
+
+	require.Equal(t, "table", resetReq.TxnAtomicity)
 }
 
 func TestCheckpointTsForEventServiceUsesCollectorObservedMaxTs(t *testing.T) {
