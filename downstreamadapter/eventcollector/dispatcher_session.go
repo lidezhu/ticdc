@@ -380,15 +380,9 @@ func (s *dispatcherSession) removeFrom(serverID node.ID) {
 
 // Signal-event orchestration.
 
-// handleSignalEvent is the control-plane event entrypoint.
-//
-// Signal handling follows one rule throughout this file:
-//  1. connState decides whether the incoming signal is relevant and returns the
-//     resulting control-plane decision;
-//  2. session applies the side effects for that decision in a fixed order.
-//
-// Keeping "state transition" and "side effects" separate makes it easier to
-// audit whether a signal path forgot cleanup, retry, or commit work.
+// handleSignalEvent is the control-plane event dispatch entrypoint. It only
+// routes to the ready / not reusable handlers; the actual acceptance rules live
+// in the corresponding connState transition helpers.
 func (s *dispatcherSession) handleSignalEvent(event dispatcher.DispatcherEvent) {
 	if s.connState.isRemoved() {
 		return
@@ -404,30 +398,21 @@ func (s *dispatcherSession) handleSignalEvent(event dispatcher.DispatcherEvent) 
 	}
 }
 
-// handleReadyEvent always applies ready in two steps:
-// 1. clean up stale registrations returned by connState;
-// 2. commit the accepted target, if this ready won the race.
+// handleReadyEvent applies the ready decision produced by connState: clean up
+// any stale registrations, then commit whichever target won the ready race.
 func (s *dispatcherSession) handleReadyEvent(from node.ID) {
 	accepted := s.connState.acceptReady(from, s.localServerID)
-	s.cleanupRegistrations(accepted.cleanupTargets)
-	s.commitAcceptedReady(accepted.commitTarget)
-}
-
-func (s *dispatcherSession) cleanupRegistrations(targets []node.ID) {
-	for _, target := range targets {
+	for _, target := range accepted.cleanupTargets {
 		s.removeFrom(target)
 	}
-}
-
-func (s *dispatcherSession) commitAcceptedReady(serverID node.ID) {
-	if serverID.IsEmpty() {
+	if accepted.commitTarget.IsEmpty() {
 		return
 	}
-	if serverID == s.localServerID {
+	if accepted.commitTarget == s.localServerID {
 		s.handleAcceptedLocalReady()
 		return
 	}
-	s.handleAcceptedRemoteReady(serverID)
+	s.handleAcceptedRemoteReady(accepted.commitTarget)
 }
 
 func (s *dispatcherSession) handleAcceptedLocalReady() {
@@ -458,12 +443,14 @@ func (s *dispatcherSession) handleAcceptedRemoteReady(serverID node.ID) {
 	s.commitReady(serverID)
 }
 
-// handleNotReusableEvent only advances the active remote probe. Any stale not
-// reusable signal is ignored by connState before side effects are considered.
+// handleNotReusableEvent applies the remote-probing decision produced by
+// connState. Only the active remote probe may advance the fallback chain.
 func (s *dispatcherSession) handleNotReusableEvent(from node.ID) {
 	if from == s.localServerID {
 		log.Panic("should not happen: local event service should not send not reusable event")
 	}
+	// connState decides whether this not reusable matches the active probe and
+	// returns the next candidate, if any.
 	nextCandidate, accepted := s.connState.advanceRemoteProbeAfterNotReusable(from)
 	if !accepted {
 		return
