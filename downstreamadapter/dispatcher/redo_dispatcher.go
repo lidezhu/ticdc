@@ -48,8 +48,35 @@ func NewRedoDispatcher(
 	sink sink.Sink,
 	sharedInfo *SharedInfo,
 ) *RedoDispatcher {
-	basicDispatcher := NewBasicDispatcher(
+	return NewRedoDispatcherWithGeneration(
 		id,
+		0,
+		tableSpan,
+		startTs,
+		schemaID,
+		schemaIDToDispatchers,
+		skipSyncpointAtStartTs,
+		skipDMLAsStartTs,
+		sink,
+		sharedInfo,
+	)
+}
+
+func NewRedoDispatcherWithGeneration(
+	id common.DispatcherID,
+	generation uint64,
+	tableSpan *heartbeatpb.TableSpan,
+	startTs uint64,
+	schemaID int64,
+	schemaIDToDispatchers *SchemaIDToDispatchers,
+	skipSyncpointAtStartTs bool,
+	skipDMLAsStartTs bool,
+	sink sink.Sink,
+	sharedInfo *SharedInfo,
+) *RedoDispatcher {
+	basicDispatcher := NewBasicDispatcherWithGeneration(
+		id,
+		generation,
 		tableSpan,
 		startTs,
 		schemaID,

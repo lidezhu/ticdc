@@ -329,10 +329,11 @@ func (e *DispatcherManager) NewTableTriggerEventDispatcher(id *heartbeatpb.Dispa
 	infos := map[common.DispatcherID]dispatcherCreateInfo{}
 	dispatcherID := common.NewDispatcherIDFromPB(id)
 	infos[dispatcherID] = dispatcherCreateInfo{
-		Id:        dispatcherID,
-		TableSpan: common.KeyspaceDDLSpan(e.keyspaceID),
-		StartTs:   startTs,
-		SchemaID:  0,
+		Id:         dispatcherID,
+		Generation: 0,
+		TableSpan:  common.KeyspaceDDLSpan(e.keyspaceID),
+		StartTs:    startTs,
+		SchemaID:   0,
 	}
 	err := e.newEventDispatchers(infos, newChangefeed)
 	if err != nil {
@@ -409,7 +410,7 @@ func (e *DispatcherManager) newEventDispatchers(infos map[common.DispatcherID]di
 	start := time.Now()
 	currentPdTs := e.pdClock.CurrentTS()
 
-	dispatcherIds, tableIds, startTsList, tableSpans, schemaIds, scheduleSkipDMLAsStartTsList := prepareCreateDispatcher(infos, e.dispatcherMap)
+	dispatcherIds, generations, tableIds, startTsList, tableSpans, schemaIds, scheduleSkipDMLAsStartTsList := prepareCreateDispatcher(infos, e.dispatcherMap)
 	if len(dispatcherIds) == 0 {
 		return nil
 	}
@@ -451,8 +452,9 @@ func (e *DispatcherManager) newEventDispatchers(infos map[common.DispatcherID]di
 			scheduleSkipDMLAsStartTsList[idx],
 			skipDMLAsStartTsList[idx],
 		)
-		d := dispatcher.NewEventDispatcher(
+		d := dispatcher.NewEventDispatcherWithGeneration(
 			id,
+			generations[idx],
 			tableSpans[idx],
 			uint64(newStartTsList[idx]),
 			schemaIds[idx],
@@ -811,8 +813,9 @@ func (e *DispatcherManager) mergeEventDispatcher(dispatcherIDs []common.Dispatch
 		return nil
 	}
 
-	mergedDispatcher := dispatcher.NewEventDispatcher(
+	mergedDispatcher := dispatcher.NewEventDispatcherWithGeneration(
 		mergedDispatcherID,
+		0,
 		mergedSpan,
 		fakeStartTs, // real startTs will be calculated later.
 		schemaID,

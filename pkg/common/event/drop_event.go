@@ -33,6 +33,7 @@ type DropEvent struct {
 	DroppedSeq      uint64
 	DroppedCommitTs common.Ts
 	DroppedEpoch    uint64
+	Generation      uint64
 }
 
 // NewDropEvent creates a new DropEvent
@@ -41,14 +42,19 @@ func NewDropEvent(
 	seq uint64,
 	epoch uint64,
 	commitTs common.Ts,
+	generations ...uint64,
 ) *DropEvent {
-	return &DropEvent{
+	event := &DropEvent{
 		Version:         DropEventVersion1,
 		DispatcherID:    dispatcherID,
 		DroppedSeq:      seq,
 		DroppedCommitTs: commitTs,
 		DroppedEpoch:    epoch,
 	}
+	if len(generations) > 0 {
+		event.Generation = generations[0]
+	}
+	return event
 }
 
 // GetType returns the event type
@@ -63,6 +69,10 @@ func (e *DropEvent) GetSeq() uint64 {
 
 func (e *DropEvent) GetEpoch() uint64 {
 	return e.DroppedEpoch
+}
+
+func (e *DropEvent) GetGeneration() uint64 {
+	return e.Generation
 }
 
 // GetDispatcherID returns the dispatcher ID
@@ -82,8 +92,8 @@ func (e *DropEvent) GetStartTs() common.Ts {
 
 // GetSize returns the approximate size of the event in bytes
 func (e *DropEvent) GetSize() int64 {
-	// payload: dispatcherID + seq + commitTs + epoch
-	payloadSize := int64(e.DispatcherID.GetSize() + 8 + 8 + 8)
+	// payload: dispatcherID + seq + commitTs + epoch + generation
+	payloadSize := int64(e.DispatcherID.GetSize() + 8 + 8 + 8 + 8)
 	return payloadSize
 }
 
@@ -138,9 +148,10 @@ func (e *DropEvent) Unmarshal(data []byte) error {
 }
 
 func (e *DropEvent) encodeV1() ([]byte, error) {
-	// Note: version is now handled in the header by Marshal(), not here
-	// payload: dispatcherID + seq + commitTs + epoch
-	payloadSize := e.DispatcherID.GetSize() + 8 + 8 + 8
+	// Note: version is now handled in the header by Marshal(), not here.
+	// Keep the legacy payload as the prefix and append generation as an optional
+	// trailer so older decoders can ignore it during rolling upgrade.
+	payloadSize := e.DispatcherID.GetSize() + 8 + 8 + 8 + 8
 	data := make([]byte, payloadSize)
 	offset := 0
 
@@ -159,6 +170,9 @@ func (e *DropEvent) encodeV1() ([]byte, error) {
 	// DroppedEpoch
 	binary.BigEndian.PutUint64(data[offset:], e.DroppedEpoch)
 	offset += 8
+
+	// Generation
+	binary.BigEndian.PutUint64(data[offset:], e.Generation)
 
 	return data, nil
 }
@@ -186,6 +200,10 @@ func (e *DropEvent) decodeV1(data []byte) error {
 	// DroppedEpoch
 	e.DroppedEpoch = binary.BigEndian.Uint64(data[offset:])
 	offset += 8
+
+	if len(data[offset:]) >= 8 {
+		e.Generation = binary.BigEndian.Uint64(data[offset:])
+	}
 
 	return nil
 }

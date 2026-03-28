@@ -26,6 +26,7 @@ type Event interface {
 	GetType() int
 	GetSeq() uint64
 	GetEpoch() uint64
+	GetGeneration() uint64
 	GetDispatcherID() common.DispatcherID
 	GetCommitTs() common.Ts
 	GetStartTs() common.Ts

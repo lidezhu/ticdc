@@ -38,6 +38,7 @@ import (
 // DispatcherService defines the interface for providing dispatcher information and basic event handling.
 type DispatcherService interface {
 	GetId() common.DispatcherID
+	GetGeneration() uint64
 	GetMode() int64
 	GetStartTs() uint64
 	GetBDRMode() bool
@@ -117,8 +118,9 @@ The workflow related to the dispatcher is as follows:
 */
 
 type BasicDispatcher struct {
-	id       common.DispatcherID
-	schemaID int64
+	id         common.DispatcherID
+	generation uint64
+	schemaID   int64
 
 	tableSpan *heartbeatpb.TableSpan
 	// isCompleteTable indicates whether this dispatcher is responsible for a complete table
@@ -236,8 +238,39 @@ func NewBasicDispatcher(
 	sink sink.Sink,
 	sharedInfo *SharedInfo,
 ) *BasicDispatcher {
+	return NewBasicDispatcherWithGeneration(
+		id,
+		0,
+		tableSpan,
+		startTs,
+		schemaID,
+		schemaIDToDispatchers,
+		skipSyncpointAtStartTs,
+		skipDMLAsStartTs,
+		currentPDTs,
+		mode,
+		sink,
+		sharedInfo,
+	)
+}
+
+func NewBasicDispatcherWithGeneration(
+	id common.DispatcherID,
+	generation uint64,
+	tableSpan *heartbeatpb.TableSpan,
+	startTs uint64,
+	schemaID int64,
+	schemaIDToDispatchers *SchemaIDToDispatchers,
+	skipSyncpointAtStartTs bool,
+	skipDMLAsStartTs bool,
+	currentPDTs uint64,
+	mode int64,
+	sink sink.Sink,
+	sharedInfo *SharedInfo,
+) *BasicDispatcher {
 	dispatcher := &BasicDispatcher{
 		id:                     id,
+		generation:             generation,
 		tableSpan:              tableSpan,
 		isCompleteTable:        common.IsCompleteSpan(tableSpan),
 		startTs:                startTs,

@@ -53,6 +53,9 @@ type DDLEvent struct {
 	Seq uint64 `json:"seq"`
 	// The epoch of the event. It is set by event service.
 	Epoch uint64 `json:"epoch"`
+	// Generation fences stale EC<->ES interactions across dispatcher
+	// remove/recreate cycles. It is optional for rolling upgrade and defaults to 0.
+	Generation uint64 `json:"generation,omitempty"`
 	// MultipleTableInfos holds information for multiple versions of a table.
 	// The first entry always represents the current table information.
 	MultipleTableInfos []*common.TableInfo `json:"-"`
@@ -257,6 +260,10 @@ func (d *DDLEvent) GetSeq() uint64 {
 
 func (d *DDLEvent) GetEpoch() uint64 {
 	return d.Epoch
+}
+
+func (d *DDLEvent) GetGeneration() uint64 {
+	return d.Generation
 }
 
 func (d *DDLEvent) ClearPostFlushFunc() {

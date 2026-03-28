@@ -101,10 +101,11 @@ func (e *DispatcherManager) NewTableTriggerRedoDispatcher(id *heartbeatpb.Dispat
 	infos := map[common.DispatcherID]dispatcherCreateInfo{}
 	dispatcherID := common.NewDispatcherIDFromPB(id)
 	infos[dispatcherID] = dispatcherCreateInfo{
-		Id:        dispatcherID,
-		TableSpan: common.KeyspaceDDLSpan(e.keyspaceID),
-		StartTs:   startTs,
-		SchemaID:  0,
+		Id:         dispatcherID,
+		Generation: 0,
+		TableSpan:  common.KeyspaceDDLSpan(e.keyspaceID),
+		StartTs:    startTs,
+		SchemaID:   0,
 	}
 	err := e.newRedoDispatchers(infos, newChangefeed)
 	if err != nil {
@@ -131,7 +132,7 @@ func (e *DispatcherManager) NewTableTriggerRedoDispatcher(id *heartbeatpb.Dispat
 func (e *DispatcherManager) newRedoDispatchers(infos map[common.DispatcherID]dispatcherCreateInfo, removeDDLTs bool) error {
 	start := time.Now()
 
-	dispatcherIds, _, startTsList, tableSpans, schemaIds, scheduleSkipDMLAsStartTsList := prepareCreateDispatcher(infos, e.redoDispatcherMap)
+	dispatcherIds, generations, _, startTsList, tableSpans, schemaIds, scheduleSkipDMLAsStartTsList := prepareCreateDispatcher(infos, e.redoDispatcherMap)
 	if len(dispatcherIds) == 0 {
 		return nil
 	}
@@ -151,8 +152,9 @@ func (e *DispatcherManager) newRedoDispatchers(infos map[common.DispatcherID]dis
 	}
 
 	for idx, id := range dispatcherIds {
-		rd := dispatcher.NewRedoDispatcher(
+		rd := dispatcher.NewRedoDispatcherWithGeneration(
 			id,
+			generations[idx],
 			tableSpans[idx],
 			uint64(startTsList[idx]),
 			schemaIds[idx],
@@ -215,8 +217,9 @@ func (e *DispatcherManager) mergeRedoDispatcher(dispatcherIDs []common.Dispatche
 		return nil
 	}
 
-	mergedDispatcher := dispatcher.NewRedoDispatcher(
+	mergedDispatcher := dispatcher.NewRedoDispatcherWithGeneration(
 		mergedDispatcherID,
+		0,
 		mergedSpan,
 		fakeStartTs, // real startTs will be calculated later.
 		schemaID,

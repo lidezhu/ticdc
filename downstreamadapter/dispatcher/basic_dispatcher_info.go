@@ -120,6 +120,10 @@ func (d *BasicDispatcher) GetId() common.DispatcherID {
 	return d.id
 }
 
+func (d *BasicDispatcher) GetGeneration() uint64 {
+	return d.generation
+}
+
 func (d *BasicDispatcher) GetSchemaID() int64 {
 	return d.schemaID
 }

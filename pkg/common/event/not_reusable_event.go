@@ -14,6 +14,7 @@
 package event
 
 import (
+	"encoding/binary"
 	"fmt"
 
 	"github.com/pingcap/ticdc/pkg/common"
@@ -28,13 +29,18 @@ var _ Event = &NotReusableEvent{}
 type NotReusableEvent struct {
 	Version      int
 	DispatcherID common.DispatcherID
+	Generation   uint64
 }
 
-func NewNotReusableEvent(dispatcherID common.DispatcherID) NotReusableEvent {
-	return NotReusableEvent{
+func NewNotReusableEvent(dispatcherID common.DispatcherID, generations ...uint64) NotReusableEvent {
+	event := NotReusableEvent{
 		Version:      NotReusableEventVersion,
 		DispatcherID: dispatcherID,
 	}
+	if len(generations) > 0 {
+		event.Generation = generations[0]
+	}
+	return event
 }
 
 func (e *NotReusableEvent) String() string {
@@ -57,6 +63,10 @@ func (e *NotReusableEvent) GetEpoch() uint64 {
 	return 0
 }
 
+func (e *NotReusableEvent) GetGeneration() uint64 {
+	return e.Generation
+}
+
 // GetDispatcherID returns the dispatcher ID
 func (e *NotReusableEvent) GetDispatcherID() common.DispatcherID {
 	return e.DispatcherID
@@ -77,8 +87,8 @@ func (e *NotReusableEvent) GetStartTs() common.Ts {
 // GetSize returns the approximate size of the event in bytes
 func (e *NotReusableEvent) GetSize() int64 {
 	// Size does not include header or version (those are only for serialization)
-	// Only business data: dispatcherID
-	return int64(e.DispatcherID.GetSize())
+	// Only business data: dispatcherID + generation
+	return int64(e.DispatcherID.GetSize() + 8)
 }
 
 func (e *NotReusableEvent) IsPaused() bool {
@@ -128,14 +138,19 @@ func (e *NotReusableEvent) Unmarshal(data []byte) error {
 }
 
 func (e NotReusableEvent) encodeV1() ([]byte, error) {
-	// Note: version is now handled in the header by Marshal(), not here
-	// payload: dispatcherID
-	payloadSize := e.DispatcherID.GetSize()
+	// Note: version is now handled in the header by Marshal(), not here.
+	// Keep dispatcherID as the legacy prefix and append generation as an optional
+	// trailer so older decoders can ignore it during rolling upgrade.
+	payloadSize := e.DispatcherID.GetSize() + 8
 	data := make([]byte, payloadSize)
 	offset := 0
 
 	// DispatcherID
 	copy(data[offset:], e.DispatcherID.Marshal())
+	offset += e.DispatcherID.GetSize()
+
+	// Generation
+	binary.BigEndian.PutUint64(data[offset:], e.Generation)
 
 	return data, nil
 }
@@ -148,6 +163,11 @@ func (e *NotReusableEvent) decodeV1(data []byte) error {
 	err := e.DispatcherID.Unmarshal(data[offset:])
 	if err != nil {
 		return err
+	}
+	offset += e.DispatcherID.GetSize()
+
+	if len(data[offset:]) >= 8 {
+		e.Generation = binary.BigEndian.Uint64(data[offset:])
 	}
 
 	return nil

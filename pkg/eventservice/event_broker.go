@@ -193,7 +193,7 @@ func (c *eventBroker) sendDML(remoteID node.ID, batchEvent *event.BatchDMLEvent,
 	doSendDML := func(e *event.BatchDMLEvent) {
 		// Send the DML event
 		if e != nil && len(e.DMLEvents) > 0 {
-			c.getMessageCh(d.messageWorkerIndex, common.IsRedoMode(d.info.GetMode())) <- newWrapBatchDMLEvent(remoteID, e)
+			c.getMessageCh(d.messageWorkerIndex, common.IsRedoMode(d.info.GetMode())) <- newWrapBatchDMLEvent(remoteID, d.generation, e)
 			updateMetricEventServiceSendKvCount(d.info.GetMode(), float64(e.Len()))
 		}
 	}
@@ -221,6 +221,7 @@ func (c *eventBroker) sendDML(remoteID node.ID, batchEvent *event.BatchDMLEvent,
 		// Set sequence number for the event
 		dml.Seq = d.seq.Add(1)
 		dml.Epoch = d.epoch
+		dml.Generation = d.generation
 
 		lastStartTs = dml.GetStartTs()
 		lastCommitTs = dml.GetCommitTs()
@@ -241,7 +242,8 @@ func (c *eventBroker) sendDDL(ctx context.Context, remoteID node.ID, e *event.DD
 	e.DispatcherID = d.id
 	e.Seq = d.seq.Add(1)
 	e.Epoch = d.epoch
-	ddlEvent := newWrapDDLEvent(remoteID, e)
+	e.Generation = d.generation
+	ddlEvent := newWrapDDLEvent(remoteID, d.generation, e)
 	select {
 	case <-ctx.Done():
 		log.Error("send ddl event failed", zap.Error(ctx.Err()))
@@ -289,9 +291,9 @@ func (c *eventBroker) sendSignalResolvedTs(d *dispatcherStat) {
 func (c *eventBroker) sendResolvedTs(d *dispatcherStat, watermark uint64) {
 	remoteID := node.ID(d.info.GetServerID())
 	c.emitSyncPointEventIfNeeded(watermark, d, remoteID)
-	re := event.NewResolvedEvent(watermark, d.id, d.epoch)
+	re := event.NewResolvedEvent(watermark, d.id, d.epoch, d.generation)
 	re.Seq = d.seq.Load()
-	resolvedEvent := newWrapResolvedEvent(remoteID, re)
+	resolvedEvent := newWrapResolvedEvent(remoteID, d.generation, re)
 	c.getMessageCh(d.messageWorkerIndex, common.IsRedoMode(d.info.GetMode())) <- resolvedEvent
 	d.updateSentResolvedTs(watermark)
 	updateMetricEventServiceSendResolvedTsCount(d.info.GetMode())
@@ -301,8 +303,8 @@ func (c *eventBroker) sendNotReusableEvent(
 	server node.ID,
 	d *dispatcherStat,
 ) {
-	event := event.NewNotReusableEvent(d.info.GetID())
-	wrapEvent := newWrapNotReusableEvent(server, event)
+	event := event.NewNotReusableEvent(d.info.GetID(), d.generation)
+	wrapEvent := newWrapNotReusableEvent(server, d.generation, event)
 
 	// must success unless we can do retry later
 	c.getMessageCh(d.messageWorkerIndex, common.IsRedoMode(d.info.GetMode())) <- wrapEvent
@@ -531,8 +533,8 @@ func (c *eventBroker) checkAndSendReady(task scanTask) bool {
 			return false
 		}
 		remoteID := node.ID(task.info.GetServerID())
-		event := event.NewReadyEvent(task.info.GetID())
-		wrapEvent := newWrapReadyEvent(remoteID, event)
+		event := event.NewReadyEvent(task.info.GetID(), task.generation)
+		wrapEvent := newWrapReadyEvent(remoteID, task.generation, event)
 		c.getMessageCh(task.messageWorkerIndex, common.IsRedoMode(task.info.GetMode())) <- wrapEvent
 		log.Debug("send ready event to dispatcher",
 			zap.Stringer("changefeedID", task.changefeedStat.changefeedID), zap.Stringer("dispatcherID", task.id))
@@ -562,7 +564,7 @@ func (c *eventBroker) sendHandshakeIfNeed(task scanTask) {
 	}
 
 	remoteID := node.ID(task.info.GetServerID())
-	event := event.NewHandshakeEvent(task.id, task.startTs, task.epoch, task.startTableInfo)
+	event := event.NewHandshakeEvent(task.id, task.startTs, task.epoch, task.startTableInfo, task.generation)
 	log.Info("send handshake event to dispatcher",
 		zap.Stringer("changefeedID", task.changefeedStat.changefeedID),
 		zap.Stringer("dispatcherID", task.id),
@@ -570,7 +572,7 @@ func (c *eventBroker) sendHandshakeIfNeed(task scanTask) {
 		zap.Uint64("commitTs", event.GetCommitTs()),
 		zap.Uint64("epoch", event.GetEpoch()),
 		zap.Uint64("seq", event.GetSeq()))
-	wrapEvent := newWrapHandshakeEvent(remoteID, event)
+	wrapEvent := newWrapHandshakeEvent(remoteID, task.generation, event)
 	c.getMessageCh(task.messageWorkerIndex, common.IsRedoMode(task.info.GetMode())) <- wrapEvent
 	updateMetricEventServiceSendCommandCount(task.info.GetMode())
 	// Send handshake event to channel before calling `setHandshaked`
@@ -591,13 +593,13 @@ func (c *eventBroker) emitSyncPointEventIfNeeded(ts uint64, d *dispatcherStat, r
 		commitTs := d.nextSyncPoint.Load()
 		d.nextSyncPoint.Store(oracle.GoTimeToTS(oracle.GetTimeFromTS(commitTs).Add(d.syncPointInterval)))
 
-		e := event.NewSyncPointEvent(d.id, commitTs, d.seq.Add(1), d.epoch)
+		e := event.NewSyncPointEvent(d.id, commitTs, d.seq.Add(1), d.epoch, d.generation)
 		log.Debug("send syncpoint event to dispatcher",
 			zap.Stringer("changefeedID", d.changefeedStat.changefeedID),
 			zap.Stringer("dispatcherID", d.id), zap.Int64("tableID", d.info.GetTableSpan().GetTableID()),
 			zap.Uint64("commitTs", e.GetCommitTs()), zap.Uint64("seq", e.GetSeq()))
 
-		syncPointEvent := newWrapSyncPointEvent(remoteID, e)
+		syncPointEvent := newWrapSyncPointEvent(remoteID, d.generation, e)
 		c.getMessageCh(d.messageWorkerIndex, common.IsRedoMode(d.info.GetMode())) <- syncPointEvent
 	}
 }
@@ -777,6 +779,24 @@ func allocQuota(quota *atomic.Uint64, nBytes uint64) bool {
 
 func releaseQuota(quota *atomic.Uint64, nBytes uint64) {
 	quota.Add(nBytes)
+}
+
+func compareGeneration(current, incoming uint64) int {
+	if current == 0 || incoming == 0 {
+		return 0
+	}
+	switch {
+	case incoming < current:
+		return -1
+	case incoming > current:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func generationMatches(current, incoming uint64) bool {
+	return compareGeneration(current, incoming) == 0
 }
 
 func (c *eventBroker) runSendMessageWorker(ctx context.Context, workerIndex int, topic string) error {
@@ -994,6 +1014,26 @@ func (c *eventBroker) addDispatcher(info DispatcherInfo) error {
 	id := info.GetID()
 	span := info.GetTableSpan()
 	changefeedID := info.GetChangefeedID()
+	if statPtr := c.getDispatcher(id); statPtr != nil {
+		current := statPtr.Load()
+		switch compareGeneration(current.generation, info.GetGeneration()) {
+		case -1:
+			log.Info("ignore stale register dispatcher request",
+				zap.Stringer("changefeedID", changefeedID),
+				zap.Stringer("dispatcherID", id),
+				zap.Uint64("currentGeneration", current.generation),
+				zap.Uint64("requestGeneration", info.GetGeneration()))
+			return nil
+		case 0:
+			log.Info("ignore duplicated register dispatcher request",
+				zap.Stringer("changefeedID", changefeedID),
+				zap.Stringer("dispatcherID", id),
+				zap.Uint64("generation", info.GetGeneration()))
+			return nil
+		case 1:
+			c.removeDispatcherInternal(current, statPtr)
+		}
+	}
 
 	status := c.getOrSetChangefeedStatus(changefeedID, info.GetSyncPointInterval())
 	dispatcher := newDispatcherStat(info, uint64(len(c.taskChan)), uint64(len(c.messageCh)), nil, status)
@@ -1086,31 +1126,21 @@ func (c *eventBroker) addDispatcher(info DispatcherInfo) error {
 	return nil
 }
 
-func (c *eventBroker) removeDispatcher(dispatcherInfo DispatcherInfo) {
-	id := dispatcherInfo.GetID()
-
-	var isTableTriggerDispatcher bool
-	statPtr, ok := c.dispatchers.Load(id)
-	if !ok {
-		statPtr, ok = c.tableTriggerDispatchers.Load(id)
-		if !ok {
-			return
-		}
-		isTableTriggerDispatcher = true
-	}
-
-	stat := statPtr.(*atomic.Pointer[dispatcherStat]).Load()
+func (c *eventBroker) removeDispatcherInternal(stat *dispatcherStat, statPtr interface{}) {
 	stat.isRemoved.Store(true)
 
-	if isTableTriggerDispatcher {
-		c.tableTriggerDispatchers.Delete(id)
+	if _, ok := statPtr.(*atomic.Pointer[dispatcherStat]); !ok {
+		log.Panic("invalid dispatcher pointer type", zap.Any("statPtr", statPtr))
+	}
+	if _, ok := c.dispatchers.Load(stat.id); ok {
+		c.dispatchers.Delete(stat.id)
 	} else {
-		c.dispatchers.Delete(id)
+		c.tableTriggerDispatchers.Delete(stat.id)
 	}
 
-	stat.changefeedStat.removeDispatcher(id)
+	stat.changefeedStat.removeDispatcher(stat.id)
 	c.metricsCollector.metricDispatcherCount.Dec()
-	changefeedID := dispatcherInfo.GetChangefeedID()
+	changefeedID := stat.info.GetChangefeedID()
 
 	if stat.changefeedStat.isEmpty() {
 		log.Info("All dispatchers for the changefeed are removed, remove the changefeed status",
@@ -1122,9 +1152,9 @@ func (c *eventBroker) removeDispatcher(dispatcherInfo DispatcherInfo) {
 		metrics.EventServiceScanWindowIntervalGaugeVec.DeleteLabelValues(changefeedID.String())
 	}
 
-	c.eventStore.UnregisterDispatcher(changefeedID, id)
+	c.eventStore.UnregisterDispatcher(changefeedID, stat.id)
 
-	span := dispatcherInfo.GetTableSpan()
+	span := stat.info.GetTableSpan()
 	keyspaceMeta := common.KeyspaceMeta{
 		ID:   span.KeyspaceID,
 		Name: changefeedID.Keyspace(),
@@ -1133,9 +1163,23 @@ func (c *eventBroker) removeDispatcher(dispatcherInfo DispatcherInfo) {
 
 	log.Info("remove dispatcher",
 		zap.Uint64("clusterID", c.tidbClusterID), zap.Stringer("changefeedID", changefeedID),
-		zap.Stringer("dispatcherID", id), zap.Int64("tableID", dispatcherInfo.GetTableSpan().GetTableID()),
-		zap.String("span", common.FormatTableSpan(dispatcherInfo.GetTableSpan())),
+		zap.Stringer("dispatcherID", stat.id), zap.Int64("tableID", stat.info.GetTableSpan().GetTableID()),
+		zap.String("span", common.FormatTableSpan(stat.info.GetTableSpan())),
+		zap.Uint64("generation", stat.generation),
 	)
+}
+
+func (c *eventBroker) removeDispatcher(dispatcherInfo DispatcherInfo) {
+	id := dispatcherInfo.GetID()
+	statPtr := c.getDispatcher(id)
+	if statPtr == nil {
+		return
+	}
+	stat := statPtr.Load()
+	if compareGeneration(stat.generation, dispatcherInfo.GetGeneration()) == -1 {
+		return
+	}
+	c.removeDispatcherInternal(stat, statPtr)
 }
 
 func (c *eventBroker) resetDispatcher(dispatcherInfo DispatcherInfo) error {
@@ -1155,6 +1199,14 @@ func (c *eventBroker) resetDispatcher(dispatcherInfo DispatcherInfo) error {
 	metrics.EventServiceResetDispatcherCount.Inc()
 
 	oldStat := statPtr.Load()
+	switch compareGeneration(oldStat.generation, dispatcherInfo.GetGeneration()) {
+	case -1:
+		return nil
+	case 1:
+		oldStat.isRemoved.Store(true)
+		c.removeDispatcherInternal(oldStat, statPtr)
+		return c.addDispatcher(dispatcherInfo)
+	}
 	// stale reset request, ignore it.
 	if oldStat.epoch >= dispatcherInfo.GetEpoch() {
 		return nil
@@ -1209,6 +1261,14 @@ func (c *eventBroker) resetDispatcher(dispatcherInfo DispatcherInfo) error {
 			zap.Uint64("newEpoch", newStat.epoch))
 		// The dispatcher is changed concurrently, retry it.
 		oldStat = statPtr.Load()
+		switch compareGeneration(oldStat.generation, dispatcherInfo.GetGeneration()) {
+		case -1:
+			return nil
+		case 1:
+			oldStat.isRemoved.Store(true)
+			c.removeDispatcherInternal(oldStat, statPtr)
+			return c.addDispatcher(dispatcherInfo)
+		}
 		// stale reset request, ignore it.
 		if oldStat.epoch >= dispatcherInfo.GetEpoch() {
 			return nil
@@ -1241,22 +1301,26 @@ func (c *eventBroker) getOrSetChangefeedStatus(changefeedID common.ChangeFeedID,
 }
 
 func (c *eventBroker) handleDispatcherHeartbeat(heartbeat *DispatcherHeartBeatWithServerID) {
-	responseMap := make(map[string]*event.DispatcherHeartbeatResponse)
+	responseMap := make(map[node.ID]*event.DispatcherHeartbeatResponse)
 	changedChangefeeds := make(map[*changefeedStatus]struct{})
 	now := time.Now().Unix()
-	handleProgress := func(dispatcherID common.DispatcherID, checkpointTs uint64, heartbeatEpoch uint64, checkEpoch bool) {
+	handleProgress := func(dispatcherID common.DispatcherID, checkpointTs uint64, heartbeatEpoch uint64, heartbeatGeneration uint64, checkEpoch bool) {
 		dispatcherPtr := c.getDispatcher(dispatcherID)
 		// Can't find the dispatcher, it means the dispatcher is removed.
 		if dispatcherPtr == nil {
-			response, ok := responseMap[heartbeat.serverID]
+			serverID := node.ID(heartbeat.serverID)
+			response, ok := responseMap[serverID]
 			if !ok {
 				response = event.NewDispatcherHeartbeatResponse()
-				responseMap[heartbeat.serverID] = response
+				responseMap[serverID] = response
 			}
-			response.Append(event.NewDispatcherState(dispatcherID, event.DSStateRemoved))
+			response.Append(event.NewDispatcherState(dispatcherID, event.DSStateRemoved, heartbeatGeneration))
 			return
 		}
 		dispatcher := dispatcherPtr.Load()
+		if !generationMatches(dispatcher.generation, heartbeatGeneration) {
+			return
+		}
 		if checkEpoch && heartbeatEpoch != dispatcher.epoch {
 			log.Warn("ignore dispatcher heartbeat from stale epoch",
 				zap.Stringer("changefeedID", dispatcher.changefeedStat.changefeedID),
@@ -1276,11 +1340,11 @@ func (c *eventBroker) handleDispatcherHeartbeat(heartbeat *DispatcherHeartBeatWi
 	}
 	if heartbeat.heartbeat.Version >= event.DispatcherHeartbeatVersion2 {
 		for _, dp := range heartbeat.heartbeat.DispatcherProgresses {
-			handleProgress(dp.DispatcherID, dp.CheckpointTs, dp.Epoch, true)
+			handleProgress(dp.DispatcherID, dp.CheckpointTs, dp.Epoch, dp.Generation, true)
 		}
 	} else {
 		for _, dp := range heartbeat.heartbeat.DispatcherProgressesLegacy {
-			handleProgress(dp.DispatcherID, dp.CheckpointTs, 0, false)
+			handleProgress(dp.DispatcherID, dp.CheckpointTs, 0, 0, false)
 		}
 	}
 	c.sendDispatcherResponse(responseMap)
@@ -1335,9 +1399,9 @@ func (c *eventBroker) handleCongestionControl(from node.ID, m *event.CongestionC
 	})
 }
 
-func (c *eventBroker) sendDispatcherResponse(responseMap map[string]*event.DispatcherHeartbeatResponse) {
+func (c *eventBroker) sendDispatcherResponse(responseMap map[node.ID]*event.DispatcherHeartbeatResponse) {
 	for serverID, response := range responseMap {
-		msg := messaging.NewSingleTargetMessage(node.ID(serverID), messaging.EventCollectorTopic, response)
+		msg := messaging.NewSingleTargetMessage(serverID, messaging.EventCollectorTopic, response)
 		c.msgSender.SendCommand(msg)
 	}
 }

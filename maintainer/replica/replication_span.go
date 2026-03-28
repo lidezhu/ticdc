@@ -44,6 +44,7 @@ type SpanReplication struct {
 	schemaID    int64
 	nodeIDMutex sync.Mutex // mutex for nodeID
 	nodeID      node.ID
+	generation  uint64
 	groupID     replica.GroupID
 	status      *atomic.Pointer[heartbeatpb.TableSpanStatus]
 	blockState  *atomic.Pointer[heartbeatpb.State]
@@ -210,6 +211,9 @@ func (r *SpanReplication) SetSchemaID(schemaID int64) {
 func (r *SpanReplication) SetNodeID(n node.ID) {
 	r.nodeIDMutex.Lock()
 	defer r.nodeIDMutex.Unlock()
+	if !n.IsEmpty() && r.nodeID != n {
+		r.generation++
+	}
 	r.nodeID = n
 }
 
@@ -221,6 +225,12 @@ func (r *SpanReplication) GetNodeID() node.ID {
 	r.nodeIDMutex.Lock()
 	defer r.nodeIDMutex.Unlock()
 	return r.nodeID
+}
+
+func (r *SpanReplication) GetGeneration() uint64 {
+	r.nodeIDMutex.Lock()
+	defer r.nodeIDMutex.Unlock()
+	return r.generation
 }
 
 // IsScheduled returns true if the span is scheduled to a node
@@ -274,6 +284,7 @@ func (r *SpanReplication) NewAddDispatcherMessage(server node.ID, operatorType h
 			ChangefeedID: r.ChangefeedID.ToPB(),
 			Config: &heartbeatpb.DispatcherConfig{
 				DispatcherID:     r.ID.ToPB(),
+				Generation:       r.GetGeneration(),
 				SchemaID:         r.schemaID,
 				Span:             r.Span,
 				StartTs:          startTs,
@@ -289,19 +300,20 @@ func (r *SpanReplication) NewAddDispatcherMessage(server node.ID, operatorType h
 // Span and OperatorType are included so a new maintainer can reconstruct intent during bootstrap/failover,
 // even if the dispatcher has already disappeared from the node span snapshot.
 func (r *SpanReplication) NewRemoveDispatcherMessage(server node.ID, operatorType heartbeatpb.OperatorType) *messaging.TargetMessage {
-	return NewRemoveDispatcherMessage(server, r.ChangefeedID, r.ID.ToPB(), r.Span, r.GetMode(), operatorType)
+	return NewRemoveDispatcherMessage(server, r.ChangefeedID, r.ID.ToPB(), r.Span, r.GetMode(), r.GetGeneration(), operatorType)
 }
 
 // NewRemoveDispatcherMessage creates a ScheduleDispatcherRequest(Remove) for a dispatcherID.
 // The span is optional for the dispatcher manager, but is useful for maintainer bootstrap to correlate
 // in-flight remove requests with table spans when the dispatcher no longer exists.
-func NewRemoveDispatcherMessage(server node.ID, cfID common.ChangeFeedID, dispatcherID *heartbeatpb.DispatcherID, span *heartbeatpb.TableSpan, mode int64, operatorType heartbeatpb.OperatorType) *messaging.TargetMessage {
+func NewRemoveDispatcherMessage(server node.ID, cfID common.ChangeFeedID, dispatcherID *heartbeatpb.DispatcherID, span *heartbeatpb.TableSpan, mode int64, generation uint64, operatorType heartbeatpb.OperatorType) *messaging.TargetMessage {
 	return messaging.NewSingleTargetMessage(server,
 		messaging.HeartbeatCollectorTopic,
 		&heartbeatpb.ScheduleDispatcherRequest{
 			ChangefeedID: cfID.ToPB(),
 			Config: &heartbeatpb.DispatcherConfig{
 				DispatcherID: dispatcherID,
+				Generation:   generation,
 				Span:         span,
 				Mode:         mode,
 			},

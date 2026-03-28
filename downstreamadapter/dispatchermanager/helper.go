@@ -323,6 +323,7 @@ func handleScheduleCreate(
 	dispatcherID := common.NewDispatcherIDFromPB(config.DispatcherID)
 	info := dispatcherCreateInfo{
 		Id:               dispatcherID,
+		Generation:       config.Generation,
 		TableSpan:        config.Span,
 		StartTs:          config.StartTs,
 		SchemaID:         config.SchemaID,

@@ -170,7 +170,7 @@ func (h *EventsHandler) OnDrop(event dispatcher.DispatcherEvent) interface{} {
 	switch event.GetType() {
 	case commonEvent.TypeDMLEvent, commonEvent.TypeDDLEvent, commonEvent.TypeBatchDMLEvent, commonEvent.TypeSyncPointEvent:
 		log.Debug("Drop event", zap.String("dispatcher", event.GetDispatcherID().String()), zap.Uint64("seq", event.GetSeq()), zap.String("type", commonEvent.TypeToString(event.GetType())), zap.Uint64("epoch", event.GetEpoch()), zap.Uint64("startTs", event.GetStartTs()), zap.Uint64("commitTs", event.GetCommitTs()))
-		dropEvent := commonEvent.NewDropEvent(event.GetDispatcherID(), event.GetSeq(), event.GetEpoch(), event.GetCommitTs())
+		dropEvent := commonEvent.NewDropEvent(event.GetDispatcherID(), event.GetSeq(), event.GetEpoch(), event.GetCommitTs(), event.GetGeneration())
 		return dispatcher.NewDispatcherEvent(event.From, dropEvent)
 	default:
 		log.Debug("Drop event", zap.String("dispatcher", event.GetDispatcherID().String()), zap.Any("event", event), zap.String("type", commonEvent.TypeToString(event.GetType())))

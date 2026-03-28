@@ -34,18 +34,23 @@ type SyncPointEvent struct {
 	Seq uint64
 	// The epoch of the event. It is set by event service.
 	Epoch          uint64
+	Generation     uint64
 	Version        byte
 	PostTxnFlushed []func()
 }
 
-func NewSyncPointEvent(id common.DispatcherID, commitTs uint64, seq uint64, epoch uint64) *SyncPointEvent {
-	return &SyncPointEvent{
+func NewSyncPointEvent(id common.DispatcherID, commitTs uint64, seq uint64, epoch uint64, generations ...uint64) *SyncPointEvent {
+	event := &SyncPointEvent{
 		DispatcherID: id,
 		CommitTs:     commitTs,
 		Seq:          seq,
 		Epoch:        epoch,
 		Version:      SyncPointEventVersion1,
 	}
+	if len(generations) > 0 {
+		event.Generation = generations[0]
+	}
+	return event
 }
 
 func (e *SyncPointEvent) GetType() int {
@@ -66,8 +71,8 @@ func (e *SyncPointEvent) GetStartTs() common.Ts {
 
 func (e *SyncPointEvent) GetSize() int64 {
 	// Size does not include header or version (those are only for serialization)
-	// Only business data: Seq(8) + Epoch(8) + DispatcherID + CommitTs(8)
-	return int64(8 + 8 + e.DispatcherID.GetSize() + 8)
+	// Only business data: Seq(8) + Epoch(8) + CommitTs(8) + DispatcherID + Generation(8)
+	return int64(8 + 8 + e.DispatcherID.GetSize() + 8 + 8)
 }
 
 func (e *SyncPointEvent) IsPaused() bool {
@@ -80,6 +85,10 @@ func (e SyncPointEvent) GetSeq() uint64 {
 
 func (e SyncPointEvent) GetEpoch() uint64 {
 	return e.Epoch
+}
+
+func (e SyncPointEvent) GetGeneration() uint64 {
+	return e.Generation
 }
 
 func (e *SyncPointEvent) GetBlockedTables() *InfluencedTables {
@@ -160,9 +169,10 @@ func (e *SyncPointEvent) Unmarshal(data []byte) error {
 }
 
 func (e SyncPointEvent) encodeV1() ([]byte, error) {
-	// Note: version is now handled in the header by Marshal(), not here
-	// payload: Seq + Epoch + CommitTs + DispatcherID
-	payloadSize := 8 + 8 + 8 + e.DispatcherID.GetSize()
+	// Note: version is now handled in the header by Marshal(), not here.
+	// Keep the legacy payload as the prefix and append generation as an optional
+	// trailer so older decoders can ignore it during rolling upgrade.
+	payloadSize := 8 + 8 + 8 + e.DispatcherID.GetSize() + 8
 	data := make([]byte, payloadSize)
 	offset := 0
 
@@ -180,6 +190,10 @@ func (e SyncPointEvent) encodeV1() ([]byte, error) {
 
 	// DispatcherID
 	copy(data[offset:], e.DispatcherID.Marshal())
+	offset += e.DispatcherID.GetSize()
+
+	// Generation
+	binary.BigEndian.PutUint64(data[offset:], e.Generation)
 
 	return data, nil
 }
@@ -204,6 +218,11 @@ func (e *SyncPointEvent) decodeV1(data []byte) error {
 	err := e.DispatcherID.Unmarshal(data[offset:])
 	if err != nil {
 		return err
+	}
+	offset += e.DispatcherID.GetSize()
+
+	if len(data[offset:]) >= 8 {
+		e.Generation = binary.BigEndian.Uint64(data[offset:])
 	}
 
 	return nil

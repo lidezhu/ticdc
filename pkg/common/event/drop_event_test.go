@@ -22,7 +22,7 @@ import (
 
 func TestDropEvent(t *testing.T) {
 	did := common.NewDispatcherID()
-	e := NewDropEvent(did, 123, 100, 456)
+	e := NewDropEvent(did, 123, 100, 456, 7)
 	data, err := e.Marshal()
 	require.NoError(t, err)
 	require.Len(t, data, int(e.GetSize())+int(GetEventHeaderSize()))
@@ -34,11 +34,12 @@ func TestDropEvent(t *testing.T) {
 	require.Equal(t, e.DispatcherID, e2.DispatcherID)
 	require.Equal(t, e.DroppedSeq, e2.DroppedSeq)
 	require.Equal(t, e.DroppedCommitTs, e2.DroppedCommitTs)
+	require.Equal(t, e.Generation, e2.Generation)
 }
 
 func TestDropEventMethods(t *testing.T) {
 	did := common.NewDispatcherID()
-	e := NewDropEvent(did, 123, 100, 456)
+	e := NewDropEvent(did, 123, 100, 456, 7)
 
 	// Test GetType
 	require.Equal(t, TypeDropEvent, e.GetType())
@@ -48,6 +49,7 @@ func TestDropEventMethods(t *testing.T) {
 
 	// Test GetDispatcherID
 	require.Equal(t, did, e.GetDispatcherID())
+	require.Equal(t, uint64(7), e.GetGeneration())
 
 	// Test GetCommitTs
 	require.Equal(t, common.Ts(456), e.GetCommitTs())

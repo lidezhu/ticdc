@@ -46,6 +46,10 @@ func (m *mockEventDispatcher) GetId() common.DispatcherID {
 	return m.id
 }
 
+func (m *mockEventDispatcher) GetGeneration() uint64 {
+	return 0
+}
+
 func (m *mockEventDispatcher) GetMode() int64 {
 	return common.DefaultMode
 }
@@ -281,6 +285,7 @@ func TestGroupHeartbeatUsesEpochAndClamp(t *testing.T) {
 	require.Equal(t, localDispatcher.id, localHeartbeat.DispatcherProgresses[0].DispatcherID)
 	require.Equal(t, uint64(150), localHeartbeat.DispatcherProgresses[0].CheckpointTs)
 	require.Equal(t, uint64(3), localHeartbeat.DispatcherProgresses[0].Epoch)
+	require.Equal(t, uint64(0), localHeartbeat.DispatcherProgresses[0].Generation)
 
 	remoteHeartbeat := grouped[remoteID]
 	require.NotNil(t, remoteHeartbeat)
@@ -290,6 +295,7 @@ func TestGroupHeartbeatUsesEpochAndClamp(t *testing.T) {
 	require.Equal(t, remoteDispatcher.id, remoteHeartbeat.DispatcherProgresses[0].DispatcherID)
 	require.Equal(t, uint64(210), remoteHeartbeat.DispatcherProgresses[0].CheckpointTs)
 	require.Equal(t, uint64(5), remoteHeartbeat.DispatcherProgresses[0].Epoch)
+	require.Equal(t, uint64(0), remoteHeartbeat.DispatcherProgresses[0].Generation)
 }
 
 func TestGroupHeartbeatResetThenHandshake(t *testing.T) {

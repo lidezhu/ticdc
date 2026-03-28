@@ -21,7 +21,8 @@ import (
 )
 
 const (
-	HandshakeEventVersion = 0
+	HandshakeEventVersion1 = 0
+	HandshakeEventVersion2 = 1
 )
 
 var _ Event = &HandshakeEvent{}
@@ -32,6 +33,7 @@ type HandshakeEvent struct {
 	ResolvedTs   uint64              `json:"resolved_ts"`
 	Seq          uint64              `json:"seq"`
 	Epoch        uint64              `json:"epoch"`
+	Generation   uint64              `json:"generation,omitempty"`
 	DispatcherID common.DispatcherID `json:"-"`
 	TableInfo    *common.TableInfo   `json:"table_info"`
 }
@@ -41,9 +43,10 @@ func NewHandshakeEvent(
 	resolvedTs common.Ts,
 	epoch uint64,
 	tableInfo *common.TableInfo,
+	generations ...uint64,
 ) HandshakeEvent {
-	return HandshakeEvent{
-		Version:    HandshakeEventVersion,
+	event := HandshakeEvent{
+		Version:    HandshakeEventVersion1,
 		ResolvedTs: resolvedTs,
 		// handshake event always have seq 1
 		Seq:          1,
@@ -51,6 +54,13 @@ func NewHandshakeEvent(
 		DispatcherID: dispatcherID,
 		TableInfo:    tableInfo,
 	}
+	if len(generations) > 0 {
+		event.Generation = generations[0]
+		if event.Generation != 0 {
+			event.Version = HandshakeEventVersion2
+		}
+	}
+	return event
 }
 
 func (e *HandshakeEvent) String() string {
@@ -70,6 +80,10 @@ func (e *HandshakeEvent) GetSeq() uint64 {
 
 func (e *HandshakeEvent) GetEpoch() uint64 {
 	return e.Epoch
+}
+
+func (e *HandshakeEvent) GetGeneration() uint64 {
+	return e.Generation
 }
 
 // GetDispatcherID returns the dispatcher ID
@@ -93,6 +107,9 @@ func (e *HandshakeEvent) GetSize() int64 {
 	// payload: resolvedTs + seq + epoch + dispatcherID + tableInfo (variable)
 	// Note: TableInfo size is not included in this calculation as it's variable
 	payloadSize := int64(8 + 8 + 8 + e.DispatcherID.GetSize())
+	if e.Version >= HandshakeEventVersion2 {
+		payloadSize += 8
+	}
 	return payloadSize
 }
 
@@ -109,8 +126,13 @@ func (e HandshakeEvent) Marshal() ([]byte, error) {
 	var payload []byte
 	var err error
 	switch e.Version {
-	case HandshakeEventVersion:
+	case HandshakeEventVersion1:
 		payload, err = e.encodeV1()
+		if err != nil {
+			return nil, err
+		}
+	case HandshakeEventVersion2:
+		payload, err = e.encodeV2()
 		if err != nil {
 			return nil, err
 		}
@@ -134,8 +156,10 @@ func (e *HandshakeEvent) Unmarshal(data []byte) error {
 
 	// 3. Decode based on version
 	switch version {
-	case HandshakeEventVersion:
+	case HandshakeEventVersion1:
 		return e.decodeV1(payload)
+	case HandshakeEventVersion2:
+		return e.decodeV2(payload)
 	default:
 		return fmt.Errorf("unsupported HandshakeEvent version: %d", version)
 	}
@@ -176,6 +200,31 @@ func (e HandshakeEvent) encodeV1() ([]byte, error) {
 	return data, nil
 }
 
+func (e HandshakeEvent) encodeV2() ([]byte, error) {
+	tableInfoData, err := e.TableInfo.Marshal()
+	if err != nil {
+		return nil, err
+	}
+
+	payloadSize := 8 + 8 + 8 + 8 + e.DispatcherID.GetSize() + len(tableInfoData)
+	data := make([]byte, payloadSize)
+	offset := 0
+
+	binary.BigEndian.PutUint64(data[offset:], e.ResolvedTs)
+	offset += 8
+	binary.BigEndian.PutUint64(data[offset:], e.Seq)
+	offset += 8
+	binary.BigEndian.PutUint64(data[offset:], e.Epoch)
+	offset += 8
+	binary.BigEndian.PutUint64(data[offset:], e.Generation)
+	offset += 8
+	copy(data[offset:], e.DispatcherID.Marshal())
+	offset += e.DispatcherID.GetSize()
+	copy(data[offset:], tableInfoData)
+
+	return data, nil
+}
+
 func (e *HandshakeEvent) decodeV1(data []byte) error {
 	// Note: header (magic + event type + version + length) has already been read and removed from data
 	offset := 0
@@ -208,5 +257,34 @@ func (e *HandshakeEvent) decodeV1(data []byte) error {
 	// Initialize private fields after unmarshaling
 	e.TableInfo.InitPrivateFields()
 
+	return nil
+}
+
+func (e *HandshakeEvent) decodeV2(data []byte) error {
+	offset := 0
+
+	e.ResolvedTs = binary.BigEndian.Uint64(data[offset:])
+	offset += 8
+
+	e.Seq = binary.BigEndian.Uint64(data[offset:])
+	offset += 8
+
+	e.Epoch = binary.BigEndian.Uint64(data[offset:])
+	offset += 8
+
+	e.Generation = binary.BigEndian.Uint64(data[offset:])
+	offset += 8
+
+	err := e.DispatcherID.Unmarshal(data[offset : offset+e.DispatcherID.GetSize()])
+	if err != nil {
+		return err
+	}
+	offset += e.DispatcherID.GetSize()
+
+	e.TableInfo, err = common.UnmarshalJSONToTableInfo(data[offset:])
+	if err != nil {
+		return err
+	}
+	e.TableInfo.InitPrivateFields()
 	return nil
 }

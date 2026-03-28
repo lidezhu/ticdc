@@ -119,6 +119,7 @@ message DispatcherConfig {
     // we need to replay the DDL at blockTs by starting from (blockTs-1), while avoiding
     // potential duplicate DML writes at blockTs.
     bool skipDMLAsStartTs = 6;
+    uint64 generation = 7;
 }
 
 message ScheduleDispatcherRequest {

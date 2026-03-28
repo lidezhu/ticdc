@@ -28,6 +28,7 @@ func TestResolvedEvent(t *testing.T) {
 		DispatcherID: did,
 		ResolvedTs:   123,
 		Epoch:        10,
+		Generation:   7,
 	}
 	data, err := e.Marshal()
 	require.NoError(t, err)
@@ -42,7 +43,7 @@ func TestResolvedEvent(t *testing.T) {
 
 func TestResolvedEventMethods(t *testing.T) {
 	did := common.NewDispatcherID()
-	e := NewResolvedEvent(123, did, 10)
+	e := NewResolvedEvent(123, did, 10, 7)
 
 	// Test GetType
 	require.Equal(t, TypeResolvedEvent, e.GetType())
@@ -52,6 +53,7 @@ func TestResolvedEventMethods(t *testing.T) {
 
 	// Test GetEpoch
 	require.Equal(t, uint64(10), e.GetEpoch())
+	require.Equal(t, uint64(7), e.GetGeneration())
 
 	// Test GetDispatcherID
 	require.Equal(t, did, e.GetDispatcherID())
@@ -205,7 +207,7 @@ func TestResolvedEventSize(t *testing.T) {
 	e := NewResolvedEvent(123, did, 10)
 
 	// GetSize should only return business data size, not including header
-	expectedSize := int64(8 + 8 + 8 + did.GetSize())
+	expectedSize := int64(8 + 8 + 8 + did.GetSize() + 8)
 	require.Equal(t, expectedSize, e.GetSize())
 
 	// Marshaled data should include header

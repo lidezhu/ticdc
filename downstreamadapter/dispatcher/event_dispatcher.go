@@ -65,8 +65,41 @@ func NewEventDispatcher(
 	redoEnable bool,
 	redoGlobalTs *atomic.Uint64,
 ) *EventDispatcher {
-	basicDispatcher := NewBasicDispatcher(
+	return NewEventDispatcherWithGeneration(
 		id,
+		0,
+		tableSpan,
+		startTs,
+		schemaID,
+		schemaIDToDispatchers,
+		skipSyncpointAtStartTs,
+		skipDMLAsStartTs,
+		currentPdTs,
+		sink,
+		sharedInfo,
+		redoEnable,
+		redoGlobalTs,
+	)
+}
+
+func NewEventDispatcherWithGeneration(
+	id common.DispatcherID,
+	generation uint64,
+	tableSpan *heartbeatpb.TableSpan,
+	startTs uint64,
+	schemaID int64,
+	schemaIDToDispatchers *SchemaIDToDispatchers,
+	skipSyncpointAtStartTs bool,
+	skipDMLAsStartTs bool,
+	currentPdTs uint64,
+	sink sink.Sink,
+	sharedInfo *SharedInfo,
+	redoEnable bool,
+	redoGlobalTs *atomic.Uint64,
+) *EventDispatcher {
+	basicDispatcher := NewBasicDispatcherWithGeneration(
+		id,
+		generation,
 		tableSpan,
 		startTs,
 		schemaID,

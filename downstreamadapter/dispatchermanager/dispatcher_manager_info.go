@@ -25,10 +25,11 @@ import (
 // event_dispatcher_mananger_info.go is used to store the basic info and function of the event dispatcher manager
 
 type dispatcherCreateInfo struct {
-	Id        common.DispatcherID
-	TableSpan *heartbeatpb.TableSpan
-	StartTs   uint64
-	SchemaID  int64
+	Id         common.DispatcherID
+	Generation uint64
+	TableSpan  *heartbeatpb.TableSpan
+	StartTs    uint64
+	SchemaID   int64
 	// SkipDMLAsStartTs indicates whether to skip DML events at (StartTs+1).
 	// It is used when a dispatcher is recreated during an in-flight DDL barrier:
 	// we need to replay the DDL by starting from (blockTs-1), while avoiding
