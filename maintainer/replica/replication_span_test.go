@@ -35,11 +35,13 @@ func TestNewRemoveDispatcherMessage(t *testing.T) {
 	t.Parallel()
 
 	replicaSet := NewSpanReplication(common.NewChangeFeedIDWithName("test", common.DefaultKeyspaceName), common.NewDispatcherID(), 1, getTableSpanByID(4), 10, common.DefaultMode, false)
+	replicaSet.SetNodeID("node1")
 	msg := replicaSet.NewRemoveDispatcherMessage("node1", heartbeatpb.OperatorType_O_Remove)
 	req := msg.Message[0].(*heartbeatpb.ScheduleDispatcherRequest)
 	require.Equal(t, heartbeatpb.ScheduleAction_Remove, req.ScheduleAction)
 	require.Equal(t, replicaSet.ID.ToPB(), req.Config.DispatcherID)
 	require.Equal(t, replicaSet.Span, req.Config.Span)
+	require.Equal(t, uint64(1), req.Config.Generation)
 	require.Equal(t, "node1", msg.To.String())
 }
 
@@ -47,6 +49,7 @@ func TestSpanReplication_NewAddDispatcherMessage(t *testing.T) {
 	t.Parallel()
 
 	replicaSet := NewSpanReplication(common.NewChangeFeedIDWithName("test", common.DefaultKeyspaceName), common.NewDispatcherID(), 1, getTableSpanByID(4), 10, common.DefaultMode, false)
+	replicaSet.SetNodeID("node1")
 
 	msg := replicaSet.NewAddDispatcherMessage("node1", heartbeatpb.OperatorType_O_Add)
 	require.Equal(t, "node1", msg.To.String())
@@ -55,6 +58,7 @@ func TestSpanReplication_NewAddDispatcherMessage(t *testing.T) {
 	require.Equal(t, replicaSet.ID.ToPB(), req.Config.DispatcherID)
 	require.Equal(t, replicaSet.schemaID, req.Config.SchemaID)
 	require.Equal(t, uint64(10), req.Config.StartTs)
+	require.Equal(t, uint64(1), req.Config.Generation)
 	require.False(t, req.Config.SkipDMLAsStartTs)
 }
 

@@ -306,17 +306,26 @@ func SetDispatcherTaskScheduler(taskScheduler threadpool.ThreadPool) {
 
 type DispatcherEvent struct {
 	From *node.ID
+	// Generation mirrors the generation carried by the event payload. Keeping it
+	// here avoids threading GetGeneration calls through all event handling code.
+	Generation uint64
 	commonEvent.Event
 }
 
 func (d DispatcherEvent) GetSize() int64 {
-	return d.From.GetSize() + d.Event.GetSize()
+	return d.From.GetSize() + d.Event.GetSize() + 8
 }
 
 func NewDispatcherEvent(from *node.ID, event commonEvent.Event) DispatcherEvent {
+	return NewDispatcherEventWithGeneration(from, event, 0)
+}
+
+func NewDispatcherEventWithGeneration(from *node.ID, event commonEvent.Event, generation uint64) DispatcherEvent {
+	_ = generation
 	return DispatcherEvent{
-		From:  from,
-		Event: event,
+		From:       from,
+		Generation: event.GetGeneration(),
+		Event:      event,
 	}
 }
 

@@ -58,6 +58,7 @@ type DispatcherProgress struct {
 	DispatcherID common.DispatcherID
 	CheckpointTs uint64 // 8 bytes
 	Epoch        uint64 // 8 bytes
+	Generation   uint64
 }
 
 func (dp DispatcherProgress) GetSize() int {
@@ -116,13 +117,14 @@ func NewDispatcherHeartbeat() *DispatcherHeartbeat {
 	}
 }
 
-func (d *DispatcherHeartbeat) AddDispatcherProgress(dispatcherID common.DispatcherID, checkpointTs uint64, epoch uint64) {
+func (d *DispatcherHeartbeat) AddDispatcherProgress(dispatcherID common.DispatcherID, checkpointTs uint64, epoch uint64, generation uint64) {
 	d.DispatcherCount++
 	d.DispatcherProgresses = append(d.DispatcherProgresses, DispatcherProgress{
 		Version:      DispatcherProgressVersion1,
 		DispatcherID: dispatcherID,
 		CheckpointTs: checkpointTs,
 		Epoch:        epoch,
+		Generation:   generation,
 	})
 }
 
@@ -133,6 +135,7 @@ func (d *DispatcherHeartbeat) GetSize() int {
 		for _, dp := range d.DispatcherProgresses {
 			size += dp.GetSize()
 		}
+		size += len(d.DispatcherProgresses) * 8
 		return size
 	}
 	for _, dp := range d.DispatcherProgressesLegacy {
@@ -227,6 +230,9 @@ func (d *DispatcherHeartbeat) encodeV2() ([]byte, error) {
 		}
 		buf.Write(dpData)
 	}
+	for _, dp := range d.DispatcherProgresses {
+		binary.Write(buf, binary.BigEndian, dp.Generation)
+	}
 	return buf.Bytes(), nil
 }
 
@@ -244,6 +250,15 @@ func (d *DispatcherHeartbeat) decodeV2(data []byte) error {
 		}
 		d.DispatcherProgresses = append(d.DispatcherProgresses, dp)
 	}
+	switch remain := buf.Len(); {
+	case remain == 0:
+	case remain == int(d.DispatcherCount)*8:
+		for i := range d.DispatcherProgresses {
+			d.DispatcherProgresses[i].Generation = binary.BigEndian.Uint64(buf.Next(8))
+		}
+	default:
+		return fmt.Errorf("invalid DispatcherHeartbeat generation trailer length: %d", remain)
+	}
 	return nil
 }
 
@@ -258,13 +273,18 @@ const (
 type DispatcherState struct {
 	State        DSState
 	DispatcherID common.DispatcherID
+	Generation   uint64
 }
 
-func NewDispatcherState(dispatcherID common.DispatcherID, state DSState) DispatcherState {
-	return DispatcherState{
+func NewDispatcherState(dispatcherID common.DispatcherID, state DSState, generations ...uint64) DispatcherState {
+	ds := DispatcherState{
 		State:        state,
 		DispatcherID: dispatcherID,
 	}
+	if len(generations) > 0 {
+		ds.Generation = generations[0]
+	}
+	return ds
 }
 
 func (d *DispatcherState) GetSize() int {
@@ -330,6 +350,7 @@ func (d *DispatcherHeartbeatResponse) GetSize() int {
 	for _, ds := range d.DispatcherStates {
 		size += ds.GetSize()
 	}
+	size += len(d.DispatcherStates) * 8
 	return size
 }
 
@@ -397,6 +418,9 @@ func (d *DispatcherHeartbeatResponse) encodeV1() ([]byte, error) {
 		}
 		buf.Write(dsData)
 	}
+	for _, ds := range d.DispatcherStates {
+		binary.Write(buf, binary.BigEndian, ds.Generation)
+	}
 	return buf.Bytes(), nil
 }
 
@@ -412,6 +436,15 @@ func (d *DispatcherHeartbeatResponse) decodeV1(data []byte) error {
 			return err
 		}
 		d.DispatcherStates = append(d.DispatcherStates, ds)
+	}
+	switch remain := buf.Len(); {
+	case remain == 0:
+	case remain == int(d.DispatcherCount)*8:
+		for i := range d.DispatcherStates {
+			d.DispatcherStates[i].Generation = binary.BigEndian.Uint64(buf.Next(8))
+		}
+	default:
+		return fmt.Errorf("invalid DispatcherHeartbeatResponse generation trailer length: %d", remain)
 	}
 	return nil
 }

@@ -39,3 +39,19 @@ func TestHandshakeEvent(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, &e, e2)
 }
+
+func TestHandshakeEventV2Generation(t *testing.T) {
+	dispatcherID := common.NewDispatcherID()
+	tableInfo := &common.TableInfo{}
+	e := NewHandshakeEvent(dispatcherID, 456, 100, tableInfo, 7)
+
+	data, err := e.Marshal()
+	require.NoError(t, err)
+
+	var decoded HandshakeEvent
+	err = decoded.Unmarshal(data)
+	require.NoError(t, err)
+	require.Equal(t, HandshakeEventVersion2, decoded.Version)
+	require.Equal(t, uint64(7), decoded.Generation)
+	require.Equal(t, dispatcherID, decoded.DispatcherID)
+}

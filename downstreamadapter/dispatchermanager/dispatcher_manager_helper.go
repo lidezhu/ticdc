@@ -73,9 +73,10 @@ func getDispatcherStatus(id common.DispatcherID, dispatcherItem dispatcher.Dispa
 }
 
 func prepareCreateDispatcher[T dispatcher.Dispatcher](infos map[common.DispatcherID]dispatcherCreateInfo, dispatcherMap *DispatcherMap[T]) (
-	[]common.DispatcherID, []int64, []int64, []*heartbeatpb.TableSpan, []int64, []bool,
+	[]common.DispatcherID, []uint64, []int64, []int64, []*heartbeatpb.TableSpan, []int64, []bool,
 ) {
 	dispatcherIds := make([]common.DispatcherID, 0, len(infos))
+	generations := make([]uint64, 0, len(infos))
 	tableIds := make([]int64, 0, len(infos))
 	startTsList := make([]int64, 0, len(infos))
 	tableSpans := make([]*heartbeatpb.TableSpan, 0, len(infos))
@@ -87,13 +88,14 @@ func prepareCreateDispatcher[T dispatcher.Dispatcher](infos map[common.Dispatche
 			continue
 		}
 		dispatcherIds = append(dispatcherIds, id)
+		generations = append(generations, info.Generation)
 		tableIds = append(tableIds, info.TableSpan.TableID)
 		startTsList = append(startTsList, int64(info.StartTs))
 		tableSpans = append(tableSpans, info.TableSpan)
 		schemaIds = append(schemaIds, info.SchemaID)
 		skipDMLAsStartTsList = append(skipDMLAsStartTsList, info.SkipDMLAsStartTs)
 	}
-	return dispatcherIds, tableIds, startTsList, tableSpans, schemaIds, skipDMLAsStartTsList
+	return dispatcherIds, generations, tableIds, startTsList, tableSpans, schemaIds, skipDMLAsStartTsList
 }
 
 func resolveSkipDMLAsStartTs(newStartTs, originalStartTs int64, scheduleSkipDMLAsStartTs, sinkSkipDMLAsStartTs bool) bool {

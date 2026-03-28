@@ -22,7 +22,7 @@ import (
 )
 
 func TestSyncpointEvent(t *testing.T) {
-	e := NewSyncPointEvent(common.NewDispatcherID(), 100, 1000, 10)
+	e := NewSyncPointEvent(common.NewDispatcherID(), 100, 1000, 10, 7)
 	data, err := e.Marshal()
 	require.NoError(t, err)
 	require.Len(t, data, int(e.GetSize())+GetEventHeaderSize())
@@ -35,11 +35,12 @@ func TestSyncpointEvent(t *testing.T) {
 
 func TestSyncPointEventMethods(t *testing.T) {
 	did := common.NewDispatcherID()
-	e := NewSyncPointEvent(did, 123, 1000, 10)
+	e := NewSyncPointEvent(did, 123, 1000, 10, 7)
 
 	require.Equal(t, TypeSyncPointEvent, e.GetType())
 	require.Equal(t, uint64(1000), e.GetSeq())
 	require.Equal(t, uint64(10), e.GetEpoch())
+	require.Equal(t, uint64(7), e.GetGeneration())
 	require.Equal(t, did, e.GetDispatcherID())
 	require.Equal(t, common.Ts(123), e.GetCommitTs())
 	require.Equal(t, common.Ts(123), e.GetStartTs())
@@ -176,8 +177,8 @@ func TestSyncPointEventSize(t *testing.T) {
 	e := NewSyncPointEvent(did, 100, 1000, 10)
 
 	// GetSize should only return business data size, not including header
-	// Seq(8) + Epoch(8) + DispatcherID + CommitTs(8)
-	expectedSize := int64(8 + 8 + did.GetSize() + 8)
+	// Seq(8) + Epoch(8) + DispatcherID + CommitTs(8) + Generation(8)
+	expectedSize := int64(8 + 8 + did.GetSize() + 8 + 8)
 	require.Equal(t, expectedSize, e.GetSize())
 
 	// Marshaled data should include header

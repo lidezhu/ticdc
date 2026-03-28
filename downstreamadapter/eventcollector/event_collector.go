@@ -405,18 +405,18 @@ func (c *EventCollector) sendDispatcherHeartbeat() {
 // groupHeartbeat groups the heartbeat by the dispatcherStat's serverID.
 func (c *EventCollector) groupHeartbeat() map[node.ID]*event.DispatcherHeartbeat {
 	groupedHeartbeats := make(map[node.ID]*event.DispatcherHeartbeat)
-	group := func(target node.ID, dispatcherID common.DispatcherID, checkpointTs uint64, epoch uint64) {
+	group := func(target node.ID, dispatcherID common.DispatcherID, checkpointTs uint64, epoch uint64, generation uint64) {
 		heartbeat, ok := groupedHeartbeats[target]
 		if !ok {
 			heartbeat = event.NewDispatcherHeartbeat()
 			groupedHeartbeats[target] = heartbeat
 		}
-		heartbeat.AddDispatcherProgress(dispatcherID, checkpointTs, epoch)
+		heartbeat.AddDispatcherProgress(dispatcherID, checkpointTs, epoch, generation)
 	}
 
 	c.dispatcherMap.Range(func(_, value interface{}) bool {
 		stat := value.(*dispatcherStat)
-		eventServiceID, checkpointTs, epoch, ok := stat.getHeartbeatReport()
+		eventServiceID, checkpointTs, epoch, generation, ok := stat.getHeartbeatReport()
 		if !ok {
 			return true
 		}
@@ -425,6 +425,7 @@ func (c *EventCollector) groupHeartbeat() map[node.ID]*event.DispatcherHeartbeat
 			stat.getDispatcherID(),
 			checkpointTs,
 			epoch,
+			generation,
 		)
 		return true
 	})
@@ -505,7 +506,7 @@ func (c *EventCollector) handleDispatcherHeartbeatResponse(targetMessage *messag
 				continue
 			}
 			stat := v.(*dispatcherStat)
-			stat.retryCurrentRegistrationIfRemovedFrom(targetMessage.From)
+			stat.retryCurrentRegistrationIfRemovedFrom(targetMessage.From, ds.Generation)
 		}
 	}
 }

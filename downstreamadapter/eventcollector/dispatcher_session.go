@@ -485,6 +485,7 @@ func (s *dispatcherSession) newDispatcherRegisterRequest(serverID string, onlyRe
 			BdrMode:              s.target.GetBDRMode(),
 			Mode:                 s.target.GetMode(),
 			Epoch:                0,
+			Generation:           s.target.GetGeneration(),
 			Timezone:             s.target.GetTimezone(),
 			Integrity:            s.target.GetIntegrityConfig(),
 			OutputRawChangeEvent: s.target.IsOutputRawChangeEvent(),
@@ -519,6 +520,7 @@ func (s *dispatcherSession) newDispatcherResetRequest(serverID string, resetTs u
 			BdrMode:              s.target.GetBDRMode(),
 			Mode:                 s.target.GetMode(),
 			Epoch:                epoch,
+			Generation:           s.target.GetGeneration(),
 			Timezone:             s.target.GetTimezone(),
 			Integrity:            s.target.GetIntegrityConfig(),
 			OutputRawChangeEvent: s.target.IsOutputRawChangeEvent(),
@@ -536,6 +538,7 @@ func (s *dispatcherSession) newDispatcherRemoveRequest(serverID string) *messagi
 			ServerId:   serverID,
 			ActionType: eventpb.ActionType_ACTION_TYPE_REMOVE,
 			Mode:       s.target.GetMode(),
+			Generation: s.target.GetGeneration(),
 		},
 	}
 }

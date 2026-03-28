@@ -554,6 +554,46 @@ func TestResetDispatcherConcurrently(t *testing.T) {
 	require.Equal(t, 500+maxEpoch, finalStat.startTs, "the final startTs should correspond to the max epoch")
 }
 
+func TestAddDispatcherNewerGenerationReplacesOld(t *testing.T) {
+	broker, _, _, _ := newEventBrokerForTest()
+	defer broker.close()
+
+	dispInfo := newMockDispatcherInfoForTest(t)
+	dispInfo.generation = 1
+	require.NoError(t, broker.addDispatcher(dispInfo))
+
+	dispPtr := broker.getDispatcher(dispInfo.GetID())
+	require.NotNil(t, dispPtr)
+	oldStat := dispPtr.Load()
+
+	newerInfo := newMockDispatcherInfo(t, 600, dispInfo.GetID(), 100, eventpb.ActionType_ACTION_TYPE_REGISTER)
+	newerInfo.generation = 2
+	require.NoError(t, broker.addDispatcher(newerInfo))
+
+	newStat := broker.getDispatcher(dispInfo.GetID()).Load()
+	require.NotSame(t, oldStat, newStat)
+	require.True(t, oldStat.isRemoved.Load())
+	require.Equal(t, uint64(2), newStat.generation)
+	require.Equal(t, uint64(600), newStat.startTs)
+}
+
+func TestRemoveDispatcherStaleGenerationIgnored(t *testing.T) {
+	broker, _, _, _ := newEventBrokerForTest()
+	defer broker.close()
+
+	dispInfo := newMockDispatcherInfoForTest(t)
+	dispInfo.generation = 2
+	require.NoError(t, broker.addDispatcher(dispInfo))
+
+	staleRemove := newMockDispatcherInfo(t, dispInfo.startTs, dispInfo.GetID(), 100, eventpb.ActionType_ACTION_TYPE_REMOVE)
+	staleRemove.generation = 1
+	broker.removeDispatcher(staleRemove)
+
+	dispPtr := broker.getDispatcher(dispInfo.GetID())
+	require.NotNil(t, dispPtr)
+	require.Equal(t, uint64(2), dispPtr.Load().generation)
+}
+
 func TestHandleResolvedTs(t *testing.T) {
 	broker, _, _, outputCh := newEventBrokerForTest()
 	defer broker.close()
@@ -569,6 +609,7 @@ func TestHandleResolvedTs(t *testing.T) {
 	cacheMap := make(map[node.ID]*resolvedTsCache)
 	wrapEvent := &wrapEvent{
 		serverID:        "test",
+		generation:      0,
 		resolvedTsEvent: event.NewResolvedEvent(100, dispInfo.GetID(), 0),
 	}
 	// handle resolvedTsCacheSize resolvedTs events, so the cache is full.
@@ -737,6 +778,77 @@ func TestHandleDispatcherHeartbeatEpochFilter(t *testing.T) {
 	broker.handleDispatcherHeartbeat(currentHeartbeat)
 	require.Equal(t, uint64(220), dispatcher.checkpointTs.Load())
 	require.Greater(t, dispatcher.lastReceivedHeartbeatTime.Load(), int64(0))
+}
+
+func TestHandleDispatcherHeartbeatGenerationFilter(t *testing.T) {
+	broker, _, _, _ := newEventBrokerForTest()
+	defer broker.close()
+
+	dispInfo := newMockDispatcherInfoForTest(t)
+	dispInfo.generation = 3
+	dispInfo.epoch = 2
+	require.NoError(t, broker.addDispatcher(dispInfo))
+
+	dispatcher := broker.getDispatcher(dispInfo.GetID()).Load()
+	require.NotNil(t, dispatcher)
+	dispatcher.checkpointTs.Store(100)
+	dispatcher.lastReceivedHeartbeatTime.Store(0)
+
+	staleHeartbeat := &DispatcherHeartBeatWithServerID{
+		serverID: "test-server-1",
+		heartbeat: &event.DispatcherHeartbeat{
+			Version:         event.DispatcherHeartbeatVersion2,
+			ClusterID:       0,
+			DispatcherCount: 1,
+			DispatcherProgresses: []event.DispatcherProgress{{
+				Version:      event.DispatcherProgressVersion1,
+				DispatcherID: dispInfo.GetID(),
+				CheckpointTs: 200,
+				Epoch:        2,
+				Generation:   2,
+			}},
+		},
+	}
+	broker.handleDispatcherHeartbeat(staleHeartbeat)
+	require.Equal(t, uint64(100), dispatcher.checkpointTs.Load())
+	require.Equal(t, int64(0), dispatcher.lastReceivedHeartbeatTime.Load())
+
+	currentHeartbeat := &DispatcherHeartBeatWithServerID{
+		serverID: "test-server-1",
+		heartbeat: &event.DispatcherHeartbeat{
+			Version:         event.DispatcherHeartbeatVersion2,
+			ClusterID:       0,
+			DispatcherCount: 1,
+			DispatcherProgresses: []event.DispatcherProgress{{
+				Version:      event.DispatcherProgressVersion1,
+				DispatcherID: dispInfo.GetID(),
+				CheckpointTs: 220,
+				Epoch:        2,
+				Generation:   3,
+			}},
+		},
+	}
+	broker.handleDispatcherHeartbeat(currentHeartbeat)
+	require.Equal(t, uint64(220), dispatcher.checkpointTs.Load())
+	require.Greater(t, dispatcher.lastReceivedHeartbeatTime.Load(), int64(0))
+}
+
+func TestSendDispatcherResponseCarriesGeneration(t *testing.T) {
+	broker, _, _, outputCh := newEventBrokerForTest()
+	defer broker.close()
+
+	response := event.NewDispatcherHeartbeatResponse()
+	dispatcherID := common.NewDispatcherID()
+	response.Append(event.NewDispatcherState(dispatcherID, event.DSStateRemoved, 9))
+	broker.sendDispatcherResponse(map[node.ID]*event.DispatcherHeartbeatResponse{
+		node.ID("server-1"): response,
+	})
+
+	msg := <-outputCh
+	got := msg.Message[0].(*event.DispatcherHeartbeatResponse)
+	require.Len(t, got.DispatcherStates, 1)
+	require.Equal(t, dispatcherID, got.DispatcherStates[0].DispatcherID)
+	require.Equal(t, uint64(9), got.DispatcherStates[0].Generation)
 }
 
 // TestSendHandshakeIfNeedConcurrency tests the concurrent safety of sendHandshakeIfNeed method

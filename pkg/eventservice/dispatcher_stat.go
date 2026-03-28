@@ -58,6 +58,9 @@ type dispatcherStat struct {
 	// The epoch of the dispatcher.
 	// It should not be changed after the dispatcher is created.
 	epoch uint64
+	// The dispatcher host generation fences stale EC<->ES interactions across
+	// remove/recreate cycles.
+	generation uint64
 
 	// The seq of the events that have been sent to the downstream dispatcher.
 	// It starts from 1, and increase by 1 for each event.
@@ -148,6 +151,7 @@ func newDispatcherStat(
 		filter:             info.GetFilter(),
 		startTs:            info.GetStartTs(),
 		epoch:              info.GetEpoch(),
+		generation:         info.GetGeneration(),
 		startTableInfo:     startTableInfo,
 		txnAtomicity:       info.GetTxnAtomicity(),
 	}
@@ -302,6 +306,7 @@ var zeroResolvedEvent = pevent.ResolvedEvent{}
 
 type wrapEvent struct {
 	serverID        node.ID
+	generation      uint64
 	resolvedTsEvent pevent.ResolvedEvent
 
 	e       messaging.IOTypeT
@@ -310,9 +315,10 @@ type wrapEvent struct {
 	postSendFunc func()
 }
 
-func newWrapBatchDMLEvent(serverID node.ID, e *pevent.BatchDMLEvent) *wrapEvent {
+func newWrapBatchDMLEvent(serverID node.ID, generation uint64, e *pevent.BatchDMLEvent) *wrapEvent {
 	w := getWrapEvent()
 	w.serverID = serverID
+	w.generation = generation
 	w.e = e
 	w.msgType = e.GetType()
 	return w
@@ -323,6 +329,7 @@ func (w *wrapEvent) reset() {
 	w.postSendFunc = nil
 	w.resolvedTsEvent = zeroResolvedEvent
 	w.serverID = ""
+	w.generation = 0
 	w.msgType = -1
 	wrapEventPool.Put(w)
 }
@@ -335,49 +342,55 @@ func (w *wrapEvent) getDispatcherID() common.DispatcherID {
 	return e.GetDispatcherID()
 }
 
-func newWrapHandshakeEvent(serverID node.ID, e pevent.HandshakeEvent) *wrapEvent {
+func newWrapHandshakeEvent(serverID node.ID, generation uint64, e pevent.HandshakeEvent) *wrapEvent {
 	w := getWrapEvent()
 	w.serverID = serverID
+	w.generation = generation
 	w.e = &e
 	w.msgType = pevent.TypeHandshakeEvent
 	return w
 }
 
-func newWrapReadyEvent(serverID node.ID, e pevent.ReadyEvent) *wrapEvent {
+func newWrapReadyEvent(serverID node.ID, generation uint64, e pevent.ReadyEvent) *wrapEvent {
 	w := getWrapEvent()
 	w.serverID = serverID
+	w.generation = generation
 	w.e = &e
 	w.msgType = pevent.TypeReadyEvent
 	return w
 }
 
-func newWrapNotReusableEvent(serverID node.ID, e pevent.NotReusableEvent) *wrapEvent {
+func newWrapNotReusableEvent(serverID node.ID, generation uint64, e pevent.NotReusableEvent) *wrapEvent {
 	w := getWrapEvent()
 	w.serverID = serverID
+	w.generation = generation
 	w.e = &e
 	w.msgType = pevent.TypeNotReusableEvent
 	return w
 }
 
-func newWrapResolvedEvent(serverID node.ID, e pevent.ResolvedEvent) *wrapEvent {
+func newWrapResolvedEvent(serverID node.ID, generation uint64, e pevent.ResolvedEvent) *wrapEvent {
 	w := getWrapEvent()
 	w.serverID = serverID
+	w.generation = generation
 	w.resolvedTsEvent = e
 	w.msgType = pevent.TypeResolvedEvent
 	return w
 }
 
-func newWrapDDLEvent(serverID node.ID, e *pevent.DDLEvent) *wrapEvent {
+func newWrapDDLEvent(serverID node.ID, generation uint64, e *pevent.DDLEvent) *wrapEvent {
 	w := getWrapEvent()
 	w.serverID = serverID
+	w.generation = generation
 	w.e = e
 	w.msgType = pevent.TypeDDLEvent
 	return w
 }
 
-func newWrapSyncPointEvent(serverID node.ID, e *pevent.SyncPointEvent) *wrapEvent {
+func newWrapSyncPointEvent(serverID node.ID, generation uint64, e *pevent.SyncPointEvent) *wrapEvent {
 	w := getWrapEvent()
 	w.serverID = serverID
+	w.generation = generation
 	w.e = e
 	w.msgType = pevent.TypeSyncPointEvent
 	return w

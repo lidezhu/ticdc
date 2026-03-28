@@ -39,6 +39,7 @@ type mockDispatcher struct {
 	dispatcher.EventDispatcher
 	startTs      uint64
 	id           common.DispatcherID
+	generation   uint64
 	changefeedID common.ChangeFeedID
 	handleEvents func(events []dispatcher.DispatcherEvent, wakeCallback func()) (block bool)
 	events       []dispatcher.DispatcherEvent
@@ -80,6 +81,10 @@ func (m *mockDispatcher) GetId() common.DispatcherID {
 
 func (m *mockDispatcher) GetChangefeedID() common.ChangeFeedID {
 	return m.changefeedID
+}
+
+func (m *mockDispatcher) GetGeneration() uint64 {
+	return m.generation
 }
 
 func (m *mockDispatcher) GetTableSpan() *heartbeatpb.TableSpan {
@@ -152,6 +157,7 @@ type mockEvent struct {
 	isPaused     bool
 	len          int32
 	epoch        uint64
+	generation   uint64
 }
 
 func (m *mockEvent) GetType() int {
@@ -164,6 +170,10 @@ func (m *mockEvent) GetSeq() uint64 {
 
 func (m *mockEvent) GetEpoch() uint64 {
 	return m.epoch
+}
+
+func (m *mockEvent) GetGeneration() uint64 {
+	return m.generation
 }
 
 func (m *mockEvent) GetDispatcherID() common.DispatcherID {
@@ -684,6 +694,26 @@ func TestHandleSignalEvent(t *testing.T) {
 	}
 }
 
+func TestHandleSignalEventIgnoresStaleGeneration(t *testing.T) {
+	localServerID := node.ID("local-server")
+	stat := newDispatcherStat(newMockDispatcher(common.NewDispatcherID(), 0), newTestEventCollector(localServerID), nil)
+	stat.target.(*mockDispatcher).generation = 2
+	markSessionRegistering(stat.session, localServerID)
+
+	stat.handleSignalEvent(dispatcher.DispatcherEvent{
+		From:       &localServerID,
+		Generation: 1,
+		Event: &mockEvent{
+			eventType: commonEvent.TypeReadyEvent,
+		},
+	})
+
+	currentEventServiceID, localReadyPending, pendingRemoteTarget := sessionState(stat.session)
+	require.True(t, currentEventServiceID.IsEmpty())
+	require.True(t, localReadyPending)
+	require.True(t, pendingRemoteTarget.IsEmpty())
+}
+
 func TestHandleLocalReadyEventCleansUpRemoteRegistrations(t *testing.T) {
 	localServerID := node.ID("local-server")
 	remoteServerID := node.ID("remote-server")
@@ -1025,6 +1055,55 @@ func TestHandleDataEvents(t *testing.T) {
 			require.Equal(t, tt.expectedResult, result)
 		})
 	}
+}
+
+func TestHandleDataEventsIgnoresStaleGeneration(t *testing.T) {
+	localServerID := node.ID("local-server")
+	dispatcherID := common.NewDispatcherID()
+	mockDisp := newMockDispatcher(dispatcherID, 100)
+	mockDisp.generation = 5
+	mockDisp.handleEvents = func(events []dispatcher.DispatcherEvent, wakeCallback func()) (block bool) {
+		return false
+	}
+
+	stat := newDispatcherStat(mockDisp, newTestEventCollector(localServerID), nil)
+	state := newDispatcherEpochState(1, 0, 100)
+	stat.currentEpoch.Store(state)
+
+	handshake := commonEvent.NewHandshakeEvent(dispatcherID, 100, 1, &common.TableInfo{})
+	stat.handleHandshakeEvent(dispatcher.DispatcherEvent{
+		From:       &localServerID,
+		Generation: 5,
+		Event:      &handshake,
+	})
+	require.Equal(t, uint64(1), state.lastEventSeq.Load())
+
+	result := stat.handleDataEvents(dispatcher.DispatcherEvent{
+		From:       &localServerID,
+		Generation: 4,
+		Event: &mockEvent{
+			eventType:    commonEvent.TypeResolvedEvent,
+			dispatcherID: dispatcherID,
+			epoch:        1,
+			seq:          1,
+			commitTs:     120,
+		},
+	})
+	require.False(t, result)
+	require.Empty(t, mockDisp.events)
+}
+
+func TestRetryCurrentRegistrationIfRemovedFromIgnoresStaleGeneration(t *testing.T) {
+	localServerID := node.ID("local-server")
+	remoteServerID := node.ID("remote-server")
+	mockDisp := newMockDispatcher(common.NewDispatcherID(), 100)
+	mockDisp.generation = 7
+	mockEventCollector := newTestEventCollector(localServerID)
+	stat := newDispatcherStat(mockDisp, mockEventCollector, nil)
+	markSessionReceiving(stat.session, remoteServerID)
+
+	require.False(t, stat.retryCurrentRegistrationIfRemovedFrom(remoteServerID, 6))
+	requireNoDispatcherRequest(t, mockEventCollector)
 }
 
 func createNodeID(id string) *node.ID {
@@ -1383,7 +1462,7 @@ func TestCheckpointTsForEventServiceUsesCollectorObservedMaxTs(t *testing.T) {
 	stat := newDispatcherStat(mockDisp, newTestEventCollector(node.ID("local")), nil)
 	markSessionReceiving(stat.session, node.ID("local"))
 	getHeartbeatCheckpoint := func() uint64 {
-		_, checkpointTs, _, ok := stat.getHeartbeatReport()
+		_, checkpointTs, _, _, ok := stat.getHeartbeatReport()
 		require.True(t, ok)
 		return checkpointTs
 	}

@@ -323,6 +323,10 @@ func (b *BatchDMLEvent) GetEpoch() uint64 {
 	return b.DMLEvents[len(b.DMLEvents)-1].Epoch
 }
 
+func (b *BatchDMLEvent) GetGeneration() uint64 {
+	return b.DMLEvents[len(b.DMLEvents)-1].Generation
+}
+
 func (b *BatchDMLEvent) GetDispatcherID() common.DispatcherID {
 	return b.DMLEvents[len(b.DMLEvents)-1].DispatcherID
 }
@@ -369,6 +373,9 @@ type DMLEvent struct {
 	Seq uint64 `json:"seq"`
 	// Epoch is the epoch of the event. It is set by event service.
 	Epoch uint64 `json:"epoch"`
+	// Generation fences stale EC<->ES interactions across dispatcher
+	// remove/recreate cycles. It is optional for rolling upgrade and defaults to 0.
+	Generation uint64 `json:"generation,omitempty"`
 	// Length is the number of rows in the transaction.
 	// Note: it is the logic length of the transaction, not the number of physical rows in the Rows chunk.
 	// For an update event, it has two physical rows in the Rows chunk.
@@ -676,6 +683,10 @@ func (t *DMLEvent) GetEpoch() uint64 {
 	return t.Epoch
 }
 
+func (t *DMLEvent) GetGeneration() uint64 {
+	return t.Generation
+}
+
 // PushFrontFlushFunc prepends a flush callback so it runs before existing ones.
 func (t *DMLEvent) PushFrontFlushFunc(f func()) {
 	t.PostTxnFlushed = append([]func(){f}, t.PostTxnFlushed...)
@@ -854,6 +865,7 @@ func (t *DMLEvent) encodeV1() ([]byte, error) {
 	for i := 0; i < len(t.RowKeys); i++ {
 		size += 4 + len(t.RowKeys[i]) // size + contents of t.RowKeys[i]
 	}
+	size += 8 // generation trailer
 
 	// Allocate a buffer with the calculated size
 	buf := make([]byte, size)
@@ -905,6 +917,7 @@ func (t *DMLEvent) encodeV1() ([]byte, error) {
 		copy(buf[offset:], rowKey)
 		offset += len(rowKey)
 	}
+	binary.BigEndian.PutUint64(buf[offset:], t.Generation)
 	return buf, nil
 }
 
@@ -960,6 +973,9 @@ func (t *DMLEvent) decodeV1(data []byte) error {
 		t.RowKeys[i] = make([]byte, len)
 		copy(t.RowKeys[i], data[offset:offset+int(len)])
 		offset += int(len)
+	}
+	if len(data[offset:]) >= 8 {
+		t.Generation = binary.BigEndian.Uint64(data[offset:])
 	}
 	return nil
 }

@@ -291,6 +291,10 @@ func (r DispatcherRequest) GetEpoch() uint64 {
 	return r.Epoch
 }
 
+func (r DispatcherRequest) GetGeneration() uint64 {
+	return r.Generation
+}
+
 func (r DispatcherRequest) IsOutputRawChangeEvent() bool {
 	return r.OutputRawChangeEvent
 }

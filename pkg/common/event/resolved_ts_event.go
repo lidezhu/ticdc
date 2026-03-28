@@ -68,6 +68,13 @@ func (b *BatchResolvedEvent) GetEpoch() uint64 {
 	return 0
 }
 
+func (b *BatchResolvedEvent) GetGeneration() uint64 {
+	if len(b.Events) == 0 {
+		return 0
+	}
+	return b.Events[len(b.Events)-1].GetGeneration()
+}
+
 func (b *BatchResolvedEvent) Len() int32 {
 	// Return the length of events.
 	return int32(len(b.Events))
@@ -146,6 +153,7 @@ type ResolvedEvent struct {
 	DispatcherID common.DispatcherID
 	ResolvedTs   common.Ts
 	Epoch        uint64
+	Generation   uint64
 	// It's the last concrete data event's (eg. dml/ddl/handshake) seq.
 	// Use it to check if there is a missing
 	Seq uint64
@@ -155,13 +163,18 @@ func NewResolvedEvent(
 	resolvedTs common.Ts,
 	dispatcherID common.DispatcherID,
 	epoch uint64,
+	generations ...uint64,
 ) ResolvedEvent {
-	return ResolvedEvent{
+	event := ResolvedEvent{
 		DispatcherID: dispatcherID,
 		ResolvedTs:   resolvedTs,
 		Version:      ResolvedEventVersion1,
 		Epoch:        epoch,
 	}
+	if len(generations) > 0 {
+		event.Generation = generations[0]
+	}
+	return event
 }
 
 func (e ResolvedEvent) GetType() int {
@@ -186,6 +199,10 @@ func (e ResolvedEvent) GetSeq() uint64 {
 
 func (e ResolvedEvent) GetEpoch() uint64 {
 	return e.Epoch
+}
+
+func (e ResolvedEvent) GetGeneration() uint64 {
+	return e.Generation
 }
 
 func (e ResolvedEvent) Len() int32 {
@@ -230,9 +247,10 @@ func (e *ResolvedEvent) Unmarshal(data []byte) error {
 }
 
 func (e ResolvedEvent) encodeV1() ([]byte, error) {
-	// Note: version is now handled in the header by Marshal(), not here
-	// payload: ResolvedTs + Epoch + Seq + DispatcherID
-	payloadSize := 8 + 8 + 8 + e.DispatcherID.GetSize()
+	// Note: version is now handled in the header by Marshal(), not here.
+	// Keep the legacy payload as the prefix and append generation as an optional
+	// trailer so older decoders can ignore it during rolling upgrade.
+	payloadSize := 8 + 8 + 8 + e.DispatcherID.GetSize() + 8
 	data := make([]byte, payloadSize)
 	offset := 0
 
@@ -250,6 +268,10 @@ func (e ResolvedEvent) encodeV1() ([]byte, error) {
 
 	// DispatcherID
 	copy(data[offset:], e.DispatcherID.Marshal())
+	offset += e.DispatcherID.GetSize()
+
+	// Generation
+	binary.BigEndian.PutUint64(data[offset:], e.Generation)
 
 	return data, nil
 }
@@ -275,6 +297,11 @@ func (e *ResolvedEvent) decodeV1(data []byte) error {
 	if err != nil {
 		return err
 	}
+	offset += e.DispatcherID.GetSize()
+
+	if len(data[offset:]) >= 8 {
+		e.Generation = binary.BigEndian.Uint64(data[offset:])
+	}
 
 	return nil
 }
@@ -286,8 +313,8 @@ func (e ResolvedEvent) String() string {
 // GetSize returns the approximate size of the event in bytes
 func (e ResolvedEvent) GetSize() int64 {
 	// Size does not include header or version (those are only for serialization)
-	// Only business data: ResolvedTs(8) + Epoch(8) + Seq(8) + DispatcherID
-	return int64(8 + 8 + 8 + e.DispatcherID.GetSize())
+	// Only business data: ResolvedTs(8) + Epoch(8) + Seq(8) + DispatcherID + Generation(8)
+	return int64(8 + 8 + 8 + e.DispatcherID.GetSize() + 8)
 }
 
 func (e ResolvedEvent) IsPaused() bool {

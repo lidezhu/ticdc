@@ -161,6 +161,21 @@ func (d *dispatcherStat) getDispatcherID() common.DispatcherID {
 	return d.target.GetId()
 }
 
+func shouldStrictCheckGeneration(current, incoming uint64) bool {
+	return current != 0 && incoming != 0
+}
+
+func generationMatches(current, incoming uint64) bool {
+	if !shouldStrictCheckGeneration(current, incoming) {
+		return true
+	}
+	return current == incoming
+}
+
+func (d *dispatcherStat) matchesTargetGeneration(generation uint64) bool {
+	return generationMatches(d.target.GetGeneration(), generation)
+}
+
 // Data-plane event validation and state update helpers.
 
 func (d *dispatcherStat) verifyEventSequence(event dispatcher.DispatcherEvent, state *dispatcherEpochState) bool {
@@ -319,6 +334,14 @@ func (d *dispatcherStat) handleBatchDataEvents(events []dispatcher.DispatcherEve
 	var validEvents []dispatcher.DispatcherEvent
 	state := d.loadCurrentEpochState()
 	for _, event := range events {
+		if !d.matchesTargetGeneration(event.Generation) {
+			log.Debug("receive DML/Resolved event from a stale generation, ignore it",
+				zap.Stringer("changefeedID", d.target.GetChangefeedID()),
+				zap.Stringer("dispatcher", d.getDispatcherID()),
+				zap.Uint64("eventGeneration", event.Generation),
+				zap.Uint64("dispatcherGeneration", d.target.GetGeneration()))
+			continue
+		}
 		if !d.isFromCurrentEpoch(event, state) {
 			log.Debug("receive DML/Resolved event from a stale epoch, ignore it",
 				zap.Stringer("changefeedID", d.target.GetChangefeedID()),
@@ -358,7 +381,7 @@ func (d *dispatcherStat) handleBatchDataEvents(events []dispatcher.DispatcherEve
 				// so each needs to be initialized separately.
 				dml.TableInfo.InitPrivateFields()
 				dml.TableInfoVersion = tableInfoVersion
-				dmlEvent := dispatcher.NewDispatcherEvent(event.From, dml)
+				dmlEvent := dispatcher.NewDispatcherEventWithGeneration(event.From, dml, event.Generation)
 				if d.filterAndUpdateEventByCommitTs(dmlEvent, state) {
 					validEvents = append(validEvents, dmlEvent)
 				}
@@ -392,6 +415,15 @@ func (d *dispatcherStat) handleSingleDataEvents(events []dispatcher.DispatcherEv
 	}
 	from := events[0].From
 	state := d.loadCurrentEpochState()
+	if !d.matchesTargetGeneration(events[0].Generation) {
+		log.Info("receive DDL/SyncPoint/Handshake event from a stale generation, ignore it",
+			zap.Stringer("changefeedID", d.target.GetChangefeedID()),
+			zap.Stringer("dispatcher", d.getDispatcherID()),
+			zap.String("eventType", commonEvent.TypeToString(events[0].GetType())),
+			zap.Uint64("eventGeneration", events[0].Generation),
+			zap.Uint64("dispatcherGeneration", d.target.GetGeneration()))
+		return false
+	}
 	if !d.isFromCurrentEpoch(events[0], state) {
 		log.Info("receive DDL/SyncPoint/Handshake event from a stale epoch, ignore it",
 			zap.Stringer("changefeedID", d.target.GetChangefeedID()),
@@ -453,6 +485,14 @@ func (d *dispatcherStat) handleDropEvent(event dispatcher.DispatcherEvent) {
 	}
 
 	state := d.loadCurrentEpochState()
+	if !d.matchesTargetGeneration(event.Generation) {
+		log.Debug("receive a drop event from a stale generation, ignore it",
+			zap.Stringer("changefeedID", d.target.GetChangefeedID()),
+			zap.Stringer("dispatcher", d.getDispatcherID()),
+			zap.Uint64("eventGeneration", event.Generation),
+			zap.Uint64("dispatcherGeneration", d.target.GetGeneration()))
+		return
+	}
 	if !d.isFromCurrentEpoch(event, state) {
 		log.Debug("receive a drop event from a stale epoch, ignore it",
 			zap.Stringer("changefeedID", d.target.GetChangefeedID()),
@@ -482,6 +522,14 @@ func (d *dispatcherStat) handleHandshakeEvent(event dispatcher.DispatcherEvent) 
 		log.Panic("handshake event is not a handshake event", zap.Any("event", event))
 	}
 	state := d.loadCurrentEpochState()
+	if !d.matchesTargetGeneration(event.Generation) {
+		log.Info("receive a handshake event from a stale generation, ignore it",
+			zap.Stringer("changefeedID", d.target.GetChangefeedID()),
+			zap.Stringer("dispatcher", d.getDispatcherID()),
+			zap.Uint64("eventGeneration", event.Generation),
+			zap.Uint64("dispatcherGeneration", d.target.GetGeneration()))
+		return
+	}
 	if !d.isFromCurrentEpoch(event, state) {
 		log.Info("receive a handshake event from a stale epoch, ignore it",
 			zap.Stringer("changefeedID", d.target.GetChangefeedID()),
@@ -506,14 +554,14 @@ func (d *dispatcherStat) handleHandshakeEvent(event dispatcher.DispatcherEvent) 
 
 // Runtime projections used by event collector.
 
-func (d *dispatcherStat) getHeartbeatReport() (node.ID, uint64, uint64, bool) {
+func (d *dispatcherStat) getHeartbeatReport() (node.ID, uint64, uint64, uint64, bool) {
 	eventServiceID := d.currentEventServiceID()
 	if eventServiceID.IsEmpty() {
-		return "", 0, 0, false
+		return "", 0, 0, 0, false
 	}
 	state := d.loadCurrentEpochState()
 	checkpointTs := min(d.target.GetCheckpointTs(), state.maxEventTs.Load())
-	return eventServiceID, checkpointTs, state.epoch, true
+	return eventServiceID, checkpointTs, state.epoch, d.target.GetGeneration(), true
 }
 
 func (d *dispatcherStat) getCurrentEventServiceTarget() (node.ID, bool) {
@@ -560,11 +608,14 @@ func (d *dispatcherStat) startRemoteProbing(nodes []string) {
 // "signalEvent" refers to the types of events that may modify the event service with which this dispatcher communicates.
 // "signalEvent" includes TypeReadyEvent/TypeNotReusableEvent
 func (d *dispatcherStat) handleSignalEvent(event dispatcher.DispatcherEvent) {
+	if !d.matchesTargetGeneration(event.Generation) {
+		return
+	}
 	d.session.handleSignalEvent(event)
 }
 
-func (d *dispatcherStat) retryCurrentRegistrationIfRemovedFrom(serverID node.ID) bool {
-	if d.currentEventServiceID() != serverID {
+func (d *dispatcherStat) retryCurrentRegistrationIfRemovedFrom(serverID node.ID, generation uint64) bool {
+	if d.currentEventServiceID() != serverID || !d.matchesTargetGeneration(generation) {
 		return false
 	}
 	log.Info("dispatcher removed in current event service, retry registration",
