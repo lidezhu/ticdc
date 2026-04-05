@@ -15,6 +15,7 @@ package logpuller
 
 import (
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -115,12 +116,14 @@ type regionRuntimeRegistry struct {
 
 	states      map[regionRuntimeKey]*regionRuntimeState
 	generations map[regionRuntimeIdentity]uint64
+	retryCounts map[regionRuntimeIdentity]int
 }
 
 func newRegionRuntimeRegistry() *regionRuntimeRegistry {
 	return &regionRuntimeRegistry{
 		states:      make(map[regionRuntimeKey]*regionRuntimeState),
 		generations: make(map[regionRuntimeIdentity]uint64),
+		retryCounts: make(map[regionRuntimeIdentity]int),
 	}
 }
 
@@ -146,9 +149,11 @@ func (r *regionRuntimeRegistry) upsert(
 
 	state, ok := r.states[key]
 	if !ok {
+		identity := regionRuntimeIdentity{subID: key.subID, regionID: key.regionID}
 		state = &regionRuntimeState{
-			key:   key,
-			phase: regionPhaseUnknown,
+			key:        key,
+			phase:      regionPhaseUnknown,
+			retryCount: r.retryCounts[identity],
 		}
 		r.states[key] = state
 	}
@@ -223,7 +228,9 @@ func (r *regionRuntimeRegistry) recordError(
 
 func (r *regionRuntimeRegistry) incRetry(key regionRuntimeKey) regionRuntimeState {
 	return r.upsert(key, func(state *regionRuntimeState) {
-		state.retryCount++
+		identity := regionRuntimeIdentity{subID: key.subID, regionID: key.regionID}
+		r.retryCounts[identity]++
+		state.retryCount = r.retryCounts[identity]
 	})
 }
 
@@ -336,5 +343,189 @@ func (r *regionRuntimeRegistry) removeBySubscription(subID SubscriptionID) int {
 		delete(r.states, key)
 		removed++
 	}
+	for identity := range r.generations {
+		if identity.subID == subID {
+			delete(r.generations, identity)
+		}
+	}
+	for identity := range r.retryCounts {
+		if identity.subID == subID {
+			delete(r.retryCounts, identity)
+		}
+	}
 	return removed
+}
+
+func (r *regionRuntimeRegistry) resetRetryCount(subID SubscriptionID, regionID uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.retryCounts, regionRuntimeIdentity{subID: subID, regionID: regionID})
+}
+
+type regionSlowReason string
+
+const (
+	regionSlowReasonUnknown              regionSlowReason = "unknown"
+	regionSlowReasonNoLeader             regionSlowReason = "no_leader"
+	regionSlowReasonRPCCtxUnavailable    regionSlowReason = "rpc_ctx_unavailable"
+	regionSlowReasonRangeLockWait        regionSlowReason = "range_lock_wait"
+	regionSlowReasonQueueBlocked         regionSlowReason = "queue_blocked"
+	regionSlowReasonWaitInitialized      regionSlowReason = "wait_initialized"
+	regionSlowReasonResolvedTsNotAdvance regionSlowReason = "resolved_ts_not_advance"
+	regionSlowReasonLockResolving        regionSlowReason = "lock_resolving"
+	regionSlowReasonRetryStorm           regionSlowReason = "retry_storm"
+	regionSlowReasonStoreBusy            regionSlowReason = "store_busy"
+)
+
+func inferRegionSlowReason(state regionRuntimeState, now time.Time) (regionSlowReason, bool) {
+	switch state.phase {
+	case regionPhaseRangeLockWait:
+		return regionSlowReasonRangeLockWait, true
+	case regionPhaseQueued, regionPhaseRPCReady:
+		return regionSlowReasonQueueBlocked, true
+	case regionPhaseWaitInitialized:
+		return regionSlowReasonWaitInitialized, true
+	case regionPhaseRetryPending:
+		if state.retryCount >= 3 {
+			return regionSlowReasonRetryStorm, true
+		}
+	}
+
+	lastError := strings.ToLower(state.lastError)
+	switch {
+	case strings.Contains(lastError, "not_leader"), strings.Contains(lastError, "not leader"):
+		return regionSlowReasonNoLeader, true
+	case strings.Contains(lastError, "cannot get rpcctx"), strings.Contains(lastError, "rpcctx"):
+		return regionSlowReasonRPCCtxUnavailable, true
+	case strings.Contains(lastError, "congested"), strings.Contains(lastError, "server_is_busy"), strings.Contains(lastError, "server is busy"), strings.Contains(lastError, "get store error"), strings.Contains(lastError, "send request to store error"):
+		return regionSlowReasonStoreBusy, true
+	}
+
+	if state.phase == regionPhaseReplicating && !state.lastEventTime.IsZero() && now.Sub(state.lastEventTime) > 6*resolveLockMinInterval {
+		return regionSlowReasonResolvedTsNotAdvance, true
+	}
+
+	return regionSlowReasonUnknown, false
+}
+
+func (s *subscriptionClient) ensureRegionRuntime(region regionInfo) regionInfo {
+	if s == nil || s.regionRuntimeRegistry == nil || region.isStopTask() {
+		return region
+	}
+	if region.runtimeKey.generation != 0 {
+		return region
+	}
+	region.runtimeKey = s.regionRuntimeRegistry.allocKey(region.subscribedSpan.subID, region.verID.GetID())
+	s.regionRuntimeRegistry.updateRegionInfo(region.runtimeKey, region)
+	s.regionRuntimeRegistry.transition(region.runtimeKey, regionPhaseDiscovered, time.Now())
+	return region
+}
+
+func (s *subscriptionClient) newRegionRuntimeAttempt(region regionInfo) regionInfo {
+	if s == nil || s.regionRuntimeRegistry == nil || region.isStopTask() {
+		return region
+	}
+	if region.runtimeKey.generation != 0 {
+		s.regionRuntimeRegistry.remove(region.runtimeKey)
+	}
+	region.runtimeKey = regionRuntimeKey{}
+	return s.ensureRegionRuntime(region)
+}
+
+func (s *subscriptionClient) removeRegionRuntime(region regionInfo) {
+	if s == nil || s.regionRuntimeRegistry == nil || region.runtimeKey.generation == 0 {
+		return
+	}
+	s.regionRuntimeRegistry.remove(region.runtimeKey)
+}
+
+func (s *subscriptionClient) transitionRegionRuntime(region regionInfo, phase regionPhase, phaseEnterTime time.Time) {
+	if s == nil || s.regionRuntimeRegistry == nil || region.runtimeKey.generation == 0 {
+		return
+	}
+	s.regionRuntimeRegistry.transition(region.runtimeKey, phase, phaseEnterTime)
+}
+
+func (s *subscriptionClient) updateRegionRuntimeInfo(region regionInfo) {
+	if s == nil || s.regionRuntimeRegistry == nil || region.runtimeKey.generation == 0 {
+		return
+	}
+	s.regionRuntimeRegistry.updateRegionInfo(region.runtimeKey, region)
+}
+
+func (s *subscriptionClient) setRegionRuntimeRangeLockAcquiredTime(region regionInfo, acquiredTime time.Time) {
+	if s == nil || s.regionRuntimeRegistry == nil || region.runtimeKey.generation == 0 {
+		return
+	}
+	s.regionRuntimeRegistry.setRangeLockAcquiredTime(region.runtimeKey, acquiredTime)
+}
+
+func (s *subscriptionClient) setRegionRuntimeEnqueueTime(region regionInfo, enqueueTime time.Time) {
+	if s == nil || s.regionRuntimeRegistry == nil || region.runtimeKey.generation == 0 {
+		return
+	}
+	s.regionRuntimeRegistry.setRequestEnqueueTime(region.runtimeKey, enqueueTime)
+}
+
+func (s *subscriptionClient) setRegionRuntimeRPCReadyTime(region regionInfo, rpcReadyTime time.Time) {
+	if s == nil || s.regionRuntimeRegistry == nil || region.runtimeKey.generation == 0 {
+		return
+	}
+	s.regionRuntimeRegistry.setRPCReadyTime(region.runtimeKey, rpcReadyTime)
+}
+
+func (s *subscriptionClient) setRegionRuntimeSendTime(region regionInfo, sendTime time.Time) {
+	if s == nil || s.regionRuntimeRegistry == nil || region.runtimeKey.generation == 0 {
+		return
+	}
+	s.regionRuntimeRegistry.setRequestSendTime(region.runtimeKey, sendTime)
+}
+
+func (s *subscriptionClient) setRegionRuntimeInitializedTime(region regionInfo, initializedTime time.Time) {
+	if s == nil || s.regionRuntimeRegistry == nil || region.runtimeKey.generation == 0 {
+		return
+	}
+	s.regionRuntimeRegistry.setInitializedTime(region.runtimeKey, initializedTime)
+}
+
+func (s *subscriptionClient) setRegionRuntimeReplicatingTime(region regionInfo, replicatingTime time.Time) {
+	if s == nil || s.regionRuntimeRegistry == nil || region.runtimeKey.generation == 0 {
+		return
+	}
+	s.regionRuntimeRegistry.setReplicatingTime(region.runtimeKey, replicatingTime)
+}
+
+func (s *subscriptionClient) updateRegionRuntimeWorker(region regionInfo, workerID uint64) {
+	if s == nil || s.regionRuntimeRegistry == nil || region.runtimeKey.generation == 0 {
+		return
+	}
+	s.regionRuntimeRegistry.updateWorker(region.runtimeKey, workerID)
+}
+
+func (s *subscriptionClient) updateRegionRuntimeResolvedTs(region regionInfo, resolvedTs uint64, eventTime time.Time) {
+	if s == nil || s.regionRuntimeRegistry == nil || region.runtimeKey.generation == 0 {
+		return
+	}
+	s.regionRuntimeRegistry.updateResolvedTs(region.runtimeKey, resolvedTs, eventTime)
+}
+
+func (s *subscriptionClient) updateRegionRuntimeLastEvent(region regionInfo, eventTime time.Time) {
+	if s == nil || s.regionRuntimeRegistry == nil || region.runtimeKey.generation == 0 {
+		return
+	}
+	s.regionRuntimeRegistry.updateLastEvent(region.runtimeKey, eventTime)
+}
+
+func (s *subscriptionClient) recordRegionRuntimeError(region regionInfo, err error, errTime time.Time) {
+	if s == nil || s.regionRuntimeRegistry == nil || region.runtimeKey.generation == 0 {
+		return
+	}
+	s.regionRuntimeRegistry.recordError(region.runtimeKey, err, errTime)
+}
+
+func (s *subscriptionClient) incRegionRuntimeRetry(region regionInfo) {
+	if s == nil || s.regionRuntimeRegistry == nil || region.runtimeKey.generation == 0 {
+		return
+	}
+	s.regionRuntimeRegistry.incRetry(region.runtimeKey)
 }

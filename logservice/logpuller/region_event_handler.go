@@ -252,6 +252,9 @@ func (h *regionEventHandler) handleRegionError(state *regionFeedState) {
 
 func handleEventEntries(span *subscribedSpan, state *regionFeedState, entries *cdcpb.Event_Entries_) {
 	regionID, _, _ := state.getRegionMeta()
+	if state.worker != nil {
+		state.worker.client.updateRegionRuntimeLastEvent(state.region, time.Now())
+	}
 	assembleRowEvent := func(regionID uint64, entry *cdcpb.Event_Row) common.RawKVEntry {
 		var opType common.OpType
 		switch entry.GetOpType() {
@@ -352,6 +355,9 @@ func handleResolvedTs(span *subscribedSpan, state *regionFeedState, resolvedTs u
 		return 0
 	}
 	state.matcher.tryCleanUnmatchedValue()
+	if state.worker != nil {
+		state.worker.client.updateRegionRuntimeLastEvent(state.region, time.Now())
+	}
 	regionID := state.getRegionID()
 	lastResolvedTs := state.getLastResolvedTs()
 	if resolvedTs < lastResolvedTs {

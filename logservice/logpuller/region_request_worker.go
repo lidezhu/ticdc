@@ -94,6 +94,7 @@ func newRegionRequestWorker(
 			}
 			worker.preFetchForConnecting = new(regionInfo)
 			*worker.preFetchForConnecting = req.regionInfo
+			worker.client.updateRegionRuntimeWorker(req.regionInfo, worker.workerID)
 			return nil
 		}
 	}
@@ -435,6 +436,9 @@ func (s *regionRequestWorker) processRegionSendTask(
 				state.markStopped(err)
 				return err
 			}
+			now := time.Now()
+			s.client.setRegionRuntimeSendTime(region, now)
+			s.client.transitionRegionRuntime(region, regionPhaseWaitInitialized, now)
 		}
 		regionReq, err = fetchMoreReq()
 		if err != nil {
