@@ -87,21 +87,8 @@ func (h *regionEventHandler) Path(event regionEvent) SubscriptionID {
 
 func (h *regionEventHandler) Handle(span *subscribedSpan, events ...regionEvent) bool {
 	startTime := time.Now()
-	hasEntries := false
-	hasResolved := false
-	hasError := false
+	eventType := "error"
 	defer func() {
-		eventType := "error"
-		switch {
-		case hasEntries && hasResolved:
-			eventType = "mixed"
-		case hasEntries:
-			eventType = "entries"
-		case hasResolved:
-			eventType = "resolved"
-		case hasError:
-			eventType = "error"
-		}
 		metrics.SubscriptionClientRegionEventHandleDuration.WithLabelValues(eventType).Observe(time.Since(startTime).Seconds())
 	}()
 
@@ -112,61 +99,92 @@ func (h *regionEventHandler) Handle(span *subscribedSpan, events ...regionEvent)
 	}
 
 	newResolvedTs := uint64(0)
+	hasEntries := false
+	hasResolved := false
+	hasError := false
 	for _, event := range events {
-		if len(event.states) == 1 && event.states[0].isStale() {
+		switch {
+		case event.isRegionError():
 			hasError = true
 			h.handleRegionError(event.states[0])
-			continue
-		}
-		if event.entries != nil {
+		case event.entries != nil:
 			hasEntries = true
 			handleEventEntries(span, event.mustFirstState(), event.entries)
-		} else if event.resolvedTs != 0 {
+		case event.resolvedTs != 0:
 			hasResolved = true
-			for _, state := range event.states {
-				resolvedTs := handleResolvedTs(span, state, event.resolvedTs)
-				if resolvedTs > newResolvedTs {
-					newResolvedTs = resolvedTs
-				}
+			resolvedTs := h.handleResolvedTsEvent(span, event)
+			if resolvedTs > newResolvedTs {
+				newResolvedTs = resolvedTs
 			}
-		} else {
+		default:
 			log.Panic("should not reach", zap.Any("event", event), zap.Any("events", events))
 		}
 	}
+	eventType = resolveRegionEventType(hasEntries, hasResolved, hasError)
+	return h.flushPendingKVEvents(span, newResolvedTs)
+}
+
+func (h *regionEventHandler) GetSize(event regionEvent) int {
+	return event.getSize()
+}
+
+func resolveRegionEventType(hasEntries, hasResolved, hasError bool) string {
+	switch {
+	case hasEntries && hasResolved:
+		return "mixed"
+	case hasEntries:
+		return "entries"
+	case hasResolved:
+		return "resolved"
+	case hasError:
+		return "error"
+	default:
+		return "error"
+	}
+}
+
+func (h *regionEventHandler) handleResolvedTsEvent(span *subscribedSpan, event regionEvent) uint64 {
+	newResolvedTs := uint64(0)
+	for _, state := range event.states {
+		resolvedTs := handleResolvedTs(span, state, event.resolvedTs)
+		if resolvedTs > newResolvedTs {
+			newResolvedTs = resolvedTs
+		}
+	}
+	return newResolvedTs
+}
+
+func (h *regionEventHandler) flushPendingKVEvents(span *subscribedSpan, newResolvedTs uint64) bool {
 	tryAdvanceResolvedTs := func() {
 		if newResolvedTs != 0 {
 			span.advanceResolvedTs(newResolvedTs)
 		}
 	}
-	if len(span.kvEventsCache) > 0 {
-		metricsEventCount.Add(float64(len(span.kvEventsCache)))
-		await := span.consumeKVEvents(span.kvEventsCache, func() {
-			start := time.Now()
-			span.clearKVEventsCache()
-			metrics.SubscriptionClientConsumeKVEventsCallbackDuration.WithLabelValues("clearCache").Observe(time.Since(start).Seconds())
 
-			start = time.Now()
-			tryAdvanceResolvedTs()
-			metrics.SubscriptionClientConsumeKVEventsCallbackDuration.WithLabelValues("advanceResolvedTs").Observe(time.Since(start).Seconds())
+	if len(span.kvEventsCache) == 0 {
+		tryAdvanceResolvedTs()
+		return false
+	}
 
-			start = time.Now()
-			h.subClient.wakeSubscription(span.subID)
-			metrics.SubscriptionClientConsumeKVEventsCallbackDuration.WithLabelValues("wakeSubscription").Observe(time.Since(start).Seconds())
-		})
-		// if not await, the wake callback will not be called, we need clear the cache manually.
-		if !await {
-			span.clearKVEventsCache()
-			tryAdvanceResolvedTs()
-		}
-		return await
-	} else {
+	metricsEventCount.Add(float64(len(span.kvEventsCache)))
+	await := span.consumeKVEvents(span.kvEventsCache, func() {
+		start := time.Now()
+		span.clearKVEventsCache()
+		metrics.SubscriptionClientConsumeKVEventsCallbackDuration.WithLabelValues("clearCache").Observe(time.Since(start).Seconds())
+
+		start = time.Now()
+		tryAdvanceResolvedTs()
+		metrics.SubscriptionClientConsumeKVEventsCallbackDuration.WithLabelValues("advanceResolvedTs").Observe(time.Since(start).Seconds())
+
+		start = time.Now()
+		h.subClient.wakeSubscription(span.subID)
+		metrics.SubscriptionClientConsumeKVEventsCallbackDuration.WithLabelValues("wakeSubscription").Observe(time.Since(start).Seconds())
+	})
+	if !await {
+		span.clearKVEventsCache()
 		tryAdvanceResolvedTs()
 	}
-	return false
-}
-
-func (h *regionEventHandler) GetSize(event regionEvent) int {
-	return event.getSize()
+	return await
 }
 
 func (h *regionEventHandler) GetArea(path SubscriptionID, dest *subscribedSpan) int {
@@ -250,11 +268,12 @@ func (h *regionEventHandler) handleRegionError(state *regionFeedState) {
 	}
 }
 
+func (event regionEvent) isRegionError() bool {
+	return len(event.states) == 1 && event.states[0].isStale()
+}
+
 func handleEventEntries(span *subscribedSpan, state *regionFeedState, entries *cdcpb.Event_Entries_) {
 	regionID, _, _ := state.getRegionMeta()
-	if state.worker != nil {
-		state.worker.client.updateRegionRuntimeLastEvent(state.region, time.Now())
-	}
 	assembleRowEvent := func(regionID uint64, entry *cdcpb.Event_Row) common.RawKVEntry {
 		var opType common.OpType
 		switch entry.GetOpType() {
@@ -355,9 +374,6 @@ func handleResolvedTs(span *subscribedSpan, state *regionFeedState, resolvedTs u
 		return 0
 	}
 	state.matcher.tryCleanUnmatchedValue()
-	if state.worker != nil {
-		state.worker.client.updateRegionRuntimeLastEvent(state.region, time.Now())
-	}
 	regionID := state.getRegionID()
 	lastResolvedTs := state.getLastResolvedTs()
 	if resolvedTs < lastResolvedTs {

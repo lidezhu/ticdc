@@ -517,9 +517,6 @@ func (s *subscriptionClient) onTableDrained(rt *subscribedSpan) {
 	s.totalSpans.Lock()
 	defer s.totalSpans.Unlock()
 	delete(s.totalSpans.spanMap, rt.subID)
-	if s.regionRuntimeRegistry != nil {
-		s.regionRuntimeRegistry.removeBySubscription(rt.subID)
-	}
 }
 
 // Note: don't block the caller, otherwise there may be deadlock
@@ -646,8 +643,6 @@ func (s *subscriptionClient) handleRegions(ctx context.Context, eg *errgroup.Gro
 			s.regionTaskQueue.Push(regionTask)
 			continue
 		}
-		s.updateRegionRuntimeWorker(region, worker.workerID)
-
 		log.Debug("subscription client will request a region",
 			zap.Uint64("workID", worker.workerID),
 			zap.Uint64("subscriptionID", uint64(region.subscribedSpan.subID)),
@@ -687,10 +682,6 @@ func (s *subscriptionClient) attachRPCContextForRegion(ctx context.Context, regi
 	rpcCtx, err := s.regionCache.GetTiKVRPCContext(bo, region.verID, kvclientv2.ReplicaReadLeader, 0)
 	if rpcCtx != nil {
 		region.rpcCtx = rpcCtx
-		now := time.Now()
-		s.updateRegionRuntimeInfo(region)
-		s.setRegionRuntimeRPCReadyTime(region, now)
-		s.transitionRegionRuntime(region, regionPhaseRPCReady, now)
 		return region, true
 	}
 	if err != nil {
@@ -699,7 +690,6 @@ func (s *subscriptionClient) attachRPCContextForRegion(ctx context.Context, regi
 			zap.Uint64("regionID", region.verID.GetID()),
 			zap.Error(err))
 	}
-	s.recordRegionRuntimeError(region, &rpcCtxUnavailableErr{verID: region.verID}, time.Now())
 	s.onRegionFail(newRegionErrorInfo(region, &rpcCtxUnavailableErr{verID: region.verID}))
 	return region, false
 }
@@ -809,31 +799,22 @@ func (s *subscriptionClient) divideSpanAndScheduleRegionRequests(
 // scheduleRegionRequest locks the region's range and send the region to regionTaskQueue,
 // which will be handled by handleRegions.
 func (s *subscriptionClient) scheduleRegionRequest(ctx context.Context, region regionInfo, priority TaskType) {
-	region = s.ensureRegionRuntime(region)
 	lockRangeResult := region.subscribedSpan.rangeLock.LockRange(
 		ctx, region.span.StartKey, region.span.EndKey, region.verID.GetID(), region.verID.GetVer())
 
 	if lockRangeResult.Status == regionlock.LockRangeStatusWait {
-		s.transitionRegionRuntime(region, regionPhaseRangeLockWait, time.Now())
 		lockRangeResult = lockRangeResult.WaitFn()
 	}
 
 	switch lockRangeResult.Status {
 	case regionlock.LockRangeStatusSuccess:
 		region.lockedRangeState = lockRangeResult.LockedRangeState
-		now := time.Now()
-		s.updateRegionRuntimeInfo(region)
-		s.setRegionRuntimeRangeLockAcquiredTime(region, now)
-		s.setRegionRuntimeEnqueueTime(region, now)
-		s.transitionRegionRuntime(region, regionPhaseQueued, now)
 		s.regionTaskQueue.Push(NewRegionPriorityTask(priority, region, s.pdClock.CurrentTS()))
 	case regionlock.LockRangeStatusStale:
-		s.removeRegionRuntime(region)
 		for _, r := range lockRangeResult.RetryRanges {
 			s.scheduleRangeRequest(ctx, r, region.subscribedSpan, region.filterLoop, priority)
 		}
 	default:
-		s.removeRegionRuntime(region)
 		return
 	}
 }
@@ -866,8 +847,6 @@ func (s *subscriptionClient) handleErrors(ctx context.Context) error {
 
 func (s *subscriptionClient) doHandleError(ctx context.Context, errInfo regionErrorInfo) error {
 	err := errors.Cause(errInfo.err)
-	s.recordRegionRuntimeError(errInfo.regionInfo, err, time.Now())
-	s.incRegionRuntimeRetry(errInfo.regionInfo)
 	log.Debug("cdc region error",
 		zap.Uint64("subscriptionID", uint64(errInfo.subscribedSpan.subID)),
 		zap.Uint64("regionID", errInfo.verID.GetID()),
@@ -879,29 +858,27 @@ func (s *subscriptionClient) doHandleError(ctx context.Context, errInfo regionEr
 		if notLeader := innerErr.GetNotLeader(); notLeader != nil {
 			metricFeedNotLeaderCounter.Inc()
 			s.regionCache.UpdateLeader(errInfo.verID, notLeader.GetLeader(), errInfo.rpcCtx.AccessIdx)
-			s.scheduleRegionRequest(ctx, s.newRegionRuntimeAttempt(errInfo.regionInfo), TaskHighPrior)
+			s.scheduleRegionRequest(ctx, errInfo.regionInfo, TaskHighPrior)
 			return nil
 		}
 		if innerErr.GetEpochNotMatch() != nil {
 			metricFeedEpochNotMatchCounter.Inc()
 			s.scheduleRangeRequest(ctx, errInfo.span, errInfo.subscribedSpan, errInfo.filterLoop, TaskHighPrior)
-			s.removeRegionRuntime(errInfo.regionInfo)
 			return nil
 		}
 		if innerErr.GetRegionNotFound() != nil {
 			metricFeedRegionNotFoundCounter.Inc()
 			s.scheduleRangeRequest(ctx, errInfo.span, errInfo.subscribedSpan, errInfo.filterLoop, TaskHighPrior)
-			s.removeRegionRuntime(errInfo.regionInfo)
 			return nil
 		}
 		if innerErr.GetCongested() != nil {
 			metricKvCongestedCounter.Inc()
-			s.scheduleRegionRequest(ctx, s.newRegionRuntimeAttempt(errInfo.regionInfo), TaskLowPrior)
+			s.scheduleRegionRequest(ctx, errInfo.regionInfo, TaskLowPrior)
 			return nil
 		}
 		if innerErr.GetServerIsBusy() != nil {
 			metricKvIsBusyCounter.Inc()
-			s.scheduleRegionRequest(ctx, s.newRegionRuntimeAttempt(errInfo.regionInfo), TaskLowPrior)
+			s.scheduleRegionRequest(ctx, errInfo.regionInfo, TaskLowPrior)
 			return nil
 		}
 		if duplicated := innerErr.GetDuplicateRequest(); duplicated != nil {
@@ -920,12 +897,11 @@ func (s *subscriptionClient) doHandleError(ctx context.Context, errInfo regionEr
 			zap.Uint64("subscriptionID", uint64(errInfo.subscribedSpan.subID)),
 			zap.Stringer("error", innerErr))
 		metricFeedUnknownErrorCounter.Inc()
-		s.scheduleRegionRequest(ctx, s.newRegionRuntimeAttempt(errInfo.regionInfo), TaskHighPrior)
+		s.scheduleRegionRequest(ctx, errInfo.regionInfo, TaskHighPrior)
 		return nil
 	case *rpcCtxUnavailableErr:
 		metricFeedRPCCtxUnavailable.Inc()
 		s.scheduleRangeRequest(ctx, errInfo.span, errInfo.subscribedSpan, errInfo.filterLoop, TaskHighPrior)
-		s.removeRegionRuntime(errInfo.regionInfo)
 		return nil
 	case *getStoreErr:
 		metricGetStoreErr.Inc()
@@ -933,17 +909,15 @@ func (s *subscriptionClient) doHandleError(ctx context.Context, errInfo regionEr
 		// cannot get the store the region belongs to, so we need to reload the region.
 		s.regionCache.OnSendFail(bo, errInfo.rpcCtx, true, err)
 		s.scheduleRangeRequest(ctx, errInfo.span, errInfo.subscribedSpan, errInfo.filterLoop, TaskHighPrior)
-		s.removeRegionRuntime(errInfo.regionInfo)
 		return nil
 	case *sendRequestToStoreErr:
 		metricStoreSendRequestErr.Inc()
 		bo := tikv.NewBackoffer(ctx, tikvRequestMaxBackoff)
 		s.regionCache.OnSendFail(bo, errInfo.rpcCtx, regionScheduleReload, err)
-		s.scheduleRegionRequest(ctx, s.newRegionRuntimeAttempt(errInfo.regionInfo), TaskHighPrior)
+		s.scheduleRegionRequest(ctx, errInfo.regionInfo, TaskHighPrior)
 		return nil
 	case *requestCancelledErr:
 		// the corresponding subscription has been unsubscribed, just ignore.
-		s.removeRegionRuntime(errInfo.regionInfo)
 		return nil
 	default:
 		// TODO(qupeng): for some errors it's better to just deregister the region from TiKVs.
@@ -1074,53 +1048,25 @@ func (s *subscriptionClient) logSlowRegions(ctx context.Context) error {
 		}
 
 		currTime := s.pdClock.CurrentTime()
-		if s.regionRuntimeRegistry != nil {
-			snapshots := s.regionRuntimeRegistry.snapshot()
-			for _, state := range snapshots {
-				reason, ok := inferRegionSlowReason(state, currTime)
-				if !ok {
-					continue
-				}
-				phaseAge := currTime.Sub(state.phaseEnterTime)
-				isSlow := phaseAge > 10*time.Minute
-				if reason == regionSlowReasonResolvedTsNotAdvance {
-					isSlow = !state.lastEventTime.IsZero() && currTime.Sub(state.lastEventTime) > 6*resolveLockMinInterval
-				}
-				if !isSlow {
-					continue
-				}
-
-				requestAge := time.Duration(0)
-				if !state.requestEnqueueTime.IsZero() {
-					requestAge = currTime.Sub(state.requestEnqueueTime)
-				}
-
-				fields := []zap.Field{
-					zap.Uint64("subscriptionID", uint64(state.key.subID)),
-					zap.Uint64("regionID", state.key.regionID),
-					zap.Uint64("generation", state.key.generation),
-					zap.Int64("tableID", state.tableID),
-					zap.String("phase", string(state.phase)),
-					zap.String("reason", string(reason)),
-					zap.Duration("phaseAge", phaseAge),
-					zap.Duration("requestAge", requestAge),
-					zap.Uint64("leaderStoreID", state.leaderStoreID),
-					zap.Uint64("leaderPeerID", state.leaderPeerID),
-					zap.String("storeAddr", state.storeAddr),
-					zap.Uint64("workerID", state.workerID),
-					zap.Int("retryCount", state.retryCount),
-					zap.String("lastError", state.lastError),
-					zap.Time("lastErrorTime", state.lastErrorTime),
-					zap.Time("lastEventTime", state.lastEventTime),
-					zap.Uint64("lastResolvedTs", state.lastResolvedTs),
-				}
-				log.Info("subscription client finds a slow region runtime", fields...)
-			}
-		}
-
 		s.totalSpans.RLock()
 		for subscriptionID, rt := range s.totalSpans.spanMap {
 			attr := rt.rangeLock.IterAll(nil)
+			ckptTime := oracle.GetTimeFromTS(attr.SlowestRegion.ResolvedTs)
+			if attr.SlowestRegion.Initialized {
+				if currTime.Sub(ckptTime) > 6*resolveLockMinInterval {
+					log.Info("subscription client finds a initialized slow region",
+						zap.Uint64("subscriptionID", uint64(subscriptionID)),
+						zap.Any("slowRegion", attr.SlowestRegion))
+				}
+			} else if currTime.Sub(attr.SlowestRegion.Created) > 10*time.Minute {
+				log.Info("subscription client initializes a region too slow",
+					zap.Uint64("subscriptionID", uint64(subscriptionID)),
+					zap.Any("slowRegion", attr.SlowestRegion))
+			} else if currTime.Sub(ckptTime) > 10*time.Minute {
+				log.Info("subscription client finds a uninitialized slow region",
+					zap.Uint64("subscriptionID", uint64(subscriptionID)),
+					zap.Any("slowRegion", attr.SlowestRegion))
+			}
 			if len(attr.UnLockedRanges) > 0 {
 				log.Info("subscription client holes exist",
 					zap.Uint64("subscriptionID", uint64(subscriptionID)),

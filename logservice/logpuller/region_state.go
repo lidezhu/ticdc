@@ -15,7 +15,6 @@ package logpuller
 
 import (
 	"sync"
-	"time"
 
 	"github.com/pingcap/ticdc/heartbeatpb"
 	"github.com/pingcap/ticdc/logservice/logpuller/regionlock"
@@ -29,8 +28,7 @@ const (
 )
 
 type regionInfo struct {
-	runtimeKey regionRuntimeKey
-	verID      tikv.RegionVerID
+	verID tikv.RegionVerID
 	// The span of the region.
 	// Note(dongmen): The span doesn't always represent the whole span of a region.
 	// Instead, it is the portion of the region that belongs the subcribed table.
@@ -55,10 +53,6 @@ func (s *regionInfo) isStopped() bool {
 	return s.lockedRangeState == nil
 }
 
-func (s *regionInfo) isStopTask() bool {
-	return s.lockedRangeState == nil && s.verID.GetID() == 0
-}
-
 func newRegionInfo(
 	verID tikv.RegionVerID,
 	span heartbeatpb.TableSpan,
@@ -67,7 +61,6 @@ func newRegionInfo(
 	filterLoop bool,
 ) regionInfo {
 	return regionInfo{
-		runtimeKey:     regionRuntimeKey{},
 		verID:          verID,
 		span:           span,
 		rpcCtx:         rpcCtx,
@@ -133,10 +126,6 @@ func (s *regionFeedState) markStopped(err error) {
 		s.state.v = stateStopped
 		s.state.err = err
 	}
-	if s.worker != nil {
-		s.worker.client.recordRegionRuntimeError(s.region, err, time.Now())
-		s.worker.client.transitionRegionRuntime(s.region, regionPhaseRetryPending, time.Now())
-	}
 	s.worker.requestCache.markStopped(s.region.subscribedSpan.subID, s.region.verID.GetID())
 }
 
@@ -148,9 +137,6 @@ func (s *regionFeedState) markRemoved() (changed bool) {
 		s.state.v = stateRemoved
 		changed = true
 		s.matcher.clear()
-	}
-	if s.worker != nil {
-		s.worker.client.transitionRegionRuntime(s.region, regionPhaseRemoved, time.Now())
 	}
 	s.worker.requestCache.markStopped(s.region.subscribedSpan.subID, s.region.verID.GetID())
 	return
@@ -177,12 +163,6 @@ func (s *regionFeedState) isInitialized() bool {
 func (s *regionFeedState) setInitialized() {
 	s.region.lockedRangeState.Initialized.Store(true)
 	s.worker.requestCache.resolve(s.region.subscribedSpan.subID, s.region.verID.GetID())
-	if s.worker != nil {
-		now := time.Now()
-		s.worker.client.setRegionRuntimeInitializedTime(s.region, now)
-		s.worker.client.setRegionRuntimeReplicatingTime(s.region, now)
-		s.worker.client.transitionRegionRuntime(s.region, regionPhaseReplicating, now)
-	}
 }
 
 func (s *regionFeedState) getRegionID() uint64 {
@@ -204,9 +184,6 @@ func (s *regionFeedState) updateResolvedTs(resolvedTs uint64) {
 		if state.ResolvedTs.CompareAndSwap(last, resolvedTs) {
 			break
 		}
-	}
-	if s.worker != nil {
-		s.worker.client.updateRegionRuntimeResolvedTs(s.region, resolvedTs, time.Now())
 	}
 }
 
