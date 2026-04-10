@@ -158,7 +158,7 @@ func newRegionRequestWorker(
 					// It means it's a special task for stopping the table.
 					continue
 				}
-				client.onRegionFail(newRegionErrorInfo(region, regionErr))
+				client.errorHandler.onRegionFail(client, newRegionErrorInfo(region, regionErr))
 			}
 			if err := util.Hang(ctx, time.Second); err != nil {
 				return err
@@ -430,7 +430,7 @@ func (s *regionRequestWorker) processRegionSendTask(
 			// It can be skipped directly because there must be no pending states from
 			// the stopped subscribedTable, or the special singleRegionInfo for stopping
 			// the table will be handled later.
-			s.client.onRegionFail(newRegionErrorInfo(region, &sendRequestToStoreErr{}))
+			s.client.errorHandler.onRegionFail(s.client, newRegionErrorInfo(region, &sendRequestToStoreErr{}))
 			s.requestCache.markDone()
 		} else {
 			state := newRegionFeedState(region, uint64(subID), s)

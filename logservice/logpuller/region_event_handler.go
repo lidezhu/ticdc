@@ -246,7 +246,7 @@ func (h *regionEventHandler) handleRegionError(state *regionFeedState) {
 	}
 	if stepsToRemoved {
 		worker.takeRegionState(SubscriptionID(state.requestID), state.getRegionID())
-		h.subClient.onRegionFail(newRegionErrorInfo(state.getRegionInfo(), err))
+		h.subClient.errorHandler.onRegionFail(h.subClient, newRegionErrorInfo(state.getRegionInfo(), err))
 	}
 }
 

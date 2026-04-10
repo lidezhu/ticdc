@@ -171,7 +171,7 @@ func TestStopTaskUsesSubscribedSpanFilterLoop(t *testing.T) {
 	res := span.rangeLock.LockRange(context.Background(), rawSpan.StartKey, rawSpan.EndKey, 1, 1)
 	require.Equal(t, regionlock.LockRangeStatusSuccess, res.Status)
 
-	client.setTableStopped(span)
+	client.scheduler.setTableStopped(client, span)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -265,14 +265,14 @@ func TestEnqueueRegionToAllStoresRetryWhenCacheFull(t *testing.T) {
 	stopRegion := regionInfo{
 		subscribedSpan: &subscribedSpan{subID: SubscriptionID(1)},
 	}
-	enqueued, err := client.enqueueRegionToAllStores(ctx, stopRegion)
+	enqueued, err := client.dispatcher.enqueueRegionToAllStores(client, ctx, stopRegion)
 	require.NoError(t, err)
 	require.False(t, enqueued)
 
 	<-worker.requestCache.pendingQueue
 	worker.requestCache.markDone()
 
-	enqueued, err = client.enqueueRegionToAllStores(ctx, stopRegion)
+	enqueued, err = client.dispatcher.enqueueRegionToAllStores(client, ctx, stopRegion)
 	require.NoError(t, err)
 	require.True(t, enqueued)
 	require.Equal(t, 1, len(worker.requestCache.pendingQueue))

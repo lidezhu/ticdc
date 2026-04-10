@@ -51,7 +51,7 @@ func TestScheduleRegionRequestUpdatesRuntimeRegistry(t *testing.T) {
 	}
 	region := newRegionInfo(tikv.NewRegionVerID(10, 1, 1), regionSpan, nil, subSpan, false)
 
-	client.scheduleRegionRequest(context.Background(), region, TaskLowPrior)
+	client.scheduler.scheduleRegionRequest(client, context.Background(), region, TaskLowPrior)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -97,7 +97,7 @@ func TestOnRegionFailUpdatesRuntimeRegistry(t *testing.T) {
 	client.ensureRegionRuntime(&region, time.Now())
 	require.True(t, region.runtimeKey.isValid())
 
-	client.onRegionFail(newRegionErrorInfo(region, &sendRequestToStoreErr{}))
+	client.errorHandler.onRegionFail(client, newRegionErrorInfo(region, &sendRequestToStoreErr{}))
 
 	state, ok := client.regionRuntimeRegistry.get(region.runtimeKey)
 	require.True(t, ok)
@@ -168,7 +168,7 @@ func TestDoHandleErrorMarksRetryPendingForRetryableRegionError(t *testing.T) {
 	region := newRegionInfo(tikv.NewRegionVerID(10, 1, 1), rawSpan, nil, subSpan, false)
 	client.ensureRegionRuntime(&region, time.Now())
 
-	err := client.doHandleError(context.Background(), newRegionErrorInfo(region, &eventError{
+	err := client.errorHandler.handleError(client, context.Background(), newRegionErrorInfo(region, &eventError{
 		err: &cdcpb.Error{ServerIsBusy: &errorpb.ServerIsBusy{Reason: "busy"}},
 	}))
 	require.NoError(t, err)
@@ -198,7 +198,7 @@ func TestDoHandleErrorRemovesRuntimeForRangeReload(t *testing.T) {
 	region := newRegionInfo(tikv.NewRegionVerID(10, 1, 1), rawSpan, nil, subSpan, false)
 	client.ensureRegionRuntime(&region, time.Now())
 
-	err := client.doHandleError(context.Background(), newRegionErrorInfo(region, &rpcCtxUnavailableErr{verID: region.verID}))
+	err := client.errorHandler.handleError(client, context.Background(), newRegionErrorInfo(region, &rpcCtxUnavailableErr{verID: region.verID}))
 	require.NoError(t, err)
 
 	_, ok := client.regionRuntimeRegistry.get(region.runtimeKey)
@@ -230,7 +230,7 @@ func TestDoHandleErrorRemovesRuntimeForCancelledRequest(t *testing.T) {
 	region := newRegionInfo(tikv.NewRegionVerID(10, 1, 1), rawSpan, nil, subSpan, false)
 	client.ensureRegionRuntime(&region, time.Now())
 
-	err := client.doHandleError(context.Background(), newRegionErrorInfo(region, &requestCancelledErr{}))
+	err := client.errorHandler.handleError(client, context.Background(), newRegionErrorInfo(region, &requestCancelledErr{}))
 	require.NoError(t, err)
 
 	_, ok := client.regionRuntimeRegistry.get(region.runtimeKey)

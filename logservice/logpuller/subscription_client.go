@@ -184,6 +184,10 @@ type subscriptionClient struct {
 	metrics   sharedClientMetrics
 	clusterID uint64
 
+	scheduler    regionScheduler
+	dispatcher   regionDispatcher
+	errorHandler regionErrorHandler
+
 	regionRuntimeRegistry *regionRuntimeRegistry
 
 	pd           pd.Client
@@ -482,7 +486,7 @@ func (s *subscriptionClient) Unsubscribe(subID SubscriptionID) {
 		log.Warn("unknown subscription", zap.Uint64("subscriptionID", uint64(subID)))
 		return
 	}
-	s.setTableStopped(rt)
+	s.scheduler.setTableStopped(s, rt)
 
 	log.Info("unsubscribe span success",
 		zap.Uint64("subscriptionID", uint64(rt.subID)),
@@ -551,9 +555,9 @@ func (s *subscriptionClient) Run(ctx context.Context) error {
 
 	g.Go(func() error { return s.updateMetrics(ctx) })
 	g.Go(func() error { return s.handleDSFeedBack(ctx) })
-	g.Go(func() error { return s.handleRangeTasks(ctx) })
-	g.Go(func() error { return s.handleRegions(ctx, g) })
-	g.Go(func() error { return s.handleErrors(ctx) })
+	g.Go(func() error { return s.scheduler.handleRangeTasks(s, ctx) })
+	g.Go(func() error { return s.dispatcher.handleRegions(s, ctx, g) })
+	g.Go(func() error { return s.errorHandler.handleErrors(s, ctx) })
 	g.Go(func() error { return s.runResolveLockChecker(ctx) })
 	g.Go(func() error { return s.handleResolveLockTasks(ctx) })
 	g.Go(func() error { return s.logSlowRegions(ctx) })

@@ -25,62 +25,55 @@ import (
 )
 
 type regionErrorHandler struct {
-	client *subscriptionClient
-}
-
-func newRegionErrorHandler(client *subscriptionClient) regionErrorHandler {
-	return regionErrorHandler{client: client}
-}
-
-func (s *subscriptionClient) onRegionFail(errInfo regionErrorInfo) {
-	newRegionErrorHandler(s).onRegionFail(errInfo)
-}
-
-func (s *subscriptionClient) handleErrors(ctx context.Context) error {
-	return newRegionErrorHandler(s).handleErrors(ctx)
-}
-
-func (s *subscriptionClient) doHandleError(ctx context.Context, errInfo regionErrorInfo) error {
-	return newRegionErrorHandler(s).handleError(ctx, errInfo)
 }
 
 // Note: don't block the caller, otherwise there may be deadlock.
-func (h regionErrorHandler) onRegionFail(errInfo regionErrorInfo) {
-	h.client.recordRegionRuntimeError(errInfo.regionInfo, errInfo.err, time.Now())
+func (h regionErrorHandler) onRegionFail(client *subscriptionClient, errInfo regionErrorInfo) {
+	client.recordRegionRuntimeError(errInfo.regionInfo, errInfo.err, time.Now())
 	if errInfo.subscribedSpan.rangeLock.UnlockRange(
 		errInfo.span.StartKey, errInfo.span.EndKey,
 		errInfo.verID.GetID(), errInfo.verID.GetVer(), errInfo.resolvedTs()) {
-		h.client.onTableDrained(errInfo.subscribedSpan)
+		client.onTableDrained(errInfo.subscribedSpan)
 		return
 	}
-	h.client.errCache.add(errInfo)
+	client.errCache.add(errInfo)
 }
 
-func (h regionErrorHandler) handleErrors(ctx context.Context) error {
+func (h regionErrorHandler) handleErrors(client *subscriptionClient, ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
 			log.Info("subscription client handle errors and exit")
 			return ctx.Err()
-		case errInfo := <-h.client.errCache.errCh:
-			if err := h.handleError(ctx, errInfo); err != nil {
+		case errInfo := <-client.errCache.errCh:
+			if err := h.handleError(client, ctx, errInfo); err != nil {
 				return err
 			}
 		}
 	}
 }
 
-func (h regionErrorHandler) retryRegion(ctx context.Context, errInfo regionErrorInfo, priority TaskType) {
-	h.client.markRegionRetryPending(errInfo.regionInfo, errInfo.err, time.Now())
-	h.client.scheduleRegionRequest(ctx, errInfo.regionInfo, priority)
+func (h regionErrorHandler) retryRegion(
+	client *subscriptionClient,
+	ctx context.Context,
+	errInfo regionErrorInfo,
+	priority TaskType,
+) {
+	client.markRegionRetryPending(errInfo.regionInfo, errInfo.err, time.Now())
+	client.scheduler.scheduleRegionRequest(client, ctx, errInfo.regionInfo, priority)
 }
 
-func (h regionErrorHandler) reloadRegionRange(ctx context.Context, errInfo regionErrorInfo) {
-	h.client.removeRegionRuntime(errInfo.regionInfo, time.Now())
-	h.client.scheduleRangeRequest(ctx, errInfo.span, errInfo.subscribedSpan, errInfo.filterLoop, TaskHighPrior)
+func (h regionErrorHandler) reloadRegionRange(
+	client *subscriptionClient,
+	ctx context.Context,
+	errInfo regionErrorInfo,
+) {
+	client.removeRegionRuntime(errInfo.regionInfo, time.Now())
+	client.scheduler.scheduleRangeRequest(client, ctx, errInfo.span, errInfo.subscribedSpan, errInfo.filterLoop, TaskHighPrior)
 }
 
 func (h regionErrorHandler) handleEventError(
+	client *subscriptionClient,
 	ctx context.Context,
 	errInfo regionErrorInfo,
 	eerr *eventError,
@@ -88,28 +81,28 @@ func (h regionErrorHandler) handleEventError(
 	innerErr := eerr.err
 	if notLeader := innerErr.GetNotLeader(); notLeader != nil {
 		metricFeedNotLeaderCounter.Inc()
-		h.client.regionCache.UpdateLeader(errInfo.verID, notLeader.GetLeader(), errInfo.rpcCtx.AccessIdx)
-		h.retryRegion(ctx, errInfo, TaskHighPrior)
+		client.regionCache.UpdateLeader(errInfo.verID, notLeader.GetLeader(), errInfo.rpcCtx.AccessIdx)
+		h.retryRegion(client, ctx, errInfo, TaskHighPrior)
 		return nil
 	}
 	if innerErr.GetEpochNotMatch() != nil {
 		metricFeedEpochNotMatchCounter.Inc()
-		h.reloadRegionRange(ctx, errInfo)
+		h.reloadRegionRange(client, ctx, errInfo)
 		return nil
 	}
 	if innerErr.GetRegionNotFound() != nil {
 		metricFeedRegionNotFoundCounter.Inc()
-		h.reloadRegionRange(ctx, errInfo)
+		h.reloadRegionRange(client, ctx, errInfo)
 		return nil
 	}
 	if innerErr.GetCongested() != nil {
 		metricKvCongestedCounter.Inc()
-		h.retryRegion(ctx, errInfo, TaskLowPrior)
+		h.retryRegion(client, ctx, errInfo, TaskLowPrior)
 		return nil
 	}
 	if innerErr.GetServerIsBusy() != nil {
 		metricKvIsBusyCounter.Inc()
-		h.retryRegion(ctx, errInfo, TaskLowPrior)
+		h.retryRegion(client, ctx, errInfo, TaskLowPrior)
 		return nil
 	}
 	if duplicated := innerErr.GetDuplicateRequest(); duplicated != nil {
@@ -128,11 +121,15 @@ func (h regionErrorHandler) handleEventError(
 		zap.Uint64("subscriptionID", uint64(errInfo.subscribedSpan.subID)),
 		zap.Stringer("error", innerErr))
 	metricFeedUnknownErrorCounter.Inc()
-	h.retryRegion(ctx, errInfo, TaskHighPrior)
+	h.retryRegion(client, ctx, errInfo, TaskHighPrior)
 	return nil
 }
 
-func (h regionErrorHandler) handleError(ctx context.Context, errInfo regionErrorInfo) error {
+func (h regionErrorHandler) handleError(
+	client *subscriptionClient,
+	ctx context.Context,
+	errInfo regionErrorInfo,
+) error {
 	err := errors.Cause(errInfo.err)
 	log.Debug("cdc region error",
 		zap.Uint64("subscriptionID", uint64(errInfo.subscribedSpan.subID)),
@@ -141,26 +138,26 @@ func (h regionErrorHandler) handleError(ctx context.Context, errInfo regionError
 
 	switch eerr := err.(type) {
 	case *eventError:
-		return h.handleEventError(ctx, errInfo, eerr)
+		return h.handleEventError(client, ctx, errInfo, eerr)
 	case *rpcCtxUnavailableErr:
 		metricFeedRPCCtxUnavailable.Inc()
-		h.reloadRegionRange(ctx, errInfo)
+		h.reloadRegionRange(client, ctx, errInfo)
 		return nil
 	case *getStoreErr:
 		metricGetStoreErr.Inc()
 		bo := tikv.NewBackoffer(ctx, tikvRequestMaxBackoff)
 		// Cannot get the store the region belongs to, so we need to reload the region.
-		h.client.regionCache.OnSendFail(bo, errInfo.rpcCtx, true, err)
-		h.reloadRegionRange(ctx, errInfo)
+		client.regionCache.OnSendFail(bo, errInfo.rpcCtx, true, err)
+		h.reloadRegionRange(client, ctx, errInfo)
 		return nil
 	case *sendRequestToStoreErr:
 		metricStoreSendRequestErr.Inc()
 		bo := tikv.NewBackoffer(ctx, tikvRequestMaxBackoff)
-		h.client.regionCache.OnSendFail(bo, errInfo.rpcCtx, regionScheduleReload, err)
-		h.retryRegion(ctx, errInfo, TaskHighPrior)
+		client.regionCache.OnSendFail(bo, errInfo.rpcCtx, regionScheduleReload, err)
+		h.retryRegion(client, ctx, errInfo, TaskHighPrior)
 		return nil
 	case *requestCancelledErr:
-		h.client.removeRegionRuntime(errInfo.regionInfo, time.Now())
+		client.removeRegionRuntime(errInfo.regionInfo, time.Now())
 		// The corresponding subscription has been unsubscribed, just ignore.
 		return nil
 	default:
