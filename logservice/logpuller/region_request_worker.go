@@ -61,21 +61,22 @@ type regionRequestWorker struct {
 	}
 }
 
-func (s *regionRequestWorker) runtimeRegistry() *regionRuntimeRegistry {
-	if s.client == nil {
+func (s *regionRequestWorker) runtimeRegistry(region regionInfo) *regionRuntimeRegistry {
+	if !region.runtimeKey.isValid() {
 		return nil
 	}
+	// Once a tracked runtime key exists, region requests always belong to a client worker.
 	return s.client.regionRuntimeRegistry
 }
 
 func (s *regionRequestWorker) markRegionRuntimeEnqueued(region regionInfo, now time.Time) {
-	if registry := s.runtimeRegistry(); registry != nil && region.runtimeKey.isValid() {
+	if registry := s.runtimeRegistry(region); registry != nil {
 		registry.setRequestEnqueueTime(region.runtimeKey, now)
 	}
 }
 
 func (s *regionRequestWorker) markRegionRuntimeSent(region regionInfo, now time.Time) {
-	if registry := s.runtimeRegistry(); registry != nil && region.runtimeKey.isValid() {
+	if registry := s.runtimeRegistry(region); registry != nil {
 		registry.markWaitInitialized(region.runtimeKey, s.workerID, now)
 	}
 }

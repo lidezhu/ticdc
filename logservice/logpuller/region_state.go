@@ -201,9 +201,10 @@ func (s *regionFeedState) getRegionMeta() (uint64, heartbeatpb.TableSpan, string
 }
 
 func (s *regionFeedState) runtimeRegistry() *regionRuntimeRegistry {
-	if !s.region.runtimeKey.isValid() || s.worker == nil || s.worker.client == nil {
+	if !s.region.runtimeKey.isValid() {
 		return nil
 	}
+	// Once a tracked runtime key exists, regionFeedState is owned by a worker in production.
 	return s.worker.client.regionRuntimeRegistry
 }
 
