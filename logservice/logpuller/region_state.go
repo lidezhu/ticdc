@@ -200,28 +200,27 @@ func (s *regionFeedState) getRegionMeta() (uint64, heartbeatpb.TableSpan, string
 	return s.region.verID.GetID(), s.region.span, s.region.rpcCtx.Addr
 }
 
-func (s *regionFeedState) runtimeRegistry() *regionRuntimeRegistry {
-	if !s.region.runtimeKey.isValid() {
+func (s *regionFeedState) runtime() *regionRuntimeTracker {
+	if s == nil || s.worker == nil || s.worker.client == nil {
 		return nil
 	}
-	// Once a tracked runtime key exists, regionFeedState is owned by a worker in production.
-	return s.worker.client.regionRuntimeRegistry
+	return s.worker.client.runtime
 }
 
 func (s *regionFeedState) updateRuntimeLastEvent(now time.Time) {
-	if registry := s.runtimeRegistry(); registry != nil {
-		registry.updateLastEvent(s.region.runtimeKey, now)
+	if runtime := s.runtime(); runtime != nil {
+		runtime.updateLastEvent(s.region, now)
 	}
 }
 
 func (s *regionFeedState) markRuntimeReplicating(now time.Time) {
-	if registry := s.runtimeRegistry(); registry != nil {
-		registry.markReplicating(s.region.runtimeKey, now)
+	if runtime := s.runtime(); runtime != nil {
+		runtime.markReplicating(s.region, now)
 	}
 }
 
 func (s *regionFeedState) updateRuntimeResolvedTs(resolvedTs uint64, now time.Time) {
-	if registry := s.runtimeRegistry(); registry != nil {
-		registry.updateResolvedTs(s.region.runtimeKey, resolvedTs, now)
+	if runtime := s.runtime(); runtime != nil {
+		runtime.updateResolvedTs(s.region, resolvedTs, now)
 	}
 }

@@ -29,27 +29,43 @@ import (
 )
 
 type regionScheduler struct {
+	regionCache *tikv.RegionCache
+	runtime     *regionRuntimeTracker
+	requests    *regionRequestRouter
+	rangeTaskCh chan rangeTask
 }
 
-func (h regionScheduler) setTableStopped(client *subscriptionClient, rt *subscribedSpan) {
-	log.Info("subscription client starts to stop table",
-		zap.Uint64("subscriptionID", uint64(rt.subID)))
-
-	// Set stopped to true so we can stop handling region events from the table.
-	// Then send a special singleRegionInfo to regionRouter to deregister the table
-	// from all TiKV instances.
-	if rt.stopped.CompareAndSwap(false, true) {
-		client.regionTaskQueue.Push(NewRegionPriorityTask(TaskHighPrior, regionInfo{
-			subscribedSpan: rt,
-			filterLoop:     rt.filterLoop,
-		}, client.pdClock.CurrentTS()))
-		if rt.rangeLock.Stop() {
-			client.onTableDrained(rt)
-		}
+func newRegionScheduler(
+	regionCache *tikv.RegionCache,
+	runtime *regionRuntimeTracker,
+	requests *regionRequestRouter,
+) *regionScheduler {
+	return &regionScheduler{
+		regionCache: regionCache,
+		runtime:     runtime,
+		requests:    requests,
+		rangeTaskCh: make(chan rangeTask, 1024),
 	}
 }
 
-func (h regionScheduler) handleRangeTasks(client *subscriptionClient, ctx context.Context) error {
+func (h *regionScheduler) enqueueRange(
+	span heartbeatpb.TableSpan,
+	subscribedSpan *subscribedSpan,
+	filterLoop bool,
+	priority TaskType,
+) {
+	select {
+	case <-h.requests.client.ctx.Done():
+	case h.rangeTaskCh <- rangeTask{
+		span:           span,
+		subscribedSpan: subscribedSpan,
+		filterLoop:     filterLoop,
+		priority:       priority,
+	}:
+	}
+}
+
+func (h *regionScheduler) run(ctx context.Context) error {
 	g, ctx := errgroup.WithContext(ctx)
 	// Limit the concurrent number of goroutines to convert range tasks to region tasks.
 	g.SetLimit(1024)
@@ -57,10 +73,10 @@ func (h regionScheduler) handleRangeTasks(client *subscriptionClient, ctx contex
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case task := <-client.rangeTaskCh:
+		case task := <-h.rangeTaskCh:
 			g.Go(func() error {
 				return h.divideSpanAndScheduleRegionRequests(
-					client, ctx, task.span, task.subscribedSpan, task.filterLoop, task.priority,
+					ctx, task.span, task.subscribedSpan, task.filterLoop, task.priority,
 				)
 			})
 		}
@@ -72,8 +88,7 @@ func (h regionScheduler) handleRangeTasks(client *subscriptionClient, ctx contex
 // 1. Load regions from PD.
 // 2. Find the intersection of each region.span and the subscribedSpan.span.
 // 3. Schedule a region request to subscribe the region.
-func (h regionScheduler) divideSpanAndScheduleRegionRequests(
-	client *subscriptionClient,
+func (h *regionScheduler) divideSpanAndScheduleRegionRequests(
 	ctx context.Context,
 	span heartbeatpb.TableSpan,
 	subscribedSpan *subscribedSpan,
@@ -96,7 +111,7 @@ func (h regionScheduler) divideSpanAndScheduleRegionRequests(
 			zap.Any("span", common.FormatTableSpan(&nextSpan)))
 
 		backoff := tikv.NewBackoffer(ctx, tikvRequestMaxBackoff)
-		regions, err := client.regionCache.BatchLoadRegionsWithKeyRange(backoff, nextSpan.StartKey, nextSpan.EndKey, limit)
+		regions, err := h.regionCache.BatchLoadRegionsWithKeyRange(backoff, nextSpan.StartKey, nextSpan.EndKey, limit)
 		if err != nil {
 			log.Warn("subscription client load regions failed",
 				zap.Uint64("subscriptionID", uint64(subscribedSpan.subID)),
@@ -142,7 +157,7 @@ func (h regionScheduler) divideSpanAndScheduleRegionRequests(
 			regionInfo := newRegionInfo(verID, intersectSpan, nil, subscribedSpan, filterLoop)
 
 			// Schedule a region request to subscribe the region.
-			h.scheduleRegionRequest(client, ctx, regionInfo, taskType)
+			h.scheduleRegionRequest(ctx, regionInfo, taskType)
 
 			nextSpan.StartKey = regionMeta.EndKey
 			// If the nextSpan.StartKey is larger than the subscribedSpan.span.EndKey,
@@ -154,55 +169,34 @@ func (h regionScheduler) divideSpanAndScheduleRegionRequests(
 	}
 }
 
-// scheduleRegionRequest locks the region's range and sends the region to regionTaskQueue,
-// which will be handled by handleRegions.
-func (h regionScheduler) scheduleRegionRequest(
-	client *subscriptionClient,
+// scheduleRegionRequest locks the region's range and hands the region to the request router.
+func (h *regionScheduler) scheduleRegionRequest(
 	ctx context.Context,
 	region regionInfo,
 	priority TaskType,
 ) {
-	client.ensureRegionRuntime(&region, time.Now())
+	h.runtime.ensureRegion(&region, time.Now())
 	lockRangeResult := region.subscribedSpan.rangeLock.LockRange(
 		ctx, region.span.StartKey, region.span.EndKey, region.verID.GetID(), region.verID.GetVer())
 
 	if lockRangeResult.Status == regionlock.LockRangeStatusWait {
-		client.transitionRegionRuntime(region, regionPhaseRangeLockWait, time.Now())
+		h.runtime.transition(region, regionPhaseRangeLockWait, time.Now())
 		lockRangeResult = lockRangeResult.WaitFn()
 	}
 
 	switch lockRangeResult.Status {
 	case regionlock.LockRangeStatusSuccess:
 		region.lockedRangeState = lockRangeResult.LockedRangeState
-		client.markRegionRuntimeQueued(region, lockRangeResult.LockedRangeState.Created, time.Now())
-		client.regionTaskQueue.Push(NewRegionPriorityTask(priority, region, client.pdClock.CurrentTS()))
+		h.runtime.markQueued(region, lockRangeResult.LockedRangeState.Created, time.Now())
+		h.requests.enqueue(region, priority)
 	case regionlock.LockRangeStatusStale:
-		client.removeRegionRuntime(region, time.Now())
+		h.runtime.removeRegion(region, time.Now())
 		for _, retrySpan := range lockRangeResult.RetryRanges {
-			h.scheduleRangeRequest(client, ctx, retrySpan, region.subscribedSpan, region.filterLoop, priority)
+			h.enqueueRange(retrySpan, region.subscribedSpan, region.filterLoop, priority)
 		}
 	case regionlock.LockRangeStatusCancel:
-		client.removeRegionRuntime(region, time.Now())
+		h.runtime.removeRegion(region, time.Now())
 	default:
 		return
-	}
-}
-
-func (h regionScheduler) scheduleRangeRequest(
-	client *subscriptionClient,
-	ctx context.Context,
-	span heartbeatpb.TableSpan,
-	subscribedSpan *subscribedSpan,
-	filterLoop bool,
-	priority TaskType,
-) {
-	select {
-	case <-ctx.Done():
-	case client.rangeTaskCh <- rangeTask{
-		span:           span,
-		subscribedSpan: subscribedSpan,
-		filterLoop:     filterLoop,
-		priority:       priority,
-	}:
 	}
 }

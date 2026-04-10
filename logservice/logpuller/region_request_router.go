@@ -46,33 +46,49 @@ func (rs *requestedStore) getRequestWorker() *regionRequestWorker {
 	return rs.requestWorkers.s[index]
 }
 
-type regionDispatcher struct {
+type regionRequestRouter struct {
+	client          *subscriptionClient
+	regionTaskQueue *PriorityQueue
+	stores          sync.Map
 }
 
-func (h regionDispatcher) getOrCreateStore(
-	client *subscriptionClient,
-	ctx context.Context,
-	eg *errgroup.Group,
-	storeAddr string,
-) *requestedStore {
-	if value, ok := client.stores.Load(storeAddr); ok {
+func newRegionRequestRouter(client *subscriptionClient) *regionRequestRouter {
+	return &regionRequestRouter{
+		client:          client,
+		regionTaskQueue: NewPriorityQueue(),
+	}
+}
+
+func (h *regionRequestRouter) enqueue(region regionInfo, priority TaskType) {
+	h.regionTaskQueue.Push(NewRegionPriorityTask(priority, region, h.client.infra.pdClock.CurrentTS()))
+}
+
+func (h *regionRequestRouter) enqueueStop(subSpan *subscribedSpan) {
+	h.regionTaskQueue.Push(NewRegionPriorityTask(TaskHighPrior, regionInfo{
+		subscribedSpan: subSpan,
+		filterLoop:     subSpan.filterLoop,
+	}, h.client.infra.pdClock.CurrentTS()))
+}
+
+func (h *regionRequestRouter) getOrCreateStore(ctx context.Context, eg *errgroup.Group, storeAddr string) *requestedStore {
+	if value, ok := h.stores.Load(storeAddr); ok {
 		return value.(*requestedStore)
 	}
 
 	rs := &requestedStore{storeAddr: storeAddr}
-	client.stores.Store(storeAddr, rs)
+	h.stores.Store(storeAddr, rs)
 
 	config := config.GetGlobalServerConfig()
-	perWorkerQueueSize := config.Debug.Puller.PendingRegionRequestQueueSize / int(client.config.RegionRequestWorkerPerStore)
+	perWorkerQueueSize := config.Debug.Puller.PendingRegionRequestQueueSize / int(h.client.config.RegionRequestWorkerPerStore)
 	if perWorkerQueueSize <= 0 {
 		log.Warn("pending region request queue size is smaller than the number of workers, adjust per worker queue size to 1",
 			zap.Int("pendingRegionRequestQueueSize", config.Debug.Puller.PendingRegionRequestQueueSize),
-			zap.Uint("regionRequestWorkerPerStore", client.config.RegionRequestWorkerPerStore))
+			zap.Uint("regionRequestWorkerPerStore", h.client.config.RegionRequestWorkerPerStore))
 		perWorkerQueueSize = 1
 	}
 
-	for i := uint(0); i < client.config.RegionRequestWorkerPerStore; i++ {
-		requestWorker := newRegionRequestWorker(ctx, client, client.credential, eg, rs, perWorkerQueueSize)
+	for i := uint(0); i < h.client.config.RegionRequestWorkerPerStore; i++ {
+		requestWorker := newRegionRequestWorker(ctx, h.client, h.client.infra.credential, eg, rs, perWorkerQueueSize)
 		rs.requestWorkers.Lock()
 		rs.requestWorkers.s = append(rs.requestWorkers.s, requestWorker)
 		rs.requestWorkers.Unlock()
@@ -80,8 +96,8 @@ func (h regionDispatcher) getOrCreateStore(
 	return rs
 }
 
-func (h regionDispatcher) clearWorkers(client *subscriptionClient) {
-	client.stores.Range(func(_ any, value any) bool {
+func (h *regionRequestRouter) clearWorkers() {
+	h.stores.Range(func(_ any, value any) bool {
 		rs := value.(*requestedStore)
 
 		rs.requestWorkers.RLock()
@@ -94,10 +110,10 @@ func (h regionDispatcher) clearWorkers(client *subscriptionClient) {
 	})
 }
 
-// handleRegions receives regionInfo from regionTaskQueue, attaches rpcCtx to them,
+// run receives regionInfo from regionTaskQueue, attaches rpcCtx to them,
 // then sends them to the corresponding requestedStore.
-func (h regionDispatcher) handleRegions(client *subscriptionClient, ctx context.Context, eg *errgroup.Group) error {
-	defer h.clearWorkers(client)
+func (h *regionRequestRouter) run(ctx context.Context, eg *errgroup.Group) error {
+	defer h.clearWorkers()
 
 	for {
 		select {
@@ -106,34 +122,34 @@ func (h regionDispatcher) handleRegions(client *subscriptionClient, ctx context.
 		default:
 		}
 		// Use blocking Pop to wait for tasks.
-		regionTask, err := client.regionTaskQueue.Pop(ctx)
+		regionTask, err := h.regionTaskQueue.Pop(ctx)
 		if err != nil {
 			return err
 		}
 
 		region := regionTask.GetRegionInfo()
 		if region.isStopped() {
-			enqueued, err := h.enqueueRegionToAllStores(client, ctx, region)
+			enqueued, err := h.broadcastStop(ctx, region)
 			if err != nil {
 				return err
 			}
 			if !enqueued {
 				log.Debug("enqueue stop request failed, retry later",
 					zap.Uint64("subscriptionID", uint64(region.subscribedSpan.subID)))
-				client.regionTaskQueue.Push(regionTask)
+				h.regionTaskQueue.Push(regionTask)
 			}
 			continue
 		}
 
-		region, ok := h.attachRPCContextForRegion(client, ctx, region)
+		region, ok := h.attachRPCContext(ctx, region)
 		// If attachRPCContextForRegion fails, the region will be re-scheduled.
 		if !ok {
 			continue
 		}
-		client.updateRegionRuntimeInfo(region)
-		client.markRegionRuntimeRPCReady(region, time.Now())
+		h.client.runtime.updateRegionInfo(region)
+		h.client.runtime.markRPCReady(region, time.Now())
 
-		store := h.getOrCreateStore(client, ctx, eg, region.rpcCtx.Addr)
+		store := h.getOrCreateStore(ctx, eg, region.rpcCtx.Addr)
 		worker := store.getRequestWorker()
 		force := regionTask.Priority() <= forcedPriorityBase
 
@@ -147,7 +163,7 @@ func (h regionDispatcher) handleRegions(client *subscriptionClient, ctx context.
 		}
 
 		if !ok {
-			client.regionTaskQueue.Push(regionTask)
+			h.regionTaskQueue.Push(regionTask)
 			continue
 		}
 
@@ -159,14 +175,10 @@ func (h regionDispatcher) handleRegions(client *subscriptionClient, ctx context.
 	}
 }
 
-func (h regionDispatcher) enqueueRegionToAllStores(
-	client *subscriptionClient,
-	ctx context.Context,
-	region regionInfo,
-) (bool, error) {
+func (h *regionRequestRouter) broadcastStop(ctx context.Context, region regionInfo) (bool, error) {
 	enqueued := true
 	var firstErr error
-	client.stores.Range(func(_ any, value any) bool {
+	h.stores.Range(func(_ any, value any) bool {
 		rs := value.(*requestedStore)
 		rs.requestWorkers.RLock()
 		workers := rs.requestWorkers.s
@@ -189,13 +201,9 @@ func (h regionDispatcher) enqueueRegionToAllStores(
 	return enqueued, firstErr
 }
 
-func (h regionDispatcher) attachRPCContextForRegion(
-	client *subscriptionClient,
-	ctx context.Context,
-	region regionInfo,
-) (regionInfo, bool) {
+func (h *regionRequestRouter) attachRPCContext(ctx context.Context, region regionInfo) (regionInfo, bool) {
 	bo := tikv.NewBackoffer(ctx, tikvRequestMaxBackoff)
-	rpcCtx, err := client.regionCache.GetTiKVRPCContext(bo, region.verID, kvclientv2.ReplicaReadLeader, 0)
+	rpcCtx, err := h.client.infra.regionCache.GetTiKVRPCContext(bo, region.verID, kvclientv2.ReplicaReadLeader, 0)
 	if rpcCtx != nil {
 		region.rpcCtx = rpcCtx
 		return region, true
@@ -206,6 +214,6 @@ func (h regionDispatcher) attachRPCContextForRegion(
 			zap.Uint64("regionID", region.verID.GetID()),
 			zap.Error(err))
 	}
-	client.errorHandler.onRegionFail(client, newRegionErrorInfo(region, &rpcCtxUnavailableErr{verID: region.verID}))
+	h.client.pipeline.errorHandler.reportRegionFailure(newRegionErrorInfo(region, &rpcCtxUnavailableErr{verID: region.verID}))
 	return region, false
 }

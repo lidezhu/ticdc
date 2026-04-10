@@ -61,23 +61,22 @@ type regionRequestWorker struct {
 	}
 }
 
-func (s *regionRequestWorker) runtimeRegistry(region regionInfo) *regionRuntimeRegistry {
-	if !region.runtimeKey.isValid() {
+func (s *regionRequestWorker) runtime() *regionRuntimeTracker {
+	if s == nil || s.client == nil {
 		return nil
 	}
-	// Once a tracked runtime key exists, region requests always belong to a client worker.
-	return s.client.regionRuntimeRegistry
+	return s.client.runtime
 }
 
 func (s *regionRequestWorker) markRegionRuntimeEnqueued(region regionInfo, now time.Time) {
-	if registry := s.runtimeRegistry(region); registry != nil {
-		registry.setRequestEnqueueTime(region.runtimeKey, now)
+	if runtime := s.runtime(); runtime != nil {
+		runtime.setRequestEnqueueTime(region, now)
 	}
 }
 
 func (s *regionRequestWorker) markRegionRuntimeSent(region regionInfo, now time.Time) {
-	if registry := s.runtimeRegistry(region); registry != nil {
-		registry.markWaitInitialized(region.runtimeKey, s.workerID, now)
+	if runtime := s.runtime(); runtime != nil {
+		runtime.markWaitInitialized(region, s.workerID, now)
 	}
 }
 
@@ -124,7 +123,7 @@ func newRegionRequestWorker(
 				return err
 			}
 			var regionErr error
-			if err := version.CheckStoreVersion(ctx, worker.client.pd); err != nil {
+			if err := version.CheckStoreVersion(ctx, worker.client.infra.pd); err != nil {
 				if errors.Cause(err) == context.Canceled {
 					return nil
 				}
@@ -149,7 +148,7 @@ func newRegionRequestWorker(
 					regionEvent := regionEvent{
 						states: []*regionFeedState{state},
 					}
-					worker.client.pushRegionEventToDS(subID, regionEvent)
+					worker.client.events.pushRegionEvent(subID, regionEvent)
 				}
 			}
 			// The store may fail forever, so we need try to re-schedule all pending regions.
@@ -158,7 +157,7 @@ func newRegionRequestWorker(
 					// It means it's a special task for stopping the table.
 					continue
 				}
-				client.errorHandler.onRegionFail(client, newRegionErrorInfo(region, regionErr))
+				worker.client.pipeline.errorHandler.reportRegionFailure(newRegionErrorInfo(region, regionErr))
 			}
 			if err := util.Hang(ctx, time.Second); err != nil {
 				return err
@@ -287,7 +286,7 @@ func (s *regionRequestWorker) dispatchRegionChangeEvents(events []*cdcpb.Event) 
 			default:
 				log.Panic("unknown event type", zap.Any("event", event))
 			}
-			s.client.pushRegionEventToDS(SubscriptionID(event.RequestId), regionEvent)
+			s.client.events.pushRegionEvent(SubscriptionID(event.RequestId), regionEvent)
 		} else {
 			switch event.Event.(type) {
 			case *cdcpb.Event_Error:
@@ -309,7 +308,7 @@ func (s *regionRequestWorker) dispatchRegionChangeEvents(events []*cdcpb.Event) 
 func (s *regionRequestWorker) dispatchResolvedTsEvent(resolvedTsEvent *cdcpb.ResolvedTs) {
 	subscriptionID := SubscriptionID(resolvedTsEvent.RequestId)
 	metricsResolvedTsCount.Add(float64(len(resolvedTsEvent.Regions)))
-	s.client.metrics.batchResolvedSize.Observe(float64(len(resolvedTsEvent.Regions)))
+	s.client.infra.metrics.batchResolvedSize.Observe(float64(len(resolvedTsEvent.Regions)))
 	// TODO: resolvedTsEvent.Ts be 0 is impossible, we need find the root cause.
 	if resolvedTsEvent.Ts == 0 {
 		log.Warn("region request worker receives a resolved ts event with zero value, ignore it",
@@ -330,7 +329,7 @@ func (s *regionRequestWorker) dispatchResolvedTsEvent(resolvedTsEvent *cdcpb.Res
 		if len(resolvedStates) == 0 {
 			return
 		}
-		s.client.pushRegionEventToDS(subscriptionID, regionEvent{
+		s.client.events.pushRegionEvent(subscriptionID, regionEvent{
 			resolvedTs: resolvedTsEvent.Ts,
 			states:     resolvedStates,
 		})
@@ -408,7 +407,7 @@ func (s *regionRequestWorker) processRegionSendTask(
 		// It means it's a special task for stopping the table.
 		if region.isStopped() {
 			req := &cdcpb.ChangeDataRequest{
-				Header:    &cdcpb.Header{ClusterId: s.client.clusterID, TicdcVersion: version.ReleaseSemver()},
+				Header:    &cdcpb.Header{ClusterId: s.client.infra.clusterID, TicdcVersion: version.ReleaseSemver()},
 				RequestId: uint64(subID),
 				Request: &cdcpb.ChangeDataRequest_Deregister_{
 					Deregister: &cdcpb.ChangeDataRequest_Deregister{},
@@ -424,13 +423,13 @@ func (s *regionRequestWorker) processRegionSendTask(
 				regionEvent := regionEvent{
 					states: []*regionFeedState{state},
 				}
-				s.client.pushRegionEventToDS(subID, regionEvent)
+				s.client.events.pushRegionEvent(subID, regionEvent)
 			}
 		} else if region.subscribedSpan.stopped.Load() {
 			// It can be skipped directly because there must be no pending states from
 			// the stopped subscribedTable, or the special singleRegionInfo for stopping
 			// the table will be handled later.
-			s.client.errorHandler.onRegionFail(s.client, newRegionErrorInfo(region, &sendRequestToStoreErr{}))
+			s.client.pipeline.errorHandler.reportRegionFailure(newRegionErrorInfo(region, &sendRequestToStoreErr{}))
 			s.requestCache.markDone()
 		} else {
 			state := newRegionFeedState(region, uint64(subID), s)
@@ -466,7 +465,7 @@ func (s *regionRequestWorker) processRegionSendTask(
 
 func (s *regionRequestWorker) createRegionRequest(region regionInfo) *cdcpb.ChangeDataRequest {
 	return &cdcpb.ChangeDataRequest{
-		Header:       &cdcpb.Header{ClusterId: s.client.clusterID, TicdcVersion: version.ReleaseSemver()},
+		Header:       &cdcpb.Header{ClusterId: s.client.infra.clusterID, TicdcVersion: version.ReleaseSemver()},
 		RegionId:     region.verID.GetID(),
 		RequestId:    uint64(region.subscribedSpan.subID),
 		RegionEpoch:  region.rpcCtx.Meta.RegionEpoch,
