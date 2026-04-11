@@ -38,27 +38,6 @@ var workerIDGen atomic.Uint64
 
 type regionFeedStates map[uint64]*regionFeedState
 
-type workerSessionFailure struct {
-	kind   regionFailureKind
-	source regionFailureSource
-	cause  error
-}
-
-func (f workerSessionFailure) toRegionFailure(region regionInfo) regionFailureInfo {
-	switch f.kind {
-	case regionFailureKindGetStore:
-		return newGetStoreFailure(region, f.source, f.cause)
-	case regionFailureKindSendRequestToStore:
-		return newSendRequestToStoreFailure(region, f.source, f.cause)
-	default:
-		log.Panic("unknown worker session failure kind",
-			zap.Stringer("failureKind", f.kind),
-			zap.Stringer("failureSource", f.source),
-			zap.Error(f.cause))
-		return regionFailureInfo{}
-	}
-}
-
 // regionRequestWorker is responsible for sending region requests to a specific TiKV store.
 type regionRequestWorker struct {
 	workerID uint64
@@ -172,23 +151,9 @@ func newRegionRequestWorker(
 					return nil
 				}
 			}
-			for subID, m := range worker.clearRegionStates() {
-				for _, state := range m {
-					state.markStopped(sessionFailure.toRegionFailure(state.getRegionInfo()))
-					regionEvent := regionEvent{
-						states: []*regionFeedState{state},
-					}
-					worker.client.pushRegionEventToDS(subID, regionEvent)
-				}
-			}
-			// The store may fail forever, so we need try to re-schedule all pending regions.
-			for _, region := range worker.clearPendingRegions() {
-				if region.isStopped() {
-					// It means it's a special task for stopping the table.
-					continue
-				}
-				client.onRegionFail(sessionFailure.toRegionFailure(region))
-			}
+			// A store/session failure fans out into ordered failures for started
+			// regions and direct failures for pending regions.
+			worker.client.failures.submitWorkerSessionFailure(worker, sessionFailure)
 			if err := util.Hang(ctx, time.Second); err != nil {
 				return err
 			}
@@ -493,7 +458,7 @@ func (s *regionRequestWorker) processRegionSendTask(
 			// It can be skipped directly because there must be no pending states from
 			// the stopped subscribedTable, or the special singleRegionInfo for stopping
 			// the table will be handled later.
-			s.client.onRegionFail(newSubscriptionStoppedFailure(region))
+			s.client.failures.submitDirectFailure(newSubscriptionStoppedFailure(region))
 			s.requestCache.markDone()
 		} else {
 			state := newRegionFeedState(region, uint64(subID), s)

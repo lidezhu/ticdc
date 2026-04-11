@@ -233,7 +233,7 @@ func (h *regionEventHandler) OnDrop(event regionEvent) interface{} {
 }
 
 func (h *regionEventHandler) handleRegionError(state *regionFeedState) {
-	failure, removed := state.takeStoppedFailure()
+	failure, removed := h.subClient.failures.submitOrderedFailure(state)
 	worker := state.worker
 	if failure.err != nil {
 		log.Debug("region event handler get a region error",
@@ -245,10 +245,6 @@ func (h *regionEventHandler) handleRegionError(state *regionFeedState) {
 			zap.Stringer("failureKind", failure.kind),
 			zap.Bool("reschedule", removed),
 			zap.Error(failure.err))
-	}
-	if removed {
-		worker.takeRegionState(SubscriptionID(state.requestID), state.getRegionID())
-		h.subClient.onRegionFail(failure)
 	}
 }
 
