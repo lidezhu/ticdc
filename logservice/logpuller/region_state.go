@@ -97,14 +97,14 @@ type regionFeedState struct {
 		hasFailure bool
 	}
 
-	worker *regionRequestWorker
+	controller *regionStateController
 }
 
-func newRegionFeedState(region regionInfo, requestID uint64, worker *regionRequestWorker) *regionFeedState {
+func newRegionFeedState(region regionInfo, requestID uint64, controller *regionStateController) *regionFeedState {
 	return &regionFeedState{
-		region:    region,
-		requestID: requestID,
-		worker:    worker,
+		region:     region,
+		requestID:  requestID,
+		controller: controller,
 	}
 }
 
@@ -122,7 +122,7 @@ func (s *regionFeedState) markStopped(failure regionFailureInfo) {
 		s.state.failure = failure
 		s.state.hasFailure = true
 	}
-	s.worker.requestCache.markStopped(s.region.subscribedSpan.subID, s.region.verID.GetID())
+	s.controller.markRequestStopped(s.region.subscribedSpan.subID, s.region.verID.GetID())
 }
 
 // takeStoppedFailure moves a stopped region into removed state and returns the
@@ -133,7 +133,7 @@ func (s *regionFeedState) takeStoppedFailure() (regionFailureInfo, bool) {
 	if s.state.v == stateStopped && s.state.hasFailure {
 		s.state.v = stateRemoved
 		s.matcher.clear()
-		s.worker.requestCache.markStopped(s.region.subscribedSpan.subID, s.region.verID.GetID())
+		s.controller.markRequestStopped(s.region.subscribedSpan.subID, s.region.verID.GetID())
 		failure := s.state.failure
 		s.state.failure = regionFailureInfo{}
 		s.state.hasFailure = false
@@ -142,7 +142,7 @@ func (s *regionFeedState) takeStoppedFailure() (regionFailureInfo, bool) {
 	if s.state.v == stateStopped {
 		s.state.v = stateRemoved
 		s.matcher.clear()
-		s.worker.requestCache.markStopped(s.region.subscribedSpan.subID, s.region.verID.GetID())
+		s.controller.markRequestStopped(s.region.subscribedSpan.subID, s.region.verID.GetID())
 	}
 	return regionFailureInfo{}, false
 }
@@ -153,7 +153,7 @@ func (s *regionFeedState) isInitialized() bool {
 
 func (s *regionFeedState) setInitialized() {
 	s.region.lockedRangeState.Initialized.Store(true)
-	s.worker.requestCache.resolve(s.region.subscribedSpan.subID, s.region.verID.GetID())
+	s.controller.resolveRequest(s.region.subscribedSpan.subID, s.region.verID.GetID())
 }
 
 func (s *regionFeedState) getRegionID() uint64 {
@@ -192,11 +192,15 @@ func (s *regionFeedState) isStale() bool {
 	return s.state.v == stateStopped || s.state.v == stateRemoved
 }
 
+func (s *regionFeedState) workerID() uint64 {
+	return s.controller.getWorkerID()
+}
+
 func (s *regionFeedState) runtimeRegistry() *regionRuntimeRegistry {
-	if !s.region.runtimeKey.isValid() || s.worker == nil || s.worker.client == nil {
+	if !s.region.runtimeKey.isValid() {
 		return nil
 	}
-	return s.worker.client.regionRuntimeRegistry
+	return s.controller.runtimeRegistry()
 }
 
 func (s *regionFeedState) updateRuntimeLastEvent(now time.Time) {

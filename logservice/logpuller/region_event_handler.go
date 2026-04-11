@@ -212,7 +212,7 @@ func (h *regionEventHandler) GetType(event regionEvent) dynstream.EventType {
 	log.Panic("unknown event type",
 		zap.Uint64("regionID", state.getRegionID()),
 		zap.Uint64("requestID", state.requestID),
-		zap.Uint64("workerID", state.worker.workerID))
+		zap.Uint64("workerID", state.workerID()))
 	return dynstream.DefaultEventType
 }
 
@@ -226,7 +226,7 @@ func (h *regionEventHandler) OnDrop(event regionEvent) interface{} {
 		zap.Uint64("regionID", state.getRegionID()),
 		zap.Uint64("requestID", state.requestID),
 		zap.Bool("stateIsStale", state.isStale()),
-		zap.Uint64("workerID", state.worker.workerID),
+		zap.Uint64("workerID", state.workerID()),
 	}
 	log.Warn("drop region event", fields...)
 	return nil
@@ -234,10 +234,9 @@ func (h *regionEventHandler) OnDrop(event regionEvent) interface{} {
 
 func (h *regionEventHandler) handleRegionError(state *regionFeedState) {
 	failure, removed := h.subClient.failures.submitOrderedFailure(state)
-	worker := state.worker
 	if failure.err != nil {
 		log.Debug("region event handler get a region error",
-			zap.Uint64("workerID", worker.workerID),
+			zap.Uint64("workerID", state.workerID()),
 			zap.Uint64("subscriptionID", uint64(state.region.subscribedSpan.subID)),
 			zap.Uint64("regionID", state.region.verID.GetID()),
 			zap.Stringer("failureScope", failure.scope),

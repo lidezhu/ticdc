@@ -54,23 +54,23 @@ func prepareRegionForSendTest(region regionInfo) regionInfo {
 }
 
 func TestRegionStatesOperation(t *testing.T) {
-	worker := &regionRequestWorker{}
-	worker.requestedRegions.subscriptions = make(map[SubscriptionID]regionFeedStates)
+	session := &regionWorkerSession{}
+	session.requestedRegions.subscriptions = make(map[SubscriptionID]regionFeedStates)
 
-	require.Nil(t, worker.getRegionState(1, 2))
-	require.Nil(t, worker.takeRegionState(1, 2))
+	require.Nil(t, session.getRegionState(1, 2))
+	require.Nil(t, session.takeRegionState(1, 2))
 
-	worker.addRegionState(1, 2, &regionFeedState{})
-	require.NotNil(t, worker.getRegionState(1, 2))
-	require.NotNil(t, worker.takeRegionState(1, 2))
-	require.Nil(t, worker.getRegionState(1, 2))
-	require.Equal(t, 0, len(worker.requestedRegions.subscriptions))
+	session.addRegionState(1, 2, &regionFeedState{})
+	require.NotNil(t, session.getRegionState(1, 2))
+	require.NotNil(t, session.takeRegionState(1, 2))
+	require.Nil(t, session.getRegionState(1, 2))
+	require.Equal(t, 0, len(session.requestedRegions.subscriptions))
 
-	worker.addRegionState(1, 2, &regionFeedState{})
-	require.NotNil(t, worker.getRegionState(1, 2))
-	require.NotNil(t, worker.takeRegionState(1, 2))
-	require.Nil(t, worker.getRegionState(1, 2))
-	require.Equal(t, 0, len(worker.requestedRegions.subscriptions))
+	session.addRegionState(1, 2, &regionFeedState{})
+	require.NotNil(t, session.getRegionState(1, 2))
+	require.NotNil(t, session.takeRegionState(1, 2))
+	require.Nil(t, session.getRegionState(1, 2))
+	require.Equal(t, 0, len(session.requestedRegions.subscriptions))
 }
 
 func TestClearPendingRegionsReleaseSlotForPreFetchedRegion(t *testing.T) {
@@ -146,9 +146,9 @@ func (m *mockRegionEventDynamicStream) GetMetrics() dynstream.Metrics[int, Subsc
 	return dynstream.Metrics[int, SubscriptionID]{}
 }
 
-func newDispatchResolvedTsTestWorker(regionCount int) (*regionRequestWorker, *mockRegionEventDynamicStream, *cdcpb.ResolvedTs) {
+func newDispatchResolvedTsTestSession(regionCount int) (*regionWorkerSession, *mockRegionEventDynamicStream, *cdcpb.ResolvedTs) {
 	ds := &mockRegionEventDynamicStream{}
-	worker := &regionRequestWorker{
+	session := &regionWorkerSession{
 		client: &subscriptionClient{
 			metrics: sharedClientMetrics{
 				batchResolvedSize: prometheus.ObserverFunc(func(float64) {}),
@@ -156,26 +156,26 @@ func newDispatchResolvedTsTestWorker(regionCount int) (*regionRequestWorker, *mo
 			ds: ds,
 		},
 	}
-	worker.requestedRegions.subscriptions = map[SubscriptionID]regionFeedStates{
+	session.requestedRegions.subscriptions = map[SubscriptionID]regionFeedStates{
 		1: make(regionFeedStates, regionCount),
 	}
 	regions := make([]uint64, regionCount)
 	for i := 0; i < regionCount; i++ {
 		regionID := uint64(i + 1)
 		regions[i] = regionID
-		worker.requestedRegions.subscriptions[1][regionID] = &regionFeedState{
+		session.requestedRegions.subscriptions[1][regionID] = &regionFeedState{
 			requestID: 1,
 		}
 	}
 
-	return worker, ds, &cdcpb.ResolvedTs{
+	return session, ds, &cdcpb.ResolvedTs{
 		RequestId: 1,
 		Ts:        100,
 		Regions:   regions,
 	}
 }
 
-func dispatchResolvedTsEventLegacyForBenchmark(s *regionRequestWorker, resolvedTsEvent *cdcpb.ResolvedTs) {
+func dispatchResolvedTsEventLegacyForBenchmark(s *regionWorkerSession, resolvedTsEvent *cdcpb.ResolvedTs) {
 	subscriptionID := SubscriptionID(resolvedTsEvent.RequestId)
 	const resolvedTsStateBatchSize = 1024
 	resolvedStates := make([]*regionFeedState, 0, resolvedTsStateBatchSize)
@@ -202,14 +202,14 @@ func dispatchResolvedTsEventLegacyForBenchmark(s *regionRequestWorker, resolvedT
 }
 
 func benchmarkDispatchResolvedTsEvent(b *testing.B, regionCount int, useLegacy bool) {
-	worker, ds, event := newDispatchResolvedTsTestWorker(regionCount)
+	session, ds, event := newDispatchResolvedTsTestSession(regionCount)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if useLegacy {
-			dispatchResolvedTsEventLegacyForBenchmark(worker, event)
+			dispatchResolvedTsEventLegacyForBenchmark(session, event)
 		} else {
-			worker.dispatchResolvedTsEvent(event)
+			session.dispatchResolvedTsEvent(event)
 		}
 	}
 	b.StopTimer()
@@ -219,8 +219,8 @@ func benchmarkDispatchResolvedTsEvent(b *testing.B, regionCount int, useLegacy b
 }
 
 func TestDispatchResolvedTsEventSingleRegion(t *testing.T) {
-	worker, ds, event := newDispatchResolvedTsTestWorker(1)
-	worker.dispatchResolvedTsEvent(event)
+	session, ds, event := newDispatchResolvedTsTestSession(1)
+	session.dispatchResolvedTsEvent(event)
 
 	require.Equal(t, 1, ds.pushCount)
 	require.Equal(t, 1, ds.totalStates)
@@ -231,8 +231,8 @@ func TestDispatchResolvedTsEventSingleRegion(t *testing.T) {
 }
 
 func TestDispatchResolvedTsEventBatchSplitForLargeRegions(t *testing.T) {
-	worker, ds, event := newDispatchResolvedTsTestWorker(2050)
-	worker.dispatchResolvedTsEvent(event)
+	session, ds, event := newDispatchResolvedTsTestSession(2050)
+	session.dispatchResolvedTsEvent(event)
 
 	require.Equal(t, 2050, ds.totalStates)
 	require.Len(t, ds.pushed, 3)
@@ -269,7 +269,11 @@ func TestClearPendingRegionsDoesNotReturnStoppedSentRegion(t *testing.T) {
 	worker := &regionRequestWorker{
 		requestCache: newRequestCache(10),
 	}
-	worker.requestedRegions.subscriptions = make(map[SubscriptionID]regionFeedStates)
+	session := &regionWorkerSession{
+		requestCache: worker.requestCache,
+	}
+	session.requestedRegions.subscriptions = make(map[SubscriptionID]regionFeedStates)
+	session.controller = newRegionStateController(0, nil, worker.requestCache, session.takeRegionState)
 
 	ctx := context.Background()
 	region := createTestRegionInfo(1, 1)
@@ -281,9 +285,9 @@ func TestClearPendingRegionsDoesNotReturnStoppedSentRegion(t *testing.T) {
 	req, err := worker.requestCache.pop(ctx)
 	require.NoError(t, err)
 
-	state := newRegionFeedState(req.regionInfo, uint64(req.regionInfo.subscribedSpan.subID), worker)
+	state := newRegionFeedState(req.regionInfo, uint64(req.regionInfo.subscribedSpan.subID), session.controller)
 	state.start()
-	worker.addRegionState(req.regionInfo.subscribedSpan.subID, req.regionInfo.verID.GetID(), state)
+	session.addRegionState(req.regionInfo.subscribedSpan.subID, req.regionInfo.verID.GetID(), state)
 
 	// Simulate the race we are fixing in processRegionSendTask:
 	// once a request is visible in sentRequests, a fast region error may mark the
@@ -296,7 +300,7 @@ func TestClearPendingRegionsDoesNotReturnStoppedSentRegion(t *testing.T) {
 		regionFailureSourceWorkerSend,
 		errors.New("send request to store error"),
 	))
-	worker.takeRegionState(req.regionInfo.subscribedSpan.subID, req.regionInfo.verID.GetID())
+	session.takeRegionState(req.regionInfo.subscribedSpan.subID, req.regionInfo.verID.GetID())
 
 	require.Equal(t, 0, worker.requestCache.getPendingCount())
 	require.Empty(t, worker.clearPendingRegions())
@@ -308,7 +312,6 @@ func TestProcessRegionSendTaskSendFailureCleansSentRequest(t *testing.T) {
 		store:        &requestedStore{storeAddr: "store-1"},
 		client:       &subscriptionClient{},
 	}
-	worker.requestedRegions.subscriptions = make(map[SubscriptionID]regionFeedStates)
 
 	ctx := context.Background()
 	region := prepareRegionForSendTest(createTestRegionInfo(1, 1))
@@ -320,8 +323,6 @@ func TestProcessRegionSendTaskSendFailureCleansSentRequest(t *testing.T) {
 
 	req, err := worker.requestCache.pop(ctx)
 	require.NoError(t, err)
-	worker.preFetchForConnecting = new(regionInfo)
-	*worker.preFetchForConnecting = req.regionInfo
 
 	sendErr := errors.New("send failed")
 	conn := &ConnAndClient{
@@ -329,11 +330,12 @@ func TestProcessRegionSendTaskSendFailureCleansSentRequest(t *testing.T) {
 		Conn:   &grpc.ClientConn{},
 	}
 
-	err = worker.processRegionSendTask(ctx, conn)
+	session := newRegionWorkerSession(worker.client, 1, worker.store.storeAddr, conn, worker.requestCache, req.regionInfo)
+	err = session.processRegionSendTask(ctx)
 	require.ErrorIs(t, err, sendErr)
 	require.Equal(t, 0, worker.requestCache.getPendingCount())
 	require.Empty(t, worker.requestCache.sentRequests.regionReqs)
-	state := worker.getRegionState(req.regionInfo.subscribedSpan.subID, req.regionInfo.verID.GetID())
+	state := session.getRegionState(req.regionInfo.subscribedSpan.subID, req.regionInfo.verID.GetID())
 	require.True(t, state == nil || state.isStale(), "region state should be removed or marked stale after send failure")
 	if state != nil {
 		failure, ok := state.takeStoppedFailure()

@@ -161,24 +161,30 @@ func (h *failureHandler) submitOrderedFailure(state *regionFeedState) (regionFai
 	if !removed {
 		return regionFailureInfo{}, false
 	}
-	state.worker.takeRegionState(SubscriptionID(state.requestID), state.getRegionID())
+	state.controller.removeRegionState(SubscriptionID(state.requestID), state.getRegionID())
 	h.submitDirectFailure(failure)
 	return failure, true
 }
 
 // submitWorkerSessionFailure converts one worker/store-session failure into:
 // ordered failures for started regions and direct failures for pending regions.
-func (h *failureHandler) submitWorkerSessionFailure(worker *regionRequestWorker, sessionFailure workerSessionFailure) {
-	for subID, states := range worker.clearRegionStates() {
-		for _, state := range states {
-			state.markStopped(sessionFailure.toRegionFailure(state.getRegionInfo()))
-			h.client.pushRegionEventToDS(subID, regionEvent{
-				states: []*regionFeedState{state},
-			})
+func (h *failureHandler) submitWorkerSessionFailure(
+	session *regionWorkerSession,
+	pendingRegions []regionInfo,
+	sessionFailure workerSessionFailure,
+) {
+	if session != nil {
+		for subID, states := range session.clearRegionStates() {
+			for _, state := range states {
+				state.markStopped(sessionFailure.toRegionFailure(state.getRegionInfo()))
+				h.client.pushRegionEventToDS(subID, regionEvent{
+					states: []*regionFeedState{state},
+				})
+			}
 		}
 	}
 
-	for _, region := range worker.clearPendingRegions() {
+	for _, region := range pendingRegions {
 		if region.isStopped() {
 			continue
 		}

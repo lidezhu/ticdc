@@ -138,7 +138,8 @@ func TestHandleResolvedTsUpdatesRuntimeRegistry(t *testing.T) {
 	region.runtimeKey = client.regionRuntimeRegistry.allocKey(subSpan.subID, region.verID.GetID())
 	client.regionRuntimeRegistry.updateRegionInfo(region.runtimeKey, region)
 
-	state := newRegionFeedState(region, uint64(subSpan.subID), worker)
+	controller := newRegionStateController(worker.workerID, worker.client, worker.requestCache, nil)
+	state := newRegionFeedState(region, uint64(subSpan.subID), controller)
 	state.start()
 
 	resolvedTs := uint64(200)
