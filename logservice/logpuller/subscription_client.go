@@ -191,8 +191,8 @@ type subscriptionClient struct {
 	runtime *regionRuntimeTracker
 
 	subscriptions struct {
-		manager     *spanManager
-		maintenance *spanMaintenance
+		manager    *spanManager
+		supervisor *spanSupervisor
 	}
 
 	pipeline struct {
@@ -238,8 +238,8 @@ func NewSubscriptionClient(
 	subClient.pipeline.requestRouter = newRegionRequestRouter(subClient)
 	subClient.pipeline.scheduler = newRegionScheduler(subClient.infra.regionCache, subClient.runtime, subClient.pipeline.requestRouter)
 	subClient.subscriptions.manager = newSpanManager(subClient.ctx, subClient.infra.pdClock, subClient.events, subClient.runtime)
-	subClient.subscriptions.maintenance = newSpanMaintenance(subClient.infra.pdClock, subClient.infra.lockResolver, subClient.subscriptions.manager)
-	subClient.subscriptions.manager.setMaintenance(subClient.subscriptions.maintenance)
+	subClient.subscriptions.supervisor = newSpanSupervisor(subClient.infra.pdClock, subClient.infra.lockResolver, subClient.subscriptions.manager)
+	subClient.subscriptions.manager.setSupervisor(subClient.subscriptions.supervisor)
 	subClient.subscriptions.manager.setPipeline(subClient.pipeline.scheduler, subClient.pipeline.requestRouter)
 	subClient.pipeline.errorHandler = newRegionErrorHandler(
 		subClient.runtime,
@@ -363,9 +363,9 @@ func (s *subscriptionClient) Run(ctx context.Context) error {
 	g.Go(func() error { return s.pipeline.scheduler.run(ctx) })
 	g.Go(func() error { return s.pipeline.requestRouter.run(ctx, g) })
 	g.Go(func() error { return s.pipeline.errorHandler.run(ctx) })
-	g.Go(func() error { return s.subscriptions.maintenance.runResolveLockChecker(ctx) })
-	g.Go(func() error { return s.subscriptions.maintenance.handleResolveLockTasks(ctx) })
-	g.Go(func() error { return s.subscriptions.maintenance.logSlowRegions(ctx) })
+	g.Go(func() error { return s.subscriptions.supervisor.runResolveLockChecker(ctx) })
+	g.Go(func() error { return s.subscriptions.supervisor.handleResolveLockTasks(ctx) })
+	g.Go(func() error { return s.subscriptions.supervisor.logSlowRegions(ctx) })
 	g.Go(func() error { return s.pipeline.errorHandler.errCache.dispatch(ctx) })
 
 	log.Info("subscription client starts")

@@ -65,8 +65,8 @@ func newSubscriptionClientForTest() *subscriptionClient {
 	client.pipeline.requestRouter = newRegionRequestRouter(client)
 	client.pipeline.scheduler = newRegionScheduler(nil, client.runtime, client.pipeline.requestRouter)
 	client.subscriptions.manager = newSpanManager(ctx, client.infra.pdClock, client.events, client.runtime)
-	client.subscriptions.maintenance = newSpanMaintenance(client.infra.pdClock, nil, client.subscriptions.manager)
-	client.subscriptions.manager.setMaintenance(client.subscriptions.maintenance)
+	client.subscriptions.supervisor = newSpanSupervisor(client.infra.pdClock, nil, client.subscriptions.manager)
+	client.subscriptions.manager.setSupervisor(client.subscriptions.supervisor)
 	client.subscriptions.manager.setPipeline(client.pipeline.scheduler, client.pipeline.requestRouter)
 	client.pipeline.errorHandler = newRegionErrorHandler(
 		client.runtime,

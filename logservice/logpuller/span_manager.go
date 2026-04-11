@@ -42,7 +42,7 @@ type spanManager struct {
 	scheduler *regionScheduler
 	router    *regionRequestRouter
 
-	maintenance *spanMaintenance
+	supervisor *spanSupervisor
 
 	mu      sync.RWMutex
 	spanMap map[SubscriptionID]*subscribedSpan
@@ -71,8 +71,8 @@ func (m *spanManager) setPipeline(scheduler *regionScheduler, router *regionRequ
 	m.router = router
 }
 
-func (m *spanManager) setMaintenance(maintenance *spanMaintenance) {
-	m.maintenance = maintenance
+func (m *spanManager) setSupervisor(supervisor *spanSupervisor) {
+	m.supervisor = supervisor
 }
 
 func (m *spanManager) subscribe(
@@ -209,7 +209,7 @@ func (m *spanManager) newSubscribedSpan(
 	subSpan.tryResolveLock = func(regionID uint64, state *regionlock.LockedRangeState) {
 		targetTs := subSpan.staleLocksTargetTs.Load()
 		if state.ResolvedTs.Load() < targetTs && state.Initialized.Load() {
-			m.maintenance.enqueueResolveLockTask(resolveLockTask{
+			m.supervisor.enqueueResolveLockTask(resolveLockTask{
 				keyspaceID: span.KeyspaceID,
 				regionID:   regionID,
 				targetTs:   targetTs,
@@ -240,7 +240,7 @@ func gcResolveLastRunMap(resolveLastRun map[uint64]time.Time, now time.Time) map
 	return copied
 }
 
-type spanMaintenance struct {
+type spanSupervisor struct {
 	pdClock      interface{ CurrentTime() time.Time }
 	lockResolver interface {
 		Resolve(ctx context.Context, keyspaceID uint32, regionID uint64, targetTs uint64) error
@@ -249,14 +249,14 @@ type spanMaintenance struct {
 	spans             *spanManager
 }
 
-func newSpanMaintenance(
+func newSpanSupervisor(
 	pdClock interface{ CurrentTime() time.Time },
 	lockResolver interface {
 		Resolve(ctx context.Context, keyspaceID uint32, regionID uint64, targetTs uint64) error
 	},
 	spans *spanManager,
-) *spanMaintenance {
-	return &spanMaintenance{
+) *spanSupervisor {
+	return &spanSupervisor{
 		pdClock:           pdClock,
 		lockResolver:      lockResolver,
 		resolveLockTaskCh: make(chan resolveLockTask, 1024),
@@ -264,7 +264,7 @@ func newSpanMaintenance(
 	}
 }
 
-func (m *spanMaintenance) enqueueResolveLockTask(task resolveLockTask) {
+func (m *spanSupervisor) enqueueResolveLockTask(task resolveLockTask) {
 	select {
 	case <-m.spans.ctx.Done():
 	case m.resolveLockTaskCh <- task:
@@ -273,7 +273,7 @@ func (m *spanMaintenance) enqueueResolveLockTask(task resolveLockTask) {
 	}
 }
 
-func (m *spanMaintenance) runResolveLockChecker(ctx context.Context) error {
+func (m *spanSupervisor) runResolveLockChecker(ctx context.Context) error {
 	resolveLockTicker := time.NewTicker(resolveLockTickInterval)
 	defer resolveLockTicker.Stop()
 	maxCacheSize := 1024
@@ -321,7 +321,7 @@ func (m *spanMaintenance) runResolveLockChecker(ctx context.Context) error {
 	}
 }
 
-func (m *spanMaintenance) handleResolveLockTasks(ctx context.Context) error {
+func (m *spanSupervisor) handleResolveLockTasks(ctx context.Context) error {
 	resolveLastRun := make(map[uint64]time.Time)
 
 	doResolve := func(keyspaceID uint32, regionID uint64, state *regionlock.LockedRangeState, targetTs uint64) {
@@ -360,7 +360,7 @@ func (m *spanMaintenance) handleResolveLockTasks(ctx context.Context) error {
 	}
 }
 
-func (m *spanMaintenance) logSlowRegions(ctx context.Context) error {
+func (m *spanSupervisor) logSlowRegions(ctx context.Context) error {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {

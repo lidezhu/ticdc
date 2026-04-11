@@ -40,7 +40,7 @@ import (
 func TestGenerateResolveLockTask(t *testing.T) {
 	client := newSubscriptionClientForTest()
 	taskCh := make(chan resolveLockTask, 10)
-	client.subscriptions.maintenance.resolveLockTaskCh = taskCh
+	client.subscriptions.supervisor.resolveLockTaskCh = taskCh
 	rawSpan := heartbeatpb.TableSpan{
 		TableID:  1,
 		StartKey: []byte{'a'},
@@ -104,7 +104,7 @@ func TestGenerateResolveLockTask(t *testing.T) {
 func TestResolveLockTaskDroppedWhenChannelFull(t *testing.T) {
 	client := newSubscriptionClientForTest()
 	taskCh := make(chan resolveLockTask, 1)
-	client.subscriptions.maintenance.resolveLockTaskCh = taskCh
+	client.subscriptions.supervisor.resolveLockTaskCh = taskCh
 	defer client.cancel()
 
 	rawSpan := heartbeatpb.TableSpan{
