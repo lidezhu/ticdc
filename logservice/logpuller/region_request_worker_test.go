@@ -22,6 +22,7 @@ import (
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/ticdc/logservice/logpuller/regionlock"
 	"github.com/pingcap/ticdc/utils/dynstream"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 	"github.com/tikv/client-go/v2/tikv"
 	"google.golang.org/grpc"
@@ -147,10 +148,13 @@ func (m *mockRegionEventDynamicStream) GetMetrics() dynstream.Metrics[int, Subsc
 
 func newDispatchResolvedTsTestWorker(regionCount int) (*regionRequestWorker, *mockRegionEventDynamicStream, *cdcpb.ResolvedTs) {
 	ds := &mockRegionEventDynamicStream{}
-	client := newSubscriptionClientForTest()
-	client.events = newEventStreamController(client.ctx, ds)
 	worker := &regionRequestWorker{
-		client: client,
+		client: &subscriptionClient{
+			metrics: sharedClientMetrics{
+				batchResolvedSize: prometheus.ObserverFunc(func(float64) {}),
+			},
+			ds: ds,
+		},
 	}
 	worker.requestedRegions.subscriptions = map[SubscriptionID]regionFeedStates{
 		1: make(regionFeedStates, regionCount),
@@ -180,7 +184,7 @@ func dispatchResolvedTsEventLegacyForBenchmark(s *regionRequestWorker, resolvedT
 			return
 		}
 		states := resolvedStates
-		s.client.events.pushRegionEvent(subscriptionID, regionEvent{
+		s.client.pushRegionEventToDS(subscriptionID, regionEvent{
 			resolvedTs: resolvedTsEvent.Ts,
 			states:     states,
 		})

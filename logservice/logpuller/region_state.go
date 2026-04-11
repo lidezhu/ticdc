@@ -91,8 +91,8 @@ type regionFeedState struct {
 	state struct {
 		sync.RWMutex
 		v uint32
-		// Failures are normalized before entering region state so the ordered
-		// stale-event path and the direct failure path use the same recovery model.
+		// The failure is normalized before entering region state, so all stale-event
+		// paths and direct failure paths converge on the same recovery model.
 		failure    regionFailureInfo
 		hasFailure bool
 	}
@@ -126,7 +126,7 @@ func (s *regionFeedState) markStopped(failure regionFailureInfo) {
 }
 
 // takeStoppedFailure moves a stopped region into removed state and returns the
-// failure that should be handed to the global failure handler.
+// failure that should be handed to the unified recovery path.
 func (s *regionFeedState) takeStoppedFailure() (regionFailureInfo, bool) {
 	s.state.Lock()
 	defer s.state.Unlock()
@@ -192,27 +192,27 @@ func (s *regionFeedState) isStale() bool {
 	return s.state.v == stateStopped || s.state.v == stateRemoved
 }
 
-func (s *regionFeedState) runtime() *regionRuntimeTracker {
-	if s == nil || s.worker == nil || s.worker.client == nil {
+func (s *regionFeedState) runtimeRegistry() *regionRuntimeRegistry {
+	if !s.region.runtimeKey.isValid() || s.worker == nil || s.worker.client == nil {
 		return nil
 	}
-	return s.worker.client.runtime
+	return s.worker.client.regionRuntimeRegistry
 }
 
 func (s *regionFeedState) updateRuntimeLastEvent(now time.Time) {
-	if runtime := s.runtime(); runtime != nil {
-		runtime.updateLastEvent(s.region, now)
+	if registry := s.runtimeRegistry(); registry != nil {
+		registry.updateLastEvent(s.region.runtimeKey, now)
 	}
 }
 
 func (s *regionFeedState) markRuntimeReplicating(now time.Time) {
-	if runtime := s.runtime(); runtime != nil {
-		runtime.markReplicating(s.region, now)
+	if registry := s.runtimeRegistry(); registry != nil {
+		registry.markReplicating(s.region.runtimeKey, now)
 	}
 }
 
 func (s *regionFeedState) updateRuntimeResolvedTs(resolvedTs uint64, now time.Time) {
-	if runtime := s.runtime(); runtime != nil {
-		runtime.updateResolvedTs(s.region, resolvedTs, now)
+	if registry := s.runtimeRegistry(); registry != nil {
+		registry.updateResolvedTs(s.region.runtimeKey, resolvedTs, now)
 	}
 }

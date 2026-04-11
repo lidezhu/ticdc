@@ -150,7 +150,7 @@ func (h *regionEventHandler) Handle(span *subscribedSpan, events ...regionEvent)
 			metrics.SubscriptionClientConsumeKVEventsCallbackDuration.WithLabelValues("advanceResolvedTs").Observe(time.Since(start).Seconds())
 
 			start = time.Now()
-			h.subClient.events.wakeSubscription(span.subID)
+			h.subClient.wakeSubscription(span.subID)
 			metrics.SubscriptionClientConsumeKVEventsCallbackDuration.WithLabelValues("wakeSubscription").Observe(time.Since(start).Seconds())
 		})
 		// if not await, the wake callback will not be called, we need clear the cache manually.
@@ -248,7 +248,7 @@ func (h *regionEventHandler) handleRegionError(state *regionFeedState) {
 	}
 	if removed {
 		worker.takeRegionState(SubscriptionID(state.requestID), state.getRegionID())
-		h.subClient.pipeline.errorHandler.reportFailure(failure)
+		h.subClient.onRegionFail(failure)
 	}
 }
 

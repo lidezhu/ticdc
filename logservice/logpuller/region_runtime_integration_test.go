@@ -23,12 +23,17 @@ import (
 	"github.com/pingcap/ticdc/heartbeatpb"
 	"github.com/pingcap/ticdc/logservice/logpuller/regionlock"
 	"github.com/pingcap/ticdc/pkg/common"
+	"github.com/pingcap/ticdc/pkg/pdutil"
 	"github.com/stretchr/testify/require"
 	"github.com/tikv/client-go/v2/tikv"
 )
 
 func TestScheduleRegionRequestUpdatesRuntimeRegistry(t *testing.T) {
-	client := newSubscriptionClientForTest()
+	client := &subscriptionClient{
+		regionTaskQueue:       NewPriorityQueue(),
+		regionRuntimeRegistry: newRegionRuntimeRegistry(),
+		pdClock:               pdutil.NewClock4Test(),
+	}
 
 	rawSpan := heartbeatpb.TableSpan{
 		TableID:  1,
@@ -37,7 +42,7 @@ func TestScheduleRegionRequestUpdatesRuntimeRegistry(t *testing.T) {
 	}
 	consumeKVEvents := func(_ []common.RawKVEntry, _ func()) bool { return false }
 	advanceResolvedTs := func(uint64) {}
-	subSpan := client.subscriptions.manager.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
+	subSpan := client.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
 
 	regionSpan := heartbeatpb.TableSpan{
 		TableID:  1,
@@ -46,16 +51,16 @@ func TestScheduleRegionRequestUpdatesRuntimeRegistry(t *testing.T) {
 	}
 	region := newRegionInfo(tikv.NewRegionVerID(10, 1, 1), regionSpan, nil, subSpan, false)
 
-	client.pipeline.scheduler.scheduleRegionRequest(context.Background(), region, TaskLowPrior)
+	client.scheduleRegionRequest(context.Background(), region, TaskLowPrior)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	task, err := client.pipeline.requestRouter.regionTaskQueue.Pop(ctx)
+	task, err := client.regionTaskQueue.Pop(ctx)
 	require.NoError(t, err)
 	queued := task.GetRegionInfo()
 	require.True(t, queued.runtimeKey.isValid())
 
-	state, ok := client.runtime.registry.get(queued.runtimeKey)
+	state, ok := client.regionRuntimeRegistry.get(queued.runtimeKey)
 	require.True(t, ok)
 	require.Equal(t, regionPhaseQueued, state.phase)
 	require.Equal(t, uint64(10), state.verID.GetID())
@@ -63,7 +68,11 @@ func TestScheduleRegionRequestUpdatesRuntimeRegistry(t *testing.T) {
 }
 
 func TestOnRegionFailUpdatesRuntimeRegistry(t *testing.T) {
-	client := newSubscriptionClientForTest()
+	client := &subscriptionClient{
+		regionRuntimeRegistry: newRegionRuntimeRegistry(),
+		failureBuffer:         newFailureBuffer(),
+	}
+	client.ctx, client.cancel = context.WithCancel(context.Background())
 	defer client.cancel()
 
 	rawSpan := heartbeatpb.TableSpan{
@@ -73,7 +82,7 @@ func TestOnRegionFailUpdatesRuntimeRegistry(t *testing.T) {
 	}
 	consumeKVEvents := func(_ []common.RawKVEntry, _ func()) bool { return false }
 	advanceResolvedTs := func(uint64) {}
-	subSpan := client.subscriptions.manager.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
+	subSpan := client.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
 
 	lockRes := subSpan.rangeLock.LockRange(context.Background(), []byte{'b'}, []byte{'c'}, 10, 1)
 	require.Equal(t, regionlock.LockRangeStatusSuccess, lockRes.Status)
@@ -85,12 +94,12 @@ func TestOnRegionFailUpdatesRuntimeRegistry(t *testing.T) {
 	}, nil, subSpan, false)
 	region.lockedRangeState = lockRes.LockedRangeState
 
-	client.runtime.ensureRegion(&region, time.Now())
+	client.ensureRegionRuntime(&region, time.Now())
 	require.True(t, region.runtimeKey.isValid())
 
-	client.pipeline.errorHandler.reportFailure(newSendRequestToStoreFailure(region, regionFailureSourceWorkerSession, nil))
+	client.onRegionFail(newSendRequestToStoreFailure(region, regionFailureSourceWorkerSession, nil))
 
-	state, ok := client.runtime.registry.get(region.runtimeKey)
+	state, ok := client.regionRuntimeRegistry.get(region.runtimeKey)
 	require.True(t, ok)
 	require.Equal(t, regionPhaseDiscovered, state.phase)
 	require.Equal(t, "send request to store error", state.lastError)
@@ -98,7 +107,9 @@ func TestOnRegionFailUpdatesRuntimeRegistry(t *testing.T) {
 }
 
 func TestHandleResolvedTsUpdatesRuntimeRegistry(t *testing.T) {
-	client := newSubscriptionClientForTest()
+	client := &subscriptionClient{
+		regionRuntimeRegistry: newRegionRuntimeRegistry(),
+	}
 	worker := &regionRequestWorker{client: client}
 
 	rawSpan := heartbeatpb.TableSpan{
@@ -106,15 +117,16 @@ func TestHandleResolvedTsUpdatesRuntimeRegistry(t *testing.T) {
 		StartKey: []byte{'a'},
 		EndKey:   []byte{'z'},
 	}
-	subSpan := client.subscriptions.manager.newSubscribedSpan(
-		SubscriptionID(1),
-		rawSpan,
-		100,
-		func(_ []common.RawKVEntry, _ func()) bool { return false },
-		func(uint64) {},
-		0,
-		false,
-	)
+	subSpan := &subscribedSpan{
+		subID:      SubscriptionID(1),
+		startTs:    100,
+		span:       rawSpan,
+		rangeLock:  regionlock.NewRangeLock(1, rawSpan.StartKey, rawSpan.EndKey, 100),
+		filterLoop: false,
+	}
+	subSpan.resolvedTs.Store(100)
+	subSpan.resolvedTsUpdated.Store(time.Now().Unix())
+	subSpan.advanceInterval = 0
 
 	lockRes := subSpan.rangeLock.LockRange(context.Background(), rawSpan.StartKey, rawSpan.EndKey, 10, 1)
 	require.Equal(t, regionlock.LockRangeStatusSuccess, lockRes.Status)
@@ -122,7 +134,8 @@ func TestHandleResolvedTsUpdatesRuntimeRegistry(t *testing.T) {
 
 	region := newRegionInfo(tikv.NewRegionVerID(10, 1, 1), rawSpan, nil, subSpan, false)
 	region.lockedRangeState = lockRes.LockedRangeState
-	client.runtime.ensureRegion(&region, time.Now())
+	region.runtimeKey = client.regionRuntimeRegistry.allocKey(subSpan.subID, region.verID.GetID())
+	client.regionRuntimeRegistry.updateRegionInfo(region.runtimeKey, region)
 
 	state := newRegionFeedState(region, uint64(subSpan.subID), worker)
 	state.start()
@@ -130,14 +143,18 @@ func TestHandleResolvedTsUpdatesRuntimeRegistry(t *testing.T) {
 	resolvedTs := uint64(200)
 	handleResolvedTs(subSpan, state, resolvedTs)
 
-	stored, ok := client.runtime.registry.get(region.runtimeKey)
+	stored, ok := client.regionRuntimeRegistry.get(region.runtimeKey)
 	require.True(t, ok)
 	require.Equal(t, resolvedTs, stored.lastResolvedTs)
 	require.False(t, stored.lastEventTime.IsZero())
 }
 
-func TestDoHandleErrorMarksRetryPendingForRetryableRegionError(t *testing.T) {
-	client := newSubscriptionClientForTest()
+func TestDoHandleFailureMarksRetryPendingForRetryableRegionError(t *testing.T) {
+	client := &subscriptionClient{
+		regionRuntimeRegistry: newRegionRuntimeRegistry(),
+		regionTaskQueue:       NewPriorityQueue(),
+		pdClock:               pdutil.NewClock4Test(),
+	}
 
 	rawSpan := heartbeatpb.TableSpan{
 		TableID:  1,
@@ -146,26 +163,29 @@ func TestDoHandleErrorMarksRetryPendingForRetryableRegionError(t *testing.T) {
 	}
 	consumeKVEvents := func(_ []common.RawKVEntry, _ func()) bool { return false }
 	advanceResolvedTs := func(uint64) {}
-	subSpan := client.subscriptions.manager.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
+	subSpan := client.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
 
 	region := newRegionInfo(tikv.NewRegionVerID(10, 1, 1), rawSpan, nil, subSpan, false)
-	client.runtime.ensureRegion(&region, time.Now())
+	client.ensureRegionRuntime(&region, time.Now())
 
-	err := client.pipeline.errorHandler.handleFailure(
+	err := client.doHandleFailure(
 		context.Background(),
 		newEventRegionFailure(region, &cdcpb.Error{ServerIsBusy: &errorpb.ServerIsBusy{Reason: "busy"}}),
 	)
 	require.NoError(t, err)
 
-	state, ok := client.runtime.registry.get(region.runtimeKey)
+	state, ok := client.regionRuntimeRegistry.get(region.runtimeKey)
 	require.True(t, ok)
 	require.Equal(t, regionPhaseQueued, state.phase)
 	require.Equal(t, 1, state.retryCount)
 	require.Contains(t, state.lastError, "server_is_busy")
 }
 
-func TestDoHandleErrorRemovesRuntimeForRangeReload(t *testing.T) {
-	client := newSubscriptionClientForTest()
+func TestDoHandleFailureRemovesRuntimeForRangeReload(t *testing.T) {
+	client := &subscriptionClient{
+		regionRuntimeRegistry: newRegionRuntimeRegistry(),
+		rangeTaskCh:           make(chan rangeTask, 1),
+	}
 
 	rawSpan := heartbeatpb.TableSpan{
 		TableID:  1,
@@ -174,19 +194,19 @@ func TestDoHandleErrorRemovesRuntimeForRangeReload(t *testing.T) {
 	}
 	consumeKVEvents := func(_ []common.RawKVEntry, _ func()) bool { return false }
 	advanceResolvedTs := func(uint64) {}
-	subSpan := client.subscriptions.manager.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
+	subSpan := client.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
 
 	region := newRegionInfo(tikv.NewRegionVerID(10, 1, 1), rawSpan, nil, subSpan, false)
-	client.runtime.ensureRegion(&region, time.Now())
+	client.ensureRegionRuntime(&region, time.Now())
 
-	err := client.pipeline.errorHandler.handleFailure(context.Background(), newRPCCtxUnavailableFailure(region))
+	err := client.doHandleFailure(context.Background(), newRPCCtxUnavailableFailure(region))
 	require.NoError(t, err)
 
-	_, ok := client.runtime.registry.get(region.runtimeKey)
+	_, ok := client.regionRuntimeRegistry.get(region.runtimeKey)
 	require.False(t, ok)
 
 	select {
-	case task := <-client.pipeline.scheduler.rangeTaskCh:
+	case task := <-client.rangeTaskCh:
 		require.Equal(t, rawSpan, task.span)
 		require.Equal(t, subSpan, task.subscribedSpan)
 	case <-time.After(time.Second):
@@ -194,8 +214,10 @@ func TestDoHandleErrorRemovesRuntimeForRangeReload(t *testing.T) {
 	}
 }
 
-func TestDoHandleErrorRemovesRuntimeForCancelledRequest(t *testing.T) {
-	client := newSubscriptionClientForTest()
+func TestDoHandleFailureRemovesRuntimeForCancelledRequest(t *testing.T) {
+	client := &subscriptionClient{
+		regionRuntimeRegistry: newRegionRuntimeRegistry(),
+	}
 
 	rawSpan := heartbeatpb.TableSpan{
 		TableID:  1,
@@ -204,23 +226,25 @@ func TestDoHandleErrorRemovesRuntimeForCancelledRequest(t *testing.T) {
 	}
 	consumeKVEvents := func(_ []common.RawKVEntry, _ func()) bool { return false }
 	advanceResolvedTs := func(uint64) {}
-	subSpan := client.subscriptions.manager.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
+	subSpan := client.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
 
 	region := newRegionInfo(tikv.NewRegionVerID(10, 1, 1), rawSpan, nil, subSpan, false)
-	client.runtime.ensureRegion(&region, time.Now())
+	client.ensureRegionRuntime(&region, time.Now())
 
-	err := client.pipeline.errorHandler.handleFailure(
+	err := client.doHandleFailure(
 		context.Background(),
 		newRequestCancelledFailure(region, regionFailureSourceDeregister),
 	)
 	require.NoError(t, err)
 
-	_, ok := client.runtime.registry.get(region.runtimeKey)
+	_, ok := client.regionRuntimeRegistry.get(region.runtimeKey)
 	require.False(t, ok)
 }
 
-func TestHandleFailureRemovesRuntimeForStoppedSubscription(t *testing.T) {
-	client := newSubscriptionClientForTest()
+func TestDoHandleFailureRemovesRuntimeForStoppedSubscription(t *testing.T) {
+	client := &subscriptionClient{
+		regionRuntimeRegistry: newRegionRuntimeRegistry(),
+	}
 
 	rawSpan := heartbeatpb.TableSpan{
 		TableID:  1,
@@ -229,14 +253,14 @@ func TestHandleFailureRemovesRuntimeForStoppedSubscription(t *testing.T) {
 	}
 	consumeKVEvents := func(_ []common.RawKVEntry, _ func()) bool { return false }
 	advanceResolvedTs := func(uint64) {}
-	subSpan := client.subscriptions.manager.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
+	subSpan := client.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
 
 	region := newRegionInfo(tikv.NewRegionVerID(10, 1, 1), rawSpan, nil, subSpan, false)
-	client.runtime.ensureRegion(&region, time.Now())
+	client.ensureRegionRuntime(&region, time.Now())
 
-	err := client.pipeline.errorHandler.handleFailure(context.Background(), newSubscriptionStoppedFailure(region))
+	err := client.doHandleFailure(context.Background(), newSubscriptionStoppedFailure(region))
 	require.NoError(t, err)
 
-	_, ok := client.runtime.registry.get(region.runtimeKey)
+	_, ok := client.regionRuntimeRegistry.get(region.runtimeKey)
 	require.False(t, ok)
 }

@@ -14,15 +14,20 @@
 package logpuller
 
 import (
+	"context"
+	"sync"
+	"time"
+
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/cdcpb"
+	"github.com/pingcap/log"
 )
 
 type regionFailureScope string
 
 const (
 	regionFailureScopeRegion       regionFailureScope = "region"
-	regionFailureScopeStore        regionFailureScope = "store_session"
+	regionFailureScopeStoreSession regionFailureScope = "store_session"
 	regionFailureScopeSubscription regionFailureScope = "subscription"
 )
 
@@ -108,7 +113,7 @@ func newRPCCtxUnavailableFailure(region regionInfo) regionFailureInfo {
 func newGetStoreFailure(region regionInfo, source regionFailureSource, cause error) regionFailureInfo {
 	return newRegionFailureInfo(
 		region,
-		regionFailureScopeStore,
+		regionFailureScopeStoreSession,
 		source,
 		regionFailureKindGetStore,
 		normalizeRegionFailure(&getStoreErr{}, cause),
@@ -118,7 +123,7 @@ func newGetStoreFailure(region regionInfo, source regionFailureSource, cause err
 func newSendRequestToStoreFailure(region regionInfo, source regionFailureSource, cause error) regionFailureInfo {
 	return newRegionFailureInfo(
 		region,
-		regionFailureScopeStore,
+		regionFailureScopeStoreSession,
 		source,
 		regionFailureKindSendRequestToStore,
 		normalizeRegionFailure(&sendRequestToStoreErr{}, cause),
@@ -150,4 +155,79 @@ func normalizeRegionFailure(base error, cause error) error {
 		return base
 	}
 	return errors.Annotate(base, cause.Error())
+}
+
+type recoveryAction string
+
+const (
+	recoveryActionRetryRegion  recoveryAction = "retry_region"
+	recoveryActionReloadRange  recoveryAction = "reload_range"
+	recoveryActionRemoveRegion recoveryAction = "remove_region"
+)
+
+func (a recoveryAction) String() string {
+	return string(a)
+}
+
+type recoveryPlan struct {
+	action   recoveryAction
+	priority TaskType
+}
+
+type failureBuffer struct {
+	sync.Mutex
+	pending []regionFailureInfo
+	ch      chan regionFailureInfo
+	notify  chan struct{}
+}
+
+func newFailureBuffer() *failureBuffer {
+	return &failureBuffer{
+		pending: make([]regionFailureInfo, 0, 1024),
+		ch:      make(chan regionFailureInfo, 1024),
+		notify:  make(chan struct{}, 1024),
+	}
+}
+
+func (b *failureBuffer) enqueue(failure regionFailureInfo) {
+	b.Lock()
+	defer b.Unlock()
+	b.pending = append(b.pending, failure)
+	select {
+	case b.notify <- struct{}{}:
+	default:
+	}
+}
+
+func (b *failureBuffer) run(ctx context.Context) error {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	dispatchOne := func() {
+		b.Lock()
+		if len(b.pending) == 0 {
+			b.Unlock()
+			return
+		}
+		failure := b.pending[0]
+		b.pending = b.pending[1:]
+		b.Unlock()
+
+		select {
+		case <-ctx.Done():
+			log.Info("subscription client dispatch failure buffer done")
+		case b.ch <- failure:
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			dispatchOne()
+		case <-b.notify:
+			dispatchOne()
+		}
+	}
 }
