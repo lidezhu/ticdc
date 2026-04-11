@@ -153,7 +153,6 @@ func TestResolveLockTaskDroppedWhenChannelFull(t *testing.T) {
 func TestStopTaskUsesSubscribedSpanFilterLoop(t *testing.T) {
 	client := &subscriptionClient{
 		resolveLockTaskCh: make(chan resolveLockTask, 1),
-		regionTaskQueue:   NewPriorityQueue(),
 	}
 	client.ctx, client.cancel = context.WithCancel(context.Background())
 	defer client.cancel()
@@ -175,7 +174,7 @@ func TestStopTaskUsesSubscribedSpanFilterLoop(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	task, err := client.regionTaskQueue.Pop(ctx)
+	task, err := client.requestRouter.regionTaskQueue.Pop(ctx)
 	require.NoError(t, err)
 	region := task.GetRegionInfo()
 	require.True(t, region.isStopped())
@@ -214,8 +213,7 @@ func (s *mockDynamicStream) GetMetrics() dynstream.Metrics[int, SubscriptionID] 
 
 func TestPushRegionEventToDSUnblocksOnClose(t *testing.T) {
 	client := &subscriptionClient{
-		ds:              &mockDynamicStream{},
-		regionTaskQueue: NewPriorityQueue(),
+		ds: &mockDynamicStream{},
 	}
 	client.ctx, client.cancel = context.WithCancel(context.Background())
 	client.cond = sync.NewCond(&client.mu)
@@ -246,13 +244,14 @@ func TestPushRegionEventToDSUnblocksOnClose(t *testing.T) {
 func TestEnqueueRegionToAllStoresRetryWhenCacheFull(t *testing.T) {
 	ctx := context.Background()
 	client := &subscriptionClient{}
+	client.requestRouter = newRegionRequestRouter(client)
 
 	worker := &regionRequestWorker{
 		requestCache: newRequestCache(1),
 	}
-	store := &requestedStore{storeAddr: "store-1"}
+	store := newRequestedStore("store-1")
 	store.requestWorkers.s = []*regionRequestWorker{worker}
-	client.stores.Store(store.storeAddr, store)
+	client.requestRouter.stores.Store(store.storeAddr, store)
 
 	dummyRegion := regionInfo{
 		subscribedSpan:   &subscribedSpan{subID: SubscriptionID(2)},
@@ -265,14 +264,14 @@ func TestEnqueueRegionToAllStoresRetryWhenCacheFull(t *testing.T) {
 	stopRegion := regionInfo{
 		subscribedSpan: &subscribedSpan{subID: SubscriptionID(1)},
 	}
-	enqueued, err := client.enqueueRegionToAllStores(ctx, stopRegion)
+	enqueued, err := client.requestRouter.enqueueRegionToAllStores(ctx, stopRegion)
 	require.NoError(t, err)
 	require.False(t, enqueued)
 
 	<-worker.requestCache.pendingQueue
 	worker.requestCache.markDone()
 
-	enqueued, err = client.enqueueRegionToAllStores(ctx, stopRegion)
+	enqueued, err = client.requestRouter.enqueueRegionToAllStores(ctx, stopRegion)
 	require.NoError(t, err)
 	require.True(t, enqueued)
 	require.Equal(t, 1, len(worker.requestCache.pendingQueue))

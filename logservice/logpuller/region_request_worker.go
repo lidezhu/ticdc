@@ -61,6 +61,76 @@ type regionRequestWorker struct {
 	}
 }
 
+type regionWorkerSession struct {
+	worker *regionRequestWorker
+	conn   *ConnAndClient
+
+	failureOnce sync.Once
+	failure     workerSessionFailure
+}
+
+func newRegionWorkerSession(worker *regionRequestWorker, conn *ConnAndClient) *regionWorkerSession {
+	return &regionWorkerSession{
+		worker: worker,
+		conn:   conn,
+	}
+}
+
+func (s *regionWorkerSession) recordFailure(source regionFailureSource, err error) {
+	if err == nil {
+		return
+	}
+	s.failureOnce.Do(func() {
+		s.failure = workerSessionFailure{
+			kind:   regionFailureKindSendRequestToStore,
+			source: source,
+			cause:  err,
+		}
+	})
+}
+
+func (s *regionWorkerSession) runReceiveLoop() error {
+	err := s.worker.receiveAndDispatchChangeEvents(s.conn)
+	s.recordFailure(regionFailureSourceWorkerRecv, err)
+	return err
+}
+
+func (s *regionWorkerSession) runSendLoop(ctx context.Context) error {
+	err := s.worker.processRegionSendTask(ctx, s.conn)
+	s.recordFailure(regionFailureSourceWorkerSend, err)
+	return err
+}
+
+func (s *regionWorkerSession) failureOrDefault() workerSessionFailure {
+	if s.failure.kind != "" {
+		return s.failure
+	}
+	return workerSessionFailure{
+		kind:   regionFailureKindSendRequestToStore,
+		source: regionFailureSourceWorkerSession,
+	}
+}
+
+func (s *regionWorkerSession) run(ctx context.Context) workerSessionFailure {
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error { return s.runReceiveLoop() })
+	g.Go(func() error { return s.runSendLoop(gctx) })
+
+	failpoint.Inject("InjectForceReconnect", func() {
+		timer := time.After(10 * time.Second)
+		g.Go(func() error {
+			<-timer
+			err := errors.New("inject force reconnect")
+			log.Info("inject force reconnect", zap.Error(err))
+			s.recordFailure(regionFailureSourceWorkerSession, err)
+			return err
+		})
+	})
+
+	_ = g.Wait()
+	return s.failureOrDefault()
+}
+
 func (s *regionRequestWorker) runtimeRegistry() *regionRuntimeRegistry {
 	if s.client == nil {
 		return nil
@@ -80,6 +150,95 @@ func (s *regionRequestWorker) markRegionRuntimeSent(region regionInfo, now time.
 	}
 }
 
+func (s *regionRequestWorker) waitPreFetchedRegion(ctx context.Context) error {
+	if s.preFetchForConnecting != nil {
+		log.Panic("preFetchForConnecting should be nil",
+			zap.Uint64("workerID", s.workerID),
+			zap.String("addr", s.store.storeAddr))
+	}
+	for {
+		req, err := s.requestCache.pop(ctx)
+		if err != nil {
+			return err
+		}
+		if req.regionInfo.isStopped() {
+			s.requestCache.markDone()
+			continue
+		}
+		s.preFetchForConnecting = new(regionInfo)
+		*s.preFetchForConnecting = req.regionInfo
+		return nil
+	}
+}
+
+func (s *regionRequestWorker) checkStoreVersion(ctx context.Context) (workerSessionFailure, bool) {
+	if err := version.CheckStoreVersion(ctx, s.client.pd); err != nil {
+		if errors.Cause(err) == context.Canceled {
+			return workerSessionFailure{}, true
+		}
+		log.Error("event feed check store version fails",
+			zap.Uint64("workerID", s.workerID),
+			zap.String("addr", s.store.storeAddr),
+			zap.Error(err))
+		if cerror.Is(err, cerror.ErrGetAllStoresFailed) {
+			return workerSessionFailure{
+				kind:   regionFailureKindGetStore,
+				source: regionFailureSourceWorkerSession,
+				cause:  err,
+			}, false
+		}
+		return workerSessionFailure{
+			kind:   regionFailureKindSendRequestToStore,
+			source: regionFailureSourceWorkerSession,
+			cause:  err,
+		}, false
+	}
+	return workerSessionFailure{}, false
+}
+
+func (s *regionRequestWorker) handleSessionFailure(sessionFailure workerSessionFailure) {
+	// A store/session failure fans out into ordered failures for started
+	// regions and direct failures for pending regions.
+	s.client.failures.submitWorkerSessionFailure(s, sessionFailure)
+}
+
+func (s *regionRequestWorker) runNextSession(
+	ctx context.Context,
+	credential *security.Credential,
+) (workerSessionFailure, bool, error) {
+	if err := s.waitPreFetchedRegion(ctx); err != nil {
+		return workerSessionFailure{}, false, err
+	}
+
+	sessionFailure, canceled := s.checkStoreVersion(ctx)
+	if canceled || sessionFailure.kind != "" {
+		return sessionFailure, canceled, nil
+	}
+
+	sessionFailure, canceled = s.runSession(ctx, credential)
+	return sessionFailure, canceled, nil
+}
+
+func (s *regionRequestWorker) runSessionLoop(
+	ctx context.Context,
+	credential *security.Credential,
+) error {
+	for {
+		sessionFailure, canceled, err := s.runNextSession(ctx, credential)
+		if err != nil {
+			return err
+		}
+		if canceled {
+			return nil
+		}
+		s.handleSessionFailure(sessionFailure)
+
+		if err := util.Hang(ctx, time.Second); err != nil {
+			return err
+		}
+	}
+}
+
 func newRegionRequestWorker(
 	ctx context.Context,
 	client *subscriptionClient,
@@ -96,74 +255,14 @@ func newRegionRequestWorker(
 	}
 	worker.requestedRegions.subscriptions = make(map[SubscriptionID]regionFeedStates)
 
-	waitForPreFetching := func() error {
-		if worker.preFetchForConnecting != nil {
-			log.Panic("preFetchForConnecting should be nil",
-				zap.Uint64("workerID", worker.workerID),
-				zap.String("addr", store.storeAddr))
-		}
-		for {
-			req, err := worker.requestCache.pop(ctx)
-			if err != nil {
-				return err
-			}
-			if req.regionInfo.isStopped() {
-				worker.requestCache.markDone()
-				continue
-			}
-			worker.preFetchForConnecting = new(regionInfo)
-			*worker.preFetchForConnecting = req.regionInfo
-			return nil
-		}
-	}
-
 	g.Go(func() error {
-		for {
-			if err := waitForPreFetching(); err != nil {
-				return err
-			}
-			var sessionFailure workerSessionFailure
-			if err := version.CheckStoreVersion(ctx, worker.client.pd); err != nil {
-				if errors.Cause(err) == context.Canceled {
-					return nil
-				}
-				log.Error("event feed check store version fails",
-					zap.Uint64("workerID", worker.workerID),
-					zap.String("addr", worker.store.storeAddr),
-					zap.Error(err))
-				if cerror.Is(err, cerror.ErrGetAllStoresFailed) {
-					sessionFailure = workerSessionFailure{
-						kind:   regionFailureKindGetStore,
-						source: regionFailureSourceWorkerSession,
-						cause:  err,
-					}
-				} else {
-					sessionFailure = workerSessionFailure{
-						kind:   regionFailureKindSendRequestToStore,
-						source: regionFailureSourceWorkerSession,
-						cause:  err,
-					}
-				}
-			} else {
-				var canceled bool
-				sessionFailure, canceled = worker.run(ctx, credential)
-				if canceled {
-					return nil
-				}
-			}
-			// A store/session failure fans out into ordered failures for started
-			// regions and direct failures for pending regions.
-			worker.client.failures.submitWorkerSessionFailure(worker, sessionFailure)
-			if err := util.Hang(ctx, time.Second); err != nil {
-				return err
-			}
-		}
+		return worker.runSessionLoop(ctx, credential)
 	})
 
 	return worker
 }
 
-func (s *regionRequestWorker) run(
+func (s *regionRequestWorker) runSession(
 	ctx context.Context,
 	credential *security.Credential,
 ) (sessionFailure workerSessionFailure, canceled bool) {
@@ -187,8 +286,7 @@ func (s *regionRequestWorker) run(
 			zap.Bool("canceled", canceled))
 	}()
 
-	g, gctx := errgroup.WithContext(ctx)
-	conn, err := Connect(gctx, credential, s.store.storeAddr)
+	conn, err := Connect(ctx, credential, s.store.storeAddr)
 	if err != nil {
 		log.Warn("region request worker create grpc stream failed",
 			zap.Uint64("workerID", s.workerID),
@@ -207,50 +305,7 @@ func (s *regionRequestWorker) run(
 	defer func() {
 		_ = conn.Conn.Close()
 	}()
-
-	var failureOnce sync.Once
-	recordFailure := func(source regionFailureSource, err error) {
-		if err == nil {
-			return
-		}
-		failureOnce.Do(func() {
-			sessionFailure = workerSessionFailure{
-				kind:   regionFailureKindSendRequestToStore,
-				source: source,
-				cause:  err,
-			}
-		})
-	}
-
-	g.Go(func() error {
-		err := s.receiveAndDispatchChangeEvents(conn)
-		recordFailure(regionFailureSourceWorkerRecv, err)
-		return err
-	})
-	g.Go(func() error {
-		err := s.processRegionSendTask(gctx, conn)
-		recordFailure(regionFailureSourceWorkerSend, err)
-		return err
-	})
-
-	failpoint.Inject("InjectForceReconnect", func() {
-		timer := time.After(10 * time.Second)
-		g.Go(func() error {
-			<-timer
-			err := errors.New("inject force reconnect")
-			log.Info("inject force reconnect", zap.Error(err))
-			recordFailure(regionFailureSourceWorkerSession, err)
-			return err
-		})
-	})
-
-	_ = g.Wait()
-	if sessionFailure.kind == "" {
-		sessionFailure = workerSessionFailure{
-			kind:   regionFailureKindSendRequestToStore,
-			source: regionFailureSourceWorkerSession,
-		}
-	}
+	sessionFailure = newRegionWorkerSession(s, conn).run(ctx)
 	return sessionFailure, isCanceled()
 }
 
@@ -275,6 +330,22 @@ func (s *regionRequestWorker) receiveAndDispatchChangeEvents(conn *ConnAndClient
 		if changeEvent.ResolvedTs != nil {
 			s.dispatchResolvedTsEvent(changeEvent.ResolvedTs)
 		}
+	}
+}
+
+func (s *regionRequestWorker) submitOrderedStateFailure(state *regionFeedState, failure regionFailureInfo) {
+	state.markStopped(failure)
+	s.client.pushRegionEventToDS(SubscriptionID(state.requestID), regionEvent{
+		states: []*regionFeedState{state},
+	})
+}
+
+func (s *regionRequestWorker) cancelSubscriptionStates(subID SubscriptionID) {
+	for _, state := range s.takeRegionStates(subID) {
+		s.submitOrderedStateFailure(
+			state,
+			newRequestCancelledFailure(state.getRegionInfo(), regionFailureSourceDeregister),
+		)
 	}
 }
 
@@ -306,7 +377,8 @@ func (s *regionRequestWorker) dispatchRegionChangeEvents(events []*cdcpb.Event) 
 					zap.Uint64("subscriptionID", uint64(subscriptionID)),
 					zap.Uint64("regionID", event.RegionId),
 					zap.Any("error", eventData.Error))
-				state.markStopped(newEventRegionFailure(state.getRegionInfo(), eventData.Error))
+				s.submitOrderedStateFailure(state, newEventRegionFailure(state.getRegionInfo(), eventData.Error))
+				continue
 			case *cdcpb.Event_ResolvedTs:
 				regionEvent.resolvedTs = eventData.ResolvedTs
 			case *cdcpb.Event_LongTxn_:
@@ -388,35 +460,107 @@ func (s *regionRequestWorker) dispatchResolvedTsEvent(resolvedTsEvent *cdcpb.Res
 	flush()
 }
 
+func (s *regionRequestWorker) sendRequest(conn *ConnAndClient, req *cdcpb.ChangeDataRequest) error {
+	if err := conn.Client.Send(req); err != nil {
+		log.Warn("region request worker send request to grpc stream failed",
+			zap.Uint64("workerID", s.workerID),
+			zap.Uint64("subscriptionID", req.RequestId),
+			zap.Uint64("regionID", req.RegionId),
+			zap.String("addr", s.store.storeAddr),
+			zap.Error(err))
+		return errors.Trace(err)
+	}
+	// TODO: add a metric?
+	return nil
+}
+
+func (s *regionRequestWorker) nextRegionRequest(ctx context.Context) (regionReq, error) {
+	req, err := s.requestCache.pop(ctx)
+	if err != nil {
+		return regionReq{}, err
+	}
+	return req, nil
+}
+
+func (s *regionRequestWorker) handleStopTask(conn *ConnAndClient, region regionInfo) error {
+	subID := region.subscribedSpan.subID
+	req := &cdcpb.ChangeDataRequest{
+		Header:    &cdcpb.Header{ClusterId: s.client.clusterID, TicdcVersion: version.ReleaseSemver()},
+		RequestId: uint64(subID),
+		Request: &cdcpb.ChangeDataRequest_Deregister_{
+			Deregister: &cdcpb.ChangeDataRequest_Deregister{},
+		},
+		FilterLoop: region.filterLoop,
+	}
+	s.requestCache.markDone()
+	if err := s.sendRequest(conn, req); err != nil {
+		return err
+	}
+	s.cancelSubscriptionStates(subID)
+	return nil
+}
+
+func (s *regionRequestWorker) handleStoppedSubscription(region regionInfo) {
+	// It can be skipped directly because there must be no pending states from
+	// the stopped subscribedTable, or the special singleRegionInfo for stopping
+	// the table will be handled later.
+	s.client.failures.submitDirectFailure(newSubscriptionStoppedFailure(region))
+	s.requestCache.markDone()
+}
+
+func (s *regionRequestWorker) handleActiveRegionRequest(
+	conn *ConnAndClient,
+	regionReq regionReq,
+) error {
+	region := regionReq.regionInfo
+	subID := region.subscribedSpan.subID
+	state := newRegionFeedState(region, uint64(subID), s)
+	state.start()
+	s.addRegionState(subID, region.verID.GetID(), state)
+	// Mark the request as sent before sending it.
+	// Otherwise there is a race with the receiver goroutine:
+	//  1. addRegionState makes the region visible to error handling.
+	//  2. sendRequest sends the request.
+	//  3. the receiver goroutine may receive a region error immediately.
+	//  4. markStopped runs before markSent, so requestCache.markStopped cannot
+	//     find the request in sentRequests.
+	//  5. the sender goroutine then calls markSent and leaves a stale sent
+	//     request behind, even though the region has already been
+	//     unlocked/rescheduled.
+	//
+	// Tracking the request before Send keeps requestedRegions and
+	// sentRequests visible in the same order and avoids leaving stale
+	// requests in cleanup.
+	s.requestCache.markSent(regionReq)
+	s.markRegionRuntimeSent(region, time.Now())
+	if err := s.sendRequest(conn, s.createRegionRequest(region)); err != nil {
+		state.markStopped(newSendRequestToStoreFailure(region, regionFailureSourceWorkerSend, err))
+		return err
+	}
+	return nil
+}
+
+func (s *regionRequestWorker) handleRegionSendTask(
+	conn *ConnAndClient,
+	regionReq regionReq,
+) error {
+	region := regionReq.regionInfo
+	switch {
+	case region.isStopped():
+		return s.handleStopTask(conn, region)
+	case region.subscribedSpan.stopped.Load():
+		s.handleStoppedSubscription(region)
+		return nil
+	default:
+		return s.handleActiveRegionRequest(conn, regionReq)
+	}
+}
+
 // processRegionSendTask receives region requests from the channel and sends them to the remote store.
 func (s *regionRequestWorker) processRegionSendTask(
 	ctx context.Context,
 	conn *ConnAndClient,
 ) error {
-	doSend := func(req *cdcpb.ChangeDataRequest) error {
-		if err := conn.Client.Send(req); err != nil {
-			log.Warn("region request worker send request to grpc stream failed",
-				zap.Uint64("workerID", s.workerID),
-				zap.Uint64("subscriptionID", req.RequestId),
-				zap.Uint64("regionID", req.RegionId),
-				zap.String("addr", s.store.storeAddr),
-				zap.Error(err))
-			return errors.Trace(err)
-		}
-		// TODO: add a metric?
-		return nil
-	}
-
-	fetchMoreReq := func() (regionReq, error) {
-		for {
-			// Try to get from cache
-			if req, err := s.requestCache.pop(ctx); err != nil {
-				return regionReq{}, err
-			} else {
-				return req, nil
-			}
-		}
-	}
 
 	// Handle pre-fetched region first
 	region := *s.preFetchForConnecting
@@ -433,59 +577,10 @@ func (s *regionRequestWorker) processRegionSendTask(
 			zap.String("addr", s.store.storeAddr),
 			zap.Bool("bdrMode", region.filterLoop))
 
-		// It means it's a special task for stopping the table.
-		if region.isStopped() {
-			req := &cdcpb.ChangeDataRequest{
-				Header:    &cdcpb.Header{ClusterId: s.client.clusterID, TicdcVersion: version.ReleaseSemver()},
-				RequestId: uint64(subID),
-				Request: &cdcpb.ChangeDataRequest_Deregister_{
-					Deregister: &cdcpb.ChangeDataRequest_Deregister{},
-				},
-				FilterLoop: region.filterLoop,
-			}
-			s.requestCache.markDone()
-			if err := doSend(req); err != nil {
-				return err
-			}
-			for _, state := range s.takeRegionStates(subID) {
-				state.markStopped(newRequestCancelledFailure(state.getRegionInfo(), regionFailureSourceDeregister))
-				regionEvent := regionEvent{
-					states: []*regionFeedState{state},
-				}
-				s.client.pushRegionEventToDS(subID, regionEvent)
-			}
-		} else if region.subscribedSpan.stopped.Load() {
-			// It can be skipped directly because there must be no pending states from
-			// the stopped subscribedTable, or the special singleRegionInfo for stopping
-			// the table will be handled later.
-			s.client.failures.submitDirectFailure(newSubscriptionStoppedFailure(region))
-			s.requestCache.markDone()
-		} else {
-			state := newRegionFeedState(region, uint64(subID), s)
-			state.start()
-			s.addRegionState(subID, region.verID.GetID(), state)
-			// Mark the request as sent before sending it.
-			// Otherwise there is a race with the receiver goroutine:
-			//  1. addRegionState makes the region visible to error handling.
-			//  2. doSend sends the request.
-			//  3. the receiver goroutine may receive a region error immediately.
-			//  4. markStopped runs before markSent, so requestCache.markStopped cannot
-			//     find the request in sentRequests.
-			//  5. the sender goroutine then calls markSent and leaves a stale sent
-			//     request behind, even though the region has already been
-			//     unlocked/rescheduled.
-			//
-			// Tracking the request before Send keeps requestedRegions and
-			// sentRequests visible in the same order and avoids leaving stale
-			// requests in cleanup.
-			s.requestCache.markSent(regionReq)
-			s.markRegionRuntimeSent(region, time.Now())
-			if err := doSend(s.createRegionRequest(region)); err != nil {
-				state.markStopped(newSendRequestToStoreFailure(region, regionFailureSourceWorkerSend, err))
-				return err
-			}
+		if err := s.handleRegionSendTask(conn, regionReq); err != nil {
+			return err
 		}
-		regionReq, err = fetchMoreReq()
+		regionReq, err = s.nextRegionRequest(ctx)
 		if err != nil {
 			return err
 		}

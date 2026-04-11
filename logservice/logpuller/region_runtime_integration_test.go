@@ -30,7 +30,6 @@ import (
 
 func TestScheduleRegionRequestUpdatesRuntimeRegistry(t *testing.T) {
 	client := &subscriptionClient{
-		regionTaskQueue:       NewPriorityQueue(),
 		regionRuntimeRegistry: newRegionRuntimeRegistry(),
 		pdClock:               pdutil.NewClock4Test(),
 	}
@@ -56,7 +55,7 @@ func TestScheduleRegionRequestUpdatesRuntimeRegistry(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	task, err := client.regionTaskQueue.Pop(ctx)
+	task, err := client.requestRouter.regionTaskQueue.Pop(ctx)
 	require.NoError(t, err)
 	queued := task.GetRegionInfo()
 	require.True(t, queued.runtimeKey.isValid())
@@ -154,7 +153,6 @@ func TestHandleResolvedTsUpdatesRuntimeRegistry(t *testing.T) {
 func TestDoHandleFailureMarksRetryPendingForRetryableRegionError(t *testing.T) {
 	client := &subscriptionClient{
 		regionRuntimeRegistry: newRegionRuntimeRegistry(),
-		regionTaskQueue:       NewPriorityQueue(),
 		pdClock:               pdutil.NewClock4Test(),
 	}
 	client.failures = newFailureHandler(client)
@@ -187,7 +185,6 @@ func TestDoHandleFailureMarksRetryPendingForRetryableRegionError(t *testing.T) {
 func TestDoHandleFailureRemovesRuntimeForRangeReload(t *testing.T) {
 	client := &subscriptionClient{
 		regionRuntimeRegistry: newRegionRuntimeRegistry(),
-		rangeTaskCh:           make(chan rangeTask, 1),
 	}
 	client.failures = newFailureHandler(client)
 
@@ -210,7 +207,7 @@ func TestDoHandleFailureRemovesRuntimeForRangeReload(t *testing.T) {
 	require.False(t, ok)
 
 	select {
-	case task := <-client.rangeTaskCh:
+	case task := <-client.requestRouter.rangeTaskCh:
 		require.Equal(t, rawSpan, task.span)
 		require.Equal(t, subSpan, task.subscribedSpan)
 	case <-time.After(time.Second):
