@@ -78,18 +78,6 @@ func (s *regionInfo) resolvedTs() uint64 {
 	return s.lockedRangeState.ResolvedTs.Load()
 }
 
-type regionErrorInfo struct {
-	regionInfo
-	err error
-}
-
-func newRegionErrorInfo(info regionInfo, err error) regionErrorInfo {
-	return regionErrorInfo{
-		regionInfo: info,
-		err:        err,
-	}
-}
-
 type regionFeedState struct {
 	region    regionInfo
 	requestID uint64 // It is also the subscription ID
@@ -103,9 +91,10 @@ type regionFeedState struct {
 	state struct {
 		sync.RWMutex
 		v uint32
-		// All region errors should be handled in region workers.
-		// `err` is used to retrieve errors generated outside.
-		err error
+		// Failures are normalized before entering region state so the ordered
+		// stale-event path and the direct failure path use the same recovery model.
+		failure    regionFailureInfo
+		hasFailure bool
 	}
 
 	worker *regionRequestWorker
@@ -123,42 +112,39 @@ func (s *regionFeedState) start() {
 	s.matcher = newMatcher()
 }
 
-// mark regionFeedState as stopped with the given error if possible.
-func (s *regionFeedState) markStopped(err error) {
+// markStopped moves a running region into stopped state and records the
+// normalized failure that will be recovered later.
+func (s *regionFeedState) markStopped(failure regionFailureInfo) {
 	s.state.Lock()
 	defer s.state.Unlock()
 	if s.state.v == stateNormal {
 		s.state.v = stateStopped
-		s.state.err = err
+		s.state.failure = failure
+		s.state.hasFailure = true
 	}
 	s.worker.requestCache.markStopped(s.region.subscribedSpan.subID, s.region.verID.GetID())
 }
 
-// mark regionFeedState as removed if possible.
-func (s *regionFeedState) markRemoved() (changed bool) {
+// takeStoppedFailure moves a stopped region into removed state and returns the
+// failure that should be handed to the global failure handler.
+func (s *regionFeedState) takeStoppedFailure() (regionFailureInfo, bool) {
 	s.state.Lock()
 	defer s.state.Unlock()
+	if s.state.v == stateStopped && s.state.hasFailure {
+		s.state.v = stateRemoved
+		s.matcher.clear()
+		s.worker.requestCache.markStopped(s.region.subscribedSpan.subID, s.region.verID.GetID())
+		failure := s.state.failure
+		s.state.failure = regionFailureInfo{}
+		s.state.hasFailure = false
+		return failure, true
+	}
 	if s.state.v == stateStopped {
 		s.state.v = stateRemoved
-		changed = true
 		s.matcher.clear()
+		s.worker.requestCache.markStopped(s.region.subscribedSpan.subID, s.region.verID.GetID())
 	}
-	s.worker.requestCache.markStopped(s.region.subscribedSpan.subID, s.region.verID.GetID())
-	return
-}
-
-func (s *regionFeedState) isStale() bool {
-	s.state.RLock()
-	defer s.state.RUnlock()
-	return s.state.v == stateStopped || s.state.v == stateRemoved
-}
-
-func (s *regionFeedState) takeError() (err error) {
-	s.state.Lock()
-	defer s.state.Unlock()
-	err = s.state.err
-	s.state.err = nil
-	return
+	return regionFailureInfo{}, false
 }
 
 func (s *regionFeedState) isInitialized() bool {
@@ -198,6 +184,12 @@ func (s *regionFeedState) getRegionInfo() regionInfo {
 
 func (s *regionFeedState) getRegionMeta() (uint64, heartbeatpb.TableSpan, string) {
 	return s.region.verID.GetID(), s.region.span, s.region.rpcCtx.Addr
+}
+
+func (s *regionFeedState) isStale() bool {
+	s.state.RLock()
+	defer s.state.RUnlock()
+	return s.state.v == stateStopped || s.state.v == stateRemoved
 }
 
 func (s *regionFeedState) runtime() *regionRuntimeTracker {

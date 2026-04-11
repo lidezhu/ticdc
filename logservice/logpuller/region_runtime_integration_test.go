@@ -88,7 +88,7 @@ func TestOnRegionFailUpdatesRuntimeRegistry(t *testing.T) {
 	client.runtime.ensureRegion(&region, time.Now())
 	require.True(t, region.runtimeKey.isValid())
 
-	client.pipeline.errorHandler.reportRegionFailure(newRegionErrorInfo(region, &sendRequestToStoreErr{}))
+	client.pipeline.errorHandler.reportFailure(newSendRequestToStoreFailure(region, regionFailureSourceWorkerSession, nil))
 
 	state, ok := client.runtime.registry.get(region.runtimeKey)
 	require.True(t, ok)
@@ -151,9 +151,10 @@ func TestDoHandleErrorMarksRetryPendingForRetryableRegionError(t *testing.T) {
 	region := newRegionInfo(tikv.NewRegionVerID(10, 1, 1), rawSpan, nil, subSpan, false)
 	client.runtime.ensureRegion(&region, time.Now())
 
-	err := client.pipeline.errorHandler.handleError(context.Background(), newRegionErrorInfo(region, &eventError{
-		err: &cdcpb.Error{ServerIsBusy: &errorpb.ServerIsBusy{Reason: "busy"}},
-	}))
+	err := client.pipeline.errorHandler.handleFailure(
+		context.Background(),
+		newEventRegionFailure(region, &cdcpb.Error{ServerIsBusy: &errorpb.ServerIsBusy{Reason: "busy"}}),
+	)
 	require.NoError(t, err)
 
 	state, ok := client.runtime.registry.get(region.runtimeKey)
@@ -178,7 +179,7 @@ func TestDoHandleErrorRemovesRuntimeForRangeReload(t *testing.T) {
 	region := newRegionInfo(tikv.NewRegionVerID(10, 1, 1), rawSpan, nil, subSpan, false)
 	client.runtime.ensureRegion(&region, time.Now())
 
-	err := client.pipeline.errorHandler.handleError(context.Background(), newRegionErrorInfo(region, &rpcCtxUnavailableErr{verID: region.verID}))
+	err := client.pipeline.errorHandler.handleFailure(context.Background(), newRPCCtxUnavailableFailure(region))
 	require.NoError(t, err)
 
 	_, ok := client.runtime.registry.get(region.runtimeKey)
@@ -208,7 +209,32 @@ func TestDoHandleErrorRemovesRuntimeForCancelledRequest(t *testing.T) {
 	region := newRegionInfo(tikv.NewRegionVerID(10, 1, 1), rawSpan, nil, subSpan, false)
 	client.runtime.ensureRegion(&region, time.Now())
 
-	err := client.pipeline.errorHandler.handleError(context.Background(), newRegionErrorInfo(region, &requestCancelledErr{}))
+	err := client.pipeline.errorHandler.handleFailure(
+		context.Background(),
+		newRequestCancelledFailure(region, regionFailureSourceDeregister),
+	)
+	require.NoError(t, err)
+
+	_, ok := client.runtime.registry.get(region.runtimeKey)
+	require.False(t, ok)
+}
+
+func TestHandleFailureRemovesRuntimeForStoppedSubscription(t *testing.T) {
+	client := newSubscriptionClientForTest()
+
+	rawSpan := heartbeatpb.TableSpan{
+		TableID:  1,
+		StartKey: []byte{'a'},
+		EndKey:   []byte{'z'},
+	}
+	consumeKVEvents := func(_ []common.RawKVEntry, _ func()) bool { return false }
+	advanceResolvedTs := func(uint64) {}
+	subSpan := client.subscriptions.manager.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
+
+	region := newRegionInfo(tikv.NewRegionVerID(10, 1, 1), rawSpan, nil, subSpan, false)
+	client.runtime.ensureRegion(&region, time.Now())
+
+	err := client.pipeline.errorHandler.handleFailure(context.Background(), newSubscriptionStoppedFailure(region))
 	require.NoError(t, err)
 
 	_, ok := client.runtime.registry.get(region.runtimeKey)

@@ -52,3 +52,7 @@ func (e *sendRequestToStoreErr) Error() string { return "send request to store e
 type requestCancelledErr struct{}
 
 func (e *requestCancelledErr) Error() string { return "region request is cancelled" }
+
+type subscriptionStoppedErr struct{}
+
+func (e *subscriptionStoppedErr) Error() string { return "subscription has been stopped" }

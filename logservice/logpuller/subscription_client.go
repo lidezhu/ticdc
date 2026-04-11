@@ -366,7 +366,7 @@ func (s *subscriptionClient) Run(ctx context.Context) error {
 	g.Go(func() error { return s.subscriptions.supervisor.runResolveLockChecker(ctx) })
 	g.Go(func() error { return s.subscriptions.supervisor.handleResolveLockTasks(ctx) })
 	g.Go(func() error { return s.subscriptions.supervisor.logSlowRegions(ctx) })
-	g.Go(func() error { return s.pipeline.errorHandler.errCache.dispatch(ctx) })
+	g.Go(func() error { return s.pipeline.errorHandler.failures.run(ctx) })
 
 	log.Info("subscription client starts")
 	defer log.Info("subscription client exits")

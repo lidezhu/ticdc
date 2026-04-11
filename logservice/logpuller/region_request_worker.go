@@ -38,6 +38,27 @@ var workerIDGen atomic.Uint64
 
 type regionFeedStates map[uint64]*regionFeedState
 
+type workerSessionFailure struct {
+	kind   regionFailureKind
+	source regionFailureSource
+	cause  error
+}
+
+func (f workerSessionFailure) toRegionFailure(region regionInfo) regionFailureInfo {
+	switch f.kind {
+	case regionFailureKindGetStore:
+		return newGetStoreFailure(region, f.source, f.cause)
+	case regionFailureKindSendRequestToStore:
+		return newSendRequestToStoreFailure(region, f.source, f.cause)
+	default:
+		log.Panic("unknown worker session failure kind",
+			zap.Stringer("failureKind", f.kind),
+			zap.Stringer("failureSource", f.source),
+			zap.Error(f.cause))
+		return regionFailureInfo{}
+	}
+}
+
 // regionRequestWorker is responsible for sending region requests to a specific TiKV store.
 type regionRequestWorker struct {
 	workerID uint64
@@ -122,7 +143,7 @@ func newRegionRequestWorker(
 			if err := waitForPreFetching(); err != nil {
 				return err
 			}
-			var regionErr error
+			var sessionFailure workerSessionFailure
 			if err := version.CheckStoreVersion(ctx, worker.client.infra.pd); err != nil {
 				if errors.Cause(err) == context.Canceled {
 					return nil
@@ -132,19 +153,28 @@ func newRegionRequestWorker(
 					zap.String("addr", worker.store.storeAddr),
 					zap.Error(err))
 				if cerror.Is(err, cerror.ErrGetAllStoresFailed) {
-					regionErr = &getStoreErr{}
+					sessionFailure = workerSessionFailure{
+						kind:   regionFailureKindGetStore,
+						source: regionFailureSourceWorkerSession,
+						cause:  err,
+					}
 				} else {
-					regionErr = &sendRequestToStoreErr{}
+					sessionFailure = workerSessionFailure{
+						kind:   regionFailureKindSendRequestToStore,
+						source: regionFailureSourceWorkerSession,
+						cause:  err,
+					}
 				}
 			} else {
-				if canceled := worker.run(ctx, credential); canceled {
+				var canceled bool
+				sessionFailure, canceled = worker.run(ctx, credential)
+				if canceled {
 					return nil
 				}
-				regionErr = &sendRequestToStoreErr{}
 			}
 			for subID, m := range worker.clearRegionStates() {
 				for _, state := range m {
-					state.markStopped(regionErr)
+					state.markStopped(sessionFailure.toRegionFailure(state.getRegionInfo()))
 					regionEvent := regionEvent{
 						states: []*regionFeedState{state},
 					}
@@ -157,7 +187,7 @@ func newRegionRequestWorker(
 					// It means it's a special task for stopping the table.
 					continue
 				}
-				worker.client.pipeline.errorHandler.reportRegionFailure(newRegionErrorInfo(region, regionErr))
+				worker.client.pipeline.errorHandler.reportFailure(sessionFailure.toRegionFailure(region))
 			}
 			if err := util.Hang(ctx, time.Second); err != nil {
 				return err
@@ -168,7 +198,10 @@ func newRegionRequestWorker(
 	return worker
 }
 
-func (s *regionRequestWorker) run(ctx context.Context, credential *security.Credential) (canceled bool) {
+func (s *regionRequestWorker) run(
+	ctx context.Context,
+	credential *security.Credential,
+) (sessionFailure workerSessionFailure, canceled bool) {
 	isCanceled := func() bool {
 		select {
 		case <-ctx.Done():
@@ -200,16 +233,40 @@ func (s *regionRequestWorker) run(ctx context.Context, credential *security.Cred
 		if conn != nil && conn.Conn != nil {
 			_ = conn.Conn.Close()
 		}
-		return isCanceled()
+		return workerSessionFailure{
+			kind:   regionFailureKindSendRequestToStore,
+			source: regionFailureSourceWorkerSession,
+			cause:  err,
+		}, isCanceled()
 	}
 	defer func() {
 		_ = conn.Conn.Close()
 	}()
 
+	var failureOnce sync.Once
+	recordFailure := func(source regionFailureSource, err error) {
+		if err == nil {
+			return
+		}
+		failureOnce.Do(func() {
+			sessionFailure = workerSessionFailure{
+				kind:   regionFailureKindSendRequestToStore,
+				source: source,
+				cause:  err,
+			}
+		})
+	}
+
 	g.Go(func() error {
-		return s.receiveAndDispatchChangeEvents(conn)
+		err := s.receiveAndDispatchChangeEvents(conn)
+		recordFailure(regionFailureSourceWorkerRecv, err)
+		return err
 	})
-	g.Go(func() error { return s.processRegionSendTask(gctx, conn) })
+	g.Go(func() error {
+		err := s.processRegionSendTask(gctx, conn)
+		recordFailure(regionFailureSourceWorkerSend, err)
+		return err
+	})
 
 	failpoint.Inject("InjectForceReconnect", func() {
 		timer := time.After(10 * time.Second)
@@ -217,12 +274,19 @@ func (s *regionRequestWorker) run(ctx context.Context, credential *security.Cred
 			<-timer
 			err := errors.New("inject force reconnect")
 			log.Info("inject force reconnect", zap.Error(err))
+			recordFailure(regionFailureSourceWorkerSession, err)
 			return err
 		})
 	})
 
 	_ = g.Wait()
-	return isCanceled()
+	if sessionFailure.kind == "" {
+		sessionFailure = workerSessionFailure{
+			kind:   regionFailureKindSendRequestToStore,
+			source: regionFailureSourceWorkerSession,
+		}
+	}
+	return sessionFailure, isCanceled()
 }
 
 // receiveAndDispatchChangeEventsToProcessor receives events from the grpc stream and dispatches them to ds.
@@ -277,7 +341,7 @@ func (s *regionRequestWorker) dispatchRegionChangeEvents(events []*cdcpb.Event) 
 					zap.Uint64("subscriptionID", uint64(subscriptionID)),
 					zap.Uint64("regionID", event.RegionId),
 					zap.Any("error", eventData.Error))
-				state.markStopped(&eventError{err: eventData.Error})
+				state.markStopped(newEventRegionFailure(state.getRegionInfo(), eventData.Error))
 			case *cdcpb.Event_ResolvedTs:
 				regionEvent.resolvedTs = eventData.ResolvedTs
 			case *cdcpb.Event_LongTxn_:
@@ -419,7 +483,7 @@ func (s *regionRequestWorker) processRegionSendTask(
 				return err
 			}
 			for _, state := range s.takeRegionStates(subID) {
-				state.markStopped(&requestCancelledErr{})
+				state.markStopped(newRequestCancelledFailure(state.getRegionInfo(), regionFailureSourceDeregister))
 				regionEvent := regionEvent{
 					states: []*regionFeedState{state},
 				}
@@ -429,7 +493,7 @@ func (s *regionRequestWorker) processRegionSendTask(
 			// It can be skipped directly because there must be no pending states from
 			// the stopped subscribedTable, or the special singleRegionInfo for stopping
 			// the table will be handled later.
-			s.client.pipeline.errorHandler.reportRegionFailure(newRegionErrorInfo(region, &sendRequestToStoreErr{}))
+			s.client.pipeline.errorHandler.reportFailure(newSubscriptionStoppedFailure(region))
 			s.requestCache.markDone()
 		} else {
 			state := newRegionFeedState(region, uint64(subID), s)
@@ -452,7 +516,7 @@ func (s *regionRequestWorker) processRegionSendTask(
 			s.requestCache.markSent(regionReq)
 			s.markRegionRuntimeSent(region, time.Now())
 			if err := doSend(s.createRegionRequest(region)); err != nil {
-				state.markStopped(err)
+				state.markStopped(newSendRequestToStoreFailure(region, regionFailureSourceWorkerSend, err))
 				return err
 			}
 		}

@@ -214,6 +214,6 @@ func (h *regionRequestRouter) attachRPCContext(ctx context.Context, region regio
 			zap.Uint64("regionID", region.verID.GetID()),
 			zap.Error(err))
 	}
-	h.client.pipeline.errorHandler.reportRegionFailure(newRegionErrorInfo(region, &rpcCtxUnavailableErr{verID: region.verID}))
+	h.client.pipeline.errorHandler.reportFailure(newRPCCtxUnavailableFailure(region))
 	return region, false
 }

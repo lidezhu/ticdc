@@ -30,49 +30,68 @@ type regionErrorHandler struct {
 	scheduler   *regionScheduler
 	spans       *spanManager
 	regionCache *tikv.RegionCache
-	errCache    *errCache
+	failures    *failureBuffer
 }
 
-type errCache struct {
+type recoveryAction string
+
+const (
+	recoveryActionRetryRegion  recoveryAction = "retry_region"
+	recoveryActionReloadRange  recoveryAction = "reload_range"
+	recoveryActionRemoveRegion recoveryAction = "remove_region"
+)
+
+func (a recoveryAction) String() string {
+	return string(a)
+}
+
+type recoveryPlan struct {
+	action   recoveryAction
+	priority TaskType
+}
+
+type failureBuffer struct {
 	sync.Mutex
-	cache  []regionErrorInfo
-	errCh  chan regionErrorInfo
-	notify chan struct{}
+	pending []regionFailureInfo
+	ch      chan regionFailureInfo
+	notify  chan struct{}
 }
 
-func newErrCache() *errCache {
-	return &errCache{
-		cache:  make([]regionErrorInfo, 0, 1024),
-		errCh:  make(chan regionErrorInfo, 1024),
-		notify: make(chan struct{}, 1024),
+func newFailureBuffer() *failureBuffer {
+	return &failureBuffer{
+		pending: make([]regionFailureInfo, 0, 1024),
+		ch:      make(chan regionFailureInfo, 1024),
+		notify:  make(chan struct{}, 1024),
 	}
 }
 
-func (e *errCache) add(errInfo regionErrorInfo) {
-	e.Lock()
-	defer e.Unlock()
-	e.cache = append(e.cache, errInfo)
+func (b *failureBuffer) enqueue(failure regionFailureInfo) {
+	b.Lock()
+	defer b.Unlock()
+	b.pending = append(b.pending, failure)
 	select {
-	case e.notify <- struct{}{}:
+	case b.notify <- struct{}{}:
 	default:
 	}
 }
 
-func (e *errCache) dispatch(ctx context.Context) error {
+func (b *failureBuffer) run(ctx context.Context) error {
 	ticker := time.NewTicker(10 * time.Millisecond)
-	sendToErrCh := func() {
-		e.Lock()
-		if len(e.cache) == 0 {
-			e.Unlock()
+	defer ticker.Stop()
+
+	dispatchOne := func() {
+		b.Lock()
+		if len(b.pending) == 0 {
+			b.Unlock()
 			return
 		}
-		errInfo := e.cache[0]
-		e.cache = e.cache[1:]
-		e.Unlock()
+		failure := b.pending[0]
+		b.pending = b.pending[1:]
+		b.Unlock()
 		select {
 		case <-ctx.Done():
-			log.Info("subscription client dispatch err cache done")
-		case e.errCh <- errInfo:
+			log.Info("subscription client dispatch failure buffer done")
+		case b.ch <- failure:
 		}
 	}
 	for {
@@ -80,9 +99,9 @@ func (e *errCache) dispatch(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			sendToErrCh()
-		case <-e.notify:
-			sendToErrCh()
+			dispatchOne()
+		case <-b.notify:
+			dispatchOne()
 		}
 	}
 }
@@ -98,20 +117,20 @@ func newRegionErrorHandler(
 		scheduler:   scheduler,
 		spans:       spans,
 		regionCache: regionCache,
-		errCache:    newErrCache(),
+		failures:    newFailureBuffer(),
 	}
 }
 
-// reportRegionFailure must not block the caller, otherwise there may be deadlock.
-func (h *regionErrorHandler) reportRegionFailure(errInfo regionErrorInfo) {
-	h.runtime.recordError(errInfo.regionInfo, errInfo.err, time.Now())
-	if errInfo.subscribedSpan.rangeLock.UnlockRange(
-		errInfo.span.StartKey, errInfo.span.EndKey,
-		errInfo.verID.GetID(), errInfo.verID.GetVer(), errInfo.resolvedTs()) {
-		h.spans.onTableDrained(errInfo.subscribedSpan)
+// reportFailure must not block the caller, otherwise there may be deadlock.
+func (h *regionErrorHandler) reportFailure(failure regionFailureInfo) {
+	h.runtime.recordError(failure.regionInfo, failure.err, time.Now())
+	if failure.subscribedSpan.rangeLock.UnlockRange(
+		failure.span.StartKey, failure.span.EndKey,
+		failure.verID.GetID(), failure.verID.GetVer(), failure.resolvedTs()) {
+		h.spans.onTableDrained(failure.subscribedSpan)
 		return
 	}
-	h.errCache.add(errInfo)
+	h.failures.enqueue(failure)
 }
 
 func (h *regionErrorHandler) run(ctx context.Context) error {
@@ -120,112 +139,135 @@ func (h *regionErrorHandler) run(ctx context.Context) error {
 		case <-ctx.Done():
 			log.Info("subscription client handle errors and exit")
 			return ctx.Err()
-		case errInfo := <-h.errCache.errCh:
-			if err := h.handleError(ctx, errInfo); err != nil {
+		case failure := <-h.failures.ch:
+			if err := h.handleFailure(ctx, failure); err != nil {
 				return err
 			}
 		}
 	}
 }
 
-func (h *regionErrorHandler) retryRegion(ctx context.Context, errInfo regionErrorInfo, priority TaskType) {
-	h.runtime.markRetryPending(errInfo.regionInfo, errInfo.err, time.Now())
-	h.scheduler.scheduleRegionRequest(ctx, errInfo.regionInfo, priority)
+func (h *regionErrorHandler) retryRegion(ctx context.Context, failure regionFailureInfo, priority TaskType) {
+	h.runtime.markRetryPending(failure.regionInfo, failure.err, time.Now())
+	h.scheduler.scheduleRegionRequest(ctx, failure.regionInfo, priority)
 }
 
-func (h *regionErrorHandler) reloadRegionRange(ctx context.Context, errInfo regionErrorInfo) {
-	h.runtime.removeRegion(errInfo.regionInfo, time.Now())
-	h.scheduler.enqueueRange(errInfo.span, errInfo.subscribedSpan, errInfo.filterLoop, TaskHighPrior)
+func (h *regionErrorHandler) reloadRegionRange(ctx context.Context, failure regionFailureInfo) {
+	h.runtime.removeRegion(failure.regionInfo, time.Now())
+	h.scheduler.enqueueRange(failure.span, failure.subscribedSpan, failure.filterLoop, TaskHighPrior)
 }
 
-func (h *regionErrorHandler) handleEventError(
-	ctx context.Context,
-	errInfo regionErrorInfo,
-	eerr *eventError,
-) error {
+func (h *regionErrorHandler) planEventFailure(failure regionFailureInfo) (recoveryPlan, error) {
+	eerr, ok := failure.err.(*eventError)
+	if !ok || eerr == nil {
+		return recoveryPlan{}, errors.New("invalid tikv event failure")
+	}
 	innerErr := eerr.err
 	if notLeader := innerErr.GetNotLeader(); notLeader != nil {
 		metricFeedNotLeaderCounter.Inc()
-		h.regionCache.UpdateLeader(errInfo.verID, notLeader.GetLeader(), errInfo.rpcCtx.AccessIdx)
-		h.retryRegion(ctx, errInfo, TaskHighPrior)
-		return nil
+		if h.regionCache != nil {
+			h.regionCache.UpdateLeader(failure.verID, notLeader.GetLeader(), failure.rpcCtx.AccessIdx)
+		}
+		return recoveryPlan{action: recoveryActionRetryRegion, priority: TaskHighPrior}, nil
 	}
 	if innerErr.GetEpochNotMatch() != nil {
 		metricFeedEpochNotMatchCounter.Inc()
-		h.reloadRegionRange(ctx, errInfo)
-		return nil
+		return recoveryPlan{action: recoveryActionReloadRange}, nil
 	}
 	if innerErr.GetRegionNotFound() != nil {
 		metricFeedRegionNotFoundCounter.Inc()
-		h.reloadRegionRange(ctx, errInfo)
-		return nil
+		return recoveryPlan{action: recoveryActionReloadRange}, nil
 	}
 	if innerErr.GetCongested() != nil {
 		metricKvCongestedCounter.Inc()
-		h.retryRegion(ctx, errInfo, TaskLowPrior)
-		return nil
+		return recoveryPlan{action: recoveryActionRetryRegion, priority: TaskLowPrior}, nil
 	}
 	if innerErr.GetServerIsBusy() != nil {
 		metricKvIsBusyCounter.Inc()
-		h.retryRegion(ctx, errInfo, TaskLowPrior)
-		return nil
+		return recoveryPlan{action: recoveryActionRetryRegion, priority: TaskLowPrior}, nil
 	}
 	if duplicated := innerErr.GetDuplicateRequest(); duplicated != nil {
 		// TODO(qupeng): It's better to add a new machanism to deregister one region.
 		metricFeedDuplicateRequestCounter.Inc()
-		return errors.New("duplicate request")
+		return recoveryPlan{}, errors.New("duplicate request")
 	}
 	if compatibility := innerErr.GetCompatibility(); compatibility != nil {
-		return cerror.ErrVersionIncompatible.GenWithStackByArgs(compatibility)
+		return recoveryPlan{}, cerror.ErrVersionIncompatible.GenWithStackByArgs(compatibility)
 	}
 	if mismatch := innerErr.GetClusterIdMismatch(); mismatch != nil {
-		return cerror.ErrClusterIDMismatch.GenWithStackByArgs(mismatch.Current, mismatch.Request)
+		return recoveryPlan{}, cerror.ErrClusterIDMismatch.GenWithStackByArgs(mismatch.Current, mismatch.Request)
 	}
 
 	log.Warn("empty or unknown cdc error",
-		zap.Uint64("subscriptionID", uint64(errInfo.subscribedSpan.subID)),
+		zap.Uint64("subscriptionID", uint64(failure.subscribedSpan.subID)),
 		zap.Stringer("error", innerErr))
 	metricFeedUnknownErrorCounter.Inc()
-	h.retryRegion(ctx, errInfo, TaskHighPrior)
-	return nil
+	return recoveryPlan{action: recoveryActionRetryRegion, priority: TaskHighPrior}, nil
 }
 
-func (h *regionErrorHandler) handleError(ctx context.Context, errInfo regionErrorInfo) error {
-	err := errors.Cause(errInfo.err)
-	log.Debug("cdc region error",
-		zap.Uint64("subscriptionID", uint64(errInfo.subscribedSpan.subID)),
-		zap.Uint64("regionID", errInfo.verID.GetID()),
-		zap.Error(err))
-
-	switch eerr := err.(type) {
-	case *eventError:
-		return h.handleEventError(ctx, errInfo, eerr)
-	case *rpcCtxUnavailableErr:
+func (h *regionErrorHandler) planFailure(ctx context.Context, failure regionFailureInfo) (recoveryPlan, error) {
+	switch failure.kind {
+	case regionFailureKindTiKVEvent:
+		return h.planEventFailure(failure)
+	case regionFailureKindRPCCtxUnavailable:
 		metricFeedRPCCtxUnavailable.Inc()
-		h.reloadRegionRange(ctx, errInfo)
-		return nil
-	case *getStoreErr:
+		return recoveryPlan{action: recoveryActionReloadRange}, nil
+	case regionFailureKindGetStore:
 		metricGetStoreErr.Inc()
-		bo := tikv.NewBackoffer(ctx, tikvRequestMaxBackoff)
-		// Cannot get the store the region belongs to, so we need to reload the region.
-		h.regionCache.OnSendFail(bo, errInfo.rpcCtx, true, err)
-		h.reloadRegionRange(ctx, errInfo)
-		return nil
-	case *sendRequestToStoreErr:
+		if h.regionCache != nil {
+			bo := tikv.NewBackoffer(ctx, tikvRequestMaxBackoff)
+			// Cannot get the store the region belongs to, so we need to reload the region.
+			h.regionCache.OnSendFail(bo, failure.rpcCtx, true, failure.err)
+		}
+		return recoveryPlan{action: recoveryActionReloadRange}, nil
+	case regionFailureKindSendRequestToStore:
 		metricStoreSendRequestErr.Inc()
-		bo := tikv.NewBackoffer(ctx, tikvRequestMaxBackoff)
-		h.regionCache.OnSendFail(bo, errInfo.rpcCtx, regionScheduleReload, err)
-		h.retryRegion(ctx, errInfo, TaskHighPrior)
-		return nil
-	case *requestCancelledErr:
-		h.runtime.removeRegion(errInfo.regionInfo, time.Now())
+		if h.regionCache != nil {
+			bo := tikv.NewBackoffer(ctx, tikvRequestMaxBackoff)
+			h.regionCache.OnSendFail(bo, failure.rpcCtx, regionScheduleReload, failure.err)
+		}
+		return recoveryPlan{action: recoveryActionRetryRegion, priority: TaskHighPrior}, nil
+	case regionFailureKindRequestCancelled, regionFailureKindSubscriptionStopped:
 		// The corresponding subscription has been unsubscribed, just ignore.
-		return nil
+		return recoveryPlan{action: recoveryActionRemoveRegion}, nil
 	default:
+		return recoveryPlan{}, failure.err
+	}
+}
+
+func (h *regionErrorHandler) applyRecovery(ctx context.Context, failure regionFailureInfo, plan recoveryPlan) {
+	switch plan.action {
+	case recoveryActionRetryRegion:
+		h.retryRegion(ctx, failure, plan.priority)
+	case recoveryActionReloadRange:
+		h.reloadRegionRange(ctx, failure)
+	case recoveryActionRemoveRegion:
+		h.runtime.removeRegion(failure.regionInfo, time.Now())
+	default:
+		log.Panic("unknown recovery action", zap.Stringer("action", plan.action))
+	}
+}
+
+func (h *regionErrorHandler) handleFailure(ctx context.Context, failure regionFailureInfo) error {
+	log.Debug("cdc region failure",
+		zap.Uint64("subscriptionID", uint64(failure.subscribedSpan.subID)),
+		zap.Uint64("regionID", failure.verID.GetID()),
+		zap.Stringer("failureScope", failure.scope),
+		zap.Stringer("failureSource", failure.source),
+		zap.Stringer("failureKind", failure.kind),
+		zap.Error(failure.err))
+
+	plan, err := h.planFailure(ctx, failure)
+	if err != nil {
 		// TODO(qupeng): for some errors it's better to just deregister the region from TiKVs.
 		log.Warn("subscription client meets an internal error, fail the changefeed",
-			zap.Uint64("subscriptionID", uint64(errInfo.subscribedSpan.subID)),
+			zap.Uint64("subscriptionID", uint64(failure.subscribedSpan.subID)),
+			zap.Stringer("failureScope", failure.scope),
+			zap.Stringer("failureSource", failure.source),
+			zap.Stringer("failureKind", failure.kind),
 			zap.Error(err))
 		return err
 	}
+	h.applyRecovery(ctx, failure, plan)
+	return nil
 }

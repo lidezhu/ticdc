@@ -287,7 +287,11 @@ func TestClearPendingRegionsDoesNotReturnStoppedSentRegion(t *testing.T) {
 	// remove the sent request immediately, so clearPendingRegions must not return
 	// the stale region again during worker shutdown.
 	worker.requestCache.markSent(req)
-	state.markStopped(errors.New("send request to store error"))
+	state.markStopped(newSendRequestToStoreFailure(
+		req.regionInfo,
+		regionFailureSourceWorkerSend,
+		errors.New("send request to store error"),
+	))
 	worker.takeRegionState(req.regionInfo.subscribedSpan.subID, req.regionInfo.verID.GetID())
 
 	require.Equal(t, 0, worker.requestCache.getPendingCount())
@@ -327,4 +331,11 @@ func TestProcessRegionSendTaskSendFailureCleansSentRequest(t *testing.T) {
 	require.Empty(t, worker.requestCache.sentRequests.regionReqs)
 	state := worker.getRegionState(req.regionInfo.subscribedSpan.subID, req.regionInfo.verID.GetID())
 	require.True(t, state == nil || state.isStale(), "region state should be removed or marked stale after send failure")
+	if state != nil {
+		failure, ok := state.takeStoppedFailure()
+		require.True(t, ok)
+		require.Equal(t, regionFailureKindSendRequestToStore, failure.kind)
+		require.Equal(t, regionFailureSourceWorkerSend, failure.source)
+		require.Contains(t, failure.err.Error(), "send failed")
+	}
 }
