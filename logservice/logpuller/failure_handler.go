@@ -134,6 +134,13 @@ func newFailureHandler(client *subscriptionClient) *failureHandler {
 	}
 }
 
+func normalizeWorkerSessionFailure(region regionInfo, sessionFailure workerSessionFailure) regionFailureInfo {
+	if region.subscribedSpan != nil && region.subscribedSpan.stopped.Load() {
+		return newSubscriptionStoppedFailure(region)
+	}
+	return sessionFailure.toRegionFailure(region)
+}
+
 // run owns the whole failure pipeline: enqueue -> plan -> recovery.
 func (h *failureHandler) run(ctx context.Context) error {
 	g, ctx := errgroup.WithContext(ctx)
@@ -176,7 +183,7 @@ func (h *failureHandler) submitWorkerSessionFailure(
 	if session != nil {
 		for subID, states := range session.clearRegionStates() {
 			for _, state := range states {
-				state.markStopped(sessionFailure.toRegionFailure(state.getRegionInfo()))
+				state.markStopped(normalizeWorkerSessionFailure(state.getRegionInfo(), sessionFailure))
 				h.client.pushRegionEventToDS(subID, regionEvent{
 					states: []*regionFeedState{state},
 				})
@@ -188,7 +195,7 @@ func (h *failureHandler) submitWorkerSessionFailure(
 		if region.isStopped() {
 			continue
 		}
-		h.submitDirectFailure(sessionFailure.toRegionFailure(region))
+		h.submitDirectFailure(normalizeWorkerSessionFailure(region, sessionFailure))
 	}
 }
 

@@ -14,8 +14,9 @@
 package logpuller
 
 type regionStateController struct {
-	workerID uint64
-	client   *subscriptionClient
+	workerID  uint64
+	storeAddr string
+	client    *subscriptionClient
 
 	requestCache *requestCache
 	takeState    func(SubscriptionID, uint64) *regionFeedState
@@ -23,12 +24,14 @@ type regionStateController struct {
 
 func newRegionStateController(
 	workerID uint64,
+	storeAddr string,
 	client *subscriptionClient,
 	requestCache *requestCache,
 	takeState func(SubscriptionID, uint64) *regionFeedState,
 ) *regionStateController {
 	return &regionStateController{
 		workerID:     workerID,
+		storeAddr:    storeAddr,
 		client:       client,
 		requestCache: requestCache,
 		takeState:    takeState,
@@ -68,4 +71,11 @@ func (c *regionStateController) getWorkerID() uint64 {
 		return 0
 	}
 	return c.workerID
+}
+
+func (c *regionStateController) getStoreAddr() string {
+	if c == nil {
+		return ""
+	}
+	return c.storeAddr
 }

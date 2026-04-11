@@ -73,7 +73,7 @@ func TestRegionStatesOperation(t *testing.T) {
 	require.Equal(t, 0, len(session.requestedRegions.subscriptions))
 }
 
-func TestClearPendingRegionsReleaseSlotForPreFetchedRegion(t *testing.T) {
+func TestCollectPendingRegionsReleaseSlotForBootstrapRegion(t *testing.T) {
 	worker := &regionRequestWorker{
 		requestCache: newRequestCache(10),
 	}
@@ -89,12 +89,9 @@ func TestClearPendingRegionsReleaseSlotForPreFetchedRegion(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, worker.requestCache.getPendingCount())
 
-	worker.preFetchForConnecting = new(regionInfo)
-	*worker.preFetchForConnecting = req.regionInfo
-
-	regions := worker.clearPendingRegions()
+	regions := worker.collectPendingRegions(nil, &req.regionInfo)
 	require.Len(t, regions, 1)
-	require.Nil(t, worker.preFetchForConnecting)
+	require.Equal(t, req.regionInfo.verID, regions[0].verID)
 	require.Equal(t, 0, worker.requestCache.getPendingCount())
 }
 
@@ -148,13 +145,14 @@ func (m *mockRegionEventDynamicStream) GetMetrics() dynstream.Metrics[int, Subsc
 
 func newDispatchResolvedTsTestSession(regionCount int) (*regionWorkerSession, *mockRegionEventDynamicStream, *cdcpb.ResolvedTs) {
 	ds := &mockRegionEventDynamicStream{}
-	session := &regionWorkerSession{
-		client: &subscriptionClient{
-			metrics: sharedClientMetrics{
-				batchResolvedSize: prometheus.ObserverFunc(func(float64) {}),
-			},
-			ds: ds,
+	client := &subscriptionClient{
+		metrics: sharedClientMetrics{
+			batchResolvedSize: prometheus.ObserverFunc(func(float64) {}),
 		},
+		ds: ds,
+	}
+	session := &regionWorkerSession{
+		controller: newRegionStateController(0, "", client, nil, nil),
 	}
 	session.requestedRegions.subscriptions = map[SubscriptionID]regionFeedStates{
 		1: make(regionFeedStates, regionCount),
@@ -184,7 +182,7 @@ func dispatchResolvedTsEventLegacyForBenchmark(s *regionWorkerSession, resolvedT
 			return
 		}
 		states := resolvedStates
-		s.client.pushRegionEventToDS(subscriptionID, regionEvent{
+		s.client().pushRegionEventToDS(subscriptionID, regionEvent{
 			resolvedTs: resolvedTsEvent.Ts,
 			states:     states,
 		})
@@ -269,11 +267,9 @@ func TestClearPendingRegionsDoesNotReturnStoppedSentRegion(t *testing.T) {
 	worker := &regionRequestWorker{
 		requestCache: newRequestCache(10),
 	}
-	session := &regionWorkerSession{
-		requestCache: worker.requestCache,
-	}
+	session := &regionWorkerSession{}
 	session.requestedRegions.subscriptions = make(map[SubscriptionID]regionFeedStates)
-	session.controller = newRegionStateController(0, nil, worker.requestCache, session.takeRegionState)
+	session.controller = newRegionStateController(0, "", nil, worker.requestCache, session.takeRegionState)
 
 	ctx := context.Background()
 	region := createTestRegionInfo(1, 1)
@@ -330,7 +326,8 @@ func TestProcessRegionSendTaskSendFailureCleansSentRequest(t *testing.T) {
 		Conn:   &grpc.ClientConn{},
 	}
 
-	session := newRegionWorkerSession(worker.client, 1, worker.store.storeAddr, conn, worker.requestCache, req.regionInfo)
+	controller := newRegionStateController(1, worker.store.storeAddr, worker.client, worker.requestCache, nil)
+	session := newRegionWorkerSession(controller, conn, req.regionInfo)
 	err = session.processRegionSendTask(ctx)
 	require.ErrorIs(t, err, sendErr)
 	require.Equal(t, 0, worker.requestCache.getPendingCount())

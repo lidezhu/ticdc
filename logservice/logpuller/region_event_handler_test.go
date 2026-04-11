@@ -80,7 +80,7 @@ func TestHandleEventEntryEventOutOfOrder(t *testing.T) {
 	worker := &regionRequestWorker{
 		requestCache: &requestCache{},
 	}
-	controller := newRegionStateController(0, nil, worker.requestCache, nil)
+	controller := newRegionStateController(0, "", nil, worker.requestCache, nil)
 	region := newRegionInfo(
 		tikv.RegionVerID{},
 		span,
@@ -220,7 +220,7 @@ func TestHandleResolvedTs(t *testing.T) {
 	worker := &regionRequestWorker{
 		requestCache: &requestCache{},
 	}
-	controller := newRegionStateController(0, nil, worker.requestCache, nil)
+	controller := newRegionStateController(0, "", nil, worker.requestCache, nil)
 	state1 := newRegionFeedState(regionInfo{verID: tikv.NewRegionVerID(1, 1, 1)}, uint64(subID1), controller)
 	state1.start()
 	{
