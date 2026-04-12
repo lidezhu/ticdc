@@ -175,8 +175,7 @@ func (s *regionRequestWorkerSession) run(ctx context.Context) (sessionRunResult,
 		}
 		return sessionRunResult{}, err
 	}
-	req := newRegionReq(bootstrapRegion)
-	s.bootstrapRegion = &req
+	s.bootstrapRegion = bootstrapRegion
 
 	sessionCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -263,17 +262,17 @@ func (s *regionRequestWorkerSession) runConnectedLoops(
 	}, nil
 }
 
-func (s *regionRequestWorkerSession) waitBootstrapRegion(ctx context.Context) (regionInfo, error) {
+func (s *regionRequestWorkerSession) waitBootstrapRegion(ctx context.Context) (*regionReq, error) {
 	for {
 		req, err := s.requestCache.pop(ctx)
 		if err != nil {
-			return regionInfo{}, err
+			return nil, err
 		}
 		if req.regionInfo.isStopped() {
-			s.requestCache.markDone()
+			req.finish()
 			continue
 		}
-		return req.regionInfo, nil
+		return req, nil
 	}
 }
 
@@ -338,12 +337,13 @@ func (s *regionRequestWorkerSession) requestHeader() *cdcpb.Header {
 	}
 }
 
-func (s *regionRequestWorkerSession) newState(region regionInfo) *regionFeedState {
+func (s *regionRequestWorkerSession) newState(request *regionReq) *regionFeedState {
+	region := request.regionInfo
 	return newRegionFeedState(
 		region,
 		uint64(region.subscribedSpan.subID),
 		s.workerID,
-		s.requestCache,
+		request,
 		s.runtimeRegistry,
 		s.takeRegionState,
 	)
@@ -525,9 +525,9 @@ func (s *regionRequestWorkerSession) sendRequest(req *cdcpb.ChangeDataRequest) e
 	return nil
 }
 
-func (s *regionRequestWorkerSession) nextRegionRequest(ctx context.Context) (regionReq, error) {
+func (s *regionRequestWorkerSession) nextRegionRequest(ctx context.Context) (*regionReq, error) {
 	if s.bootstrapRegion != nil {
-		req := *s.bootstrapRegion
+		req := s.bootstrapRegion
 		s.bootstrapRegion = nil
 		return req, nil
 	}
@@ -538,7 +538,8 @@ func (s *regionRequestWorkerSession) emitRegionEvent(subID SubscriptionID, event
 	s.pushRegionEvent(subID, event)
 }
 
-func (s *regionRequestWorkerSession) handleStopTask(region regionInfo) error {
+func (s *regionRequestWorkerSession) handleStopTask(request *regionReq) error {
+	region := request.regionInfo
 	subID := region.subscribedSpan.subID
 	req := &cdcpb.ChangeDataRequest{
 		Header:    s.requestHeader(),
@@ -548,29 +549,29 @@ func (s *regionRequestWorkerSession) handleStopTask(region regionInfo) error {
 		},
 		FilterLoop: region.filterLoop,
 	}
-	s.requestCache.markDone()
 	if err := s.sendRequest(req); err != nil {
 		return err
 	}
+	request.finish()
 	s.cancelSubscriptionStates(subID)
 	return nil
 }
 
-func (s *regionRequestWorkerSession) handleStoppedSubscription(region regionInfo) {
-	s.submitDirectFailure(newSubscriptionStoppedFailure(region))
-	s.requestCache.markDone()
+func (s *regionRequestWorkerSession) handleStoppedSubscription(request *regionReq) {
+	s.submitDirectFailure(newSubscriptionStoppedFailure(request.regionInfo))
+	request.finish()
 }
 
-func (s *regionRequestWorkerSession) handleActiveRegionRequest(regionReq regionReq) error {
-	region := regionReq.regionInfo
+func (s *regionRequestWorkerSession) handleActiveRegionRequest(request *regionReq) error {
+	region := request.regionInfo
 	subID := region.subscribedSpan.subID
-	state := s.newState(region)
+	state := s.newState(request)
 	state.start()
 	s.addRegionState(subID, region.verID.GetID(), state)
 
 	// Mark the request as sent before sending it to keep active-state tracking
-	// and request-cache accounting visible in the same order.
-	s.requestCache.markSent(regionReq)
+	// and request lifecycle tracking visible in the same order.
+	request.markSent()
 	s.markRegionSent(region, time.Now())
 	if err := s.sendRequest(s.createRegionRequest(region)); err != nil {
 		state.markStopped(newSendRequestToStoreFailure(region, regionFailureSourceWorkerSend, err))
@@ -579,28 +580,28 @@ func (s *regionRequestWorkerSession) handleActiveRegionRequest(regionReq regionR
 	return nil
 }
 
-func (s *regionRequestWorkerSession) handleRegionSendTask(regionReq regionReq) error {
-	region := regionReq.regionInfo
+func (s *regionRequestWorkerSession) handleRegionSendTask(request *regionReq) error {
+	region := request.regionInfo
 	switch {
 	case region.isStopped():
-		return s.handleStopTask(region)
+		return s.handleStopTask(request)
 	case region.subscribedSpan.stopped.Load():
-		s.handleStoppedSubscription(region)
+		s.handleStoppedSubscription(request)
 		return nil
 	default:
-		return s.handleActiveRegionRequest(regionReq)
+		return s.handleActiveRegionRequest(request)
 	}
 }
 
 // processRegionSendTask receives region requests and sends them to the remote store.
 func (s *regionRequestWorkerSession) processRegionSendTask(ctx context.Context) error {
 	for {
-		regionReq, err := s.nextRegionRequest(ctx)
+		request, err := s.nextRegionRequest(ctx)
 		if err != nil {
 			return err
 		}
 
-		region := regionReq.regionInfo
+		region := request.regionInfo
 		subID := region.subscribedSpan.subID
 		log.Debug("region request worker gets a singleRegionInfo",
 			zap.Uint64("workerID", s.workerID),
@@ -609,7 +610,7 @@ func (s *regionRequestWorkerSession) processRegionSendTask(ctx context.Context) 
 			zap.String("addr", s.storeAddr),
 			zap.Bool("bdrMode", region.filterLoop))
 
-		if err := s.handleRegionSendTask(regionReq); err != nil {
+		if err := s.handleRegionSendTask(request); err != nil {
 			return err
 		}
 	}
@@ -680,12 +681,5 @@ func (s *regionRequestWorkerSession) clearRegionStates() map[SubscriptionID]regi
 }
 
 func (s *regionRequestWorkerSession) takeNotStartedRegions() []regionInfo {
-	regions := s.requestCache.drainPendingQueue()
-	if s.bootstrapRegion == nil {
-		return regions
-	}
-	region := s.bootstrapRegion.regionInfo
-	s.bootstrapRegion = nil
-	s.requestCache.markDone()
-	return append([]regionInfo{region}, regions...)
+	return s.requestCache.takeUnsentRegions()
 }

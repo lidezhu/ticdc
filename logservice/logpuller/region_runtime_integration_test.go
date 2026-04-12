@@ -143,7 +143,7 @@ func TestHandleResolvedTsUpdatesRuntimeRegistry(t *testing.T) {
 		region,
 		uint64(subSpan.subID),
 		worker.workerID,
-		worker.requestCache,
+		nil,
 		client.regionRuntimeRegistry,
 		nil,
 	)

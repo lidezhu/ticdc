@@ -595,7 +595,6 @@ func (s *subscriptionClient) pendingRequestCount() int {
 	s.stores.Range(func(_, value any) bool {
 		store := value.(*requestedStore)
 		for _, worker := range store.snapshotWorkers() {
-			worker.requestCache.clearStaleRequest()
 			pendingRegionReqCount += worker.requestCache.getPendingCount()
 		}
 		return true

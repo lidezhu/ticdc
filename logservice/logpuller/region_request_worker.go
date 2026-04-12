@@ -174,8 +174,7 @@ func newRegionRequestWorker(
 	return worker
 }
 
-// add adds a region request to the worker's cache.
-// It blocks if the cache is full until there's space or ctx is cancelled.
+// add adds a region request to the worker window.
 func (s *regionRequestWorker) add(ctx context.Context, region regionInfo, force bool) (bool, error) {
 	ok, err := s.requestCache.add(ctx, region, force)
 	if ok && err == nil {
