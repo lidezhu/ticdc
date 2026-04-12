@@ -69,6 +69,23 @@ type regionFailureInfo struct {
 	err    error
 }
 
+type workerSessionFailure struct {
+	kind   regionFailureKind
+	source regionFailureSource
+	cause  error
+}
+
+func (f workerSessionFailure) toRegionFailure(region regionInfo) regionFailureInfo {
+	switch f.kind {
+	case regionFailureKindGetStore:
+		return newGetStoreFailure(region, f.source, f.cause)
+	case regionFailureKindSendRequestToStore:
+		return newSendRequestToStoreFailure(region, f.source, f.cause)
+	default:
+		return regionFailureInfo{}
+	}
+}
+
 func newRegionFailureInfo(
 	region regionInfo,
 	scope regionFailureScope,
@@ -143,6 +160,13 @@ func newSubscriptionStoppedFailure(region regionInfo) regionFailureInfo {
 		regionFailureKindSubscriptionStopped,
 		&subscriptionStoppedErr{},
 	)
+}
+
+func normalizeWorkerSessionFailure(region regionInfo, sessionFailure workerSessionFailure) regionFailureInfo {
+	if region.subscribedSpan != nil && region.subscribedSpan.stopped.Load() {
+		return newSubscriptionStoppedFailure(region)
+	}
+	return sessionFailure.toRegionFailure(region)
 }
 
 func normalizeRegionFailure(base error, cause error) error {

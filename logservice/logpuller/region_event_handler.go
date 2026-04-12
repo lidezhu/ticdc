@@ -233,7 +233,7 @@ func (h *regionEventHandler) OnDrop(event regionEvent) interface{} {
 }
 
 func (h *regionEventHandler) handleRegionError(state *regionFeedState) {
-	failure, removed := h.subClient.failures.submitOrderedFailure(state)
+	failure, removed := h.subClient.submitOrderedFailure(state)
 	if failure.err != nil {
 		log.Debug("region event handler get a region error",
 			zap.Uint64("workerID", state.workerID),

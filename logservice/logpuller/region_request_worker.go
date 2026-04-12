@@ -72,11 +72,12 @@ func (rs *requestedStore) snapshotWorkers() []*regionRequestWorker {
 type regionRequestWorker struct {
 	workerID uint64
 
-	pd              pd.Client
-	clusterID       uint64
-	failures        *failureHandler
-	pushRegionEvent func(SubscriptionID, regionEvent)
-	runtimeRegistry *regionRuntimeRegistry
+	pd                         pd.Client
+	clusterID                  uint64
+	pushRegionEvent            func(SubscriptionID, regionEvent)
+	runtimeRegistry            *regionRuntimeRegistry
+	submitDirectFailure        func(regionFailureInfo)
+	submitWorkerSessionFailure func(*regionRequestWorkerSession, []regionInfo, workerSessionFailure)
 
 	store *requestedStore
 
@@ -94,7 +95,7 @@ func (s *regionRequestWorker) markRegionEnqueued(region regionInfo, now time.Tim
 func (s *regionRequestWorker) handleSessionFailure(session *regionRequestWorkerSession, sessionFailure workerSessionFailure) {
 	// A store/session failure fans out into ordered failures for started regions
 	// and direct failures for requests that never became active states.
-	s.failures.submitWorkerSessionFailure(
+	s.submitWorkerSessionFailure(
 		session,
 		session.takeNotStartedRegions(),
 		sessionFailure,
@@ -113,7 +114,7 @@ func (s *regionRequestWorker) runNextSession(
 		s.clusterID,
 		s.requestCache,
 		s.runtimeRegistry,
-		s.failures,
+		s.submitDirectFailure,
 		s.pushRegionEvent,
 	)
 	result, err := session.run(ctx)
@@ -155,14 +156,15 @@ func newRegionRequestWorker(
 	requestCacheSize int,
 ) *regionRequestWorker {
 	worker := &regionRequestWorker{
-		workerID:        workerIDGen.Add(1),
-		pd:              client.pd,
-		clusterID:       client.clusterID,
-		failures:        client.failures,
-		pushRegionEvent: client.pushRegionEventToDS,
-		runtimeRegistry: client.regionRuntimeRegistry,
-		store:           store,
-		requestCache:    newRequestCache(requestCacheSize),
+		workerID:                   workerIDGen.Add(1),
+		pd:                         client.pd,
+		clusterID:                  client.clusterID,
+		pushRegionEvent:            client.pushRegionEventToDS,
+		runtimeRegistry:            client.regionRuntimeRegistry,
+		submitDirectFailure:        client.submitDirectFailure,
+		submitWorkerSessionFailure: client.submitWorkerSessionFailure,
+		store:                      store,
+		requestCache:               newRequestCache(requestCacheSize),
 	}
 
 	g.Go(func() error {

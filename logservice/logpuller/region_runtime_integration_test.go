@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/cdcpb"
 	"github.com/pingcap/kvproto/pkg/errorpb"
 	"github.com/pingcap/ticdc/heartbeatpb"
@@ -33,8 +34,8 @@ func TestScheduleRegionRequestUpdatesRuntimeRegistry(t *testing.T) {
 		regionRuntimeRegistry: newRegionRuntimeRegistry(),
 		pdClock:               pdutil.NewClock4Test(),
 		regionTaskQueue:       NewPriorityQueue(),
+		failureBuffer:         newFailureBuffer(),
 	}
-	client.failures = newFailureHandler(client)
 
 	rawSpan := heartbeatpb.TableSpan{
 		TableID:  1,
@@ -71,8 +72,8 @@ func TestScheduleRegionRequestUpdatesRuntimeRegistry(t *testing.T) {
 func TestOnRegionFailUpdatesRuntimeRegistry(t *testing.T) {
 	client := &subscriptionClient{
 		regionRuntimeRegistry: newRegionRuntimeRegistry(),
+		failureBuffer:         newFailureBuffer(),
 	}
-	client.failures = newFailureHandler(client)
 	client.ctx, client.cancel = context.WithCancel(context.Background())
 	defer client.cancel()
 
@@ -98,7 +99,7 @@ func TestOnRegionFailUpdatesRuntimeRegistry(t *testing.T) {
 	client.ensureRegionRuntime(&region, time.Now())
 	require.True(t, region.runtimeKey.isValid())
 
-	client.failures.submitDirectFailure(newSendRequestToStoreFailure(region, regionFailureSourceWorkerSession, nil))
+	client.submitDirectFailure(newSendRequestToStoreFailure(region, regionFailureSourceWorkerSession, nil))
 
 	state, ok := client.regionRuntimeRegistry.get(region.runtimeKey)
 	require.True(t, ok)
@@ -111,7 +112,6 @@ func TestHandleResolvedTsUpdatesRuntimeRegistry(t *testing.T) {
 	client := &subscriptionClient{
 		regionRuntimeRegistry: newRegionRuntimeRegistry(),
 	}
-	client.failures = newFailureHandler(client)
 	worker := &regionRequestWorker{runtimeRegistry: client.regionRuntimeRegistry}
 
 	rawSpan := heartbeatpb.TableSpan{
@@ -163,8 +163,8 @@ func TestDoHandleFailureMarksRetryPendingForRetryableRegionError(t *testing.T) {
 		regionRuntimeRegistry: newRegionRuntimeRegistry(),
 		pdClock:               pdutil.NewClock4Test(),
 		regionTaskQueue:       NewPriorityQueue(),
+		failureBuffer:         newFailureBuffer(),
 	}
-	client.failures = newFailureHandler(client)
 
 	rawSpan := heartbeatpb.TableSpan{
 		TableID:  1,
@@ -178,7 +178,7 @@ func TestDoHandleFailureMarksRetryPendingForRetryableRegionError(t *testing.T) {
 	region := newRegionInfo(tikv.NewRegionVerID(10, 1, 1), rawSpan, nil, subSpan, false)
 	client.ensureRegionRuntime(&region, time.Now())
 
-	err := client.failures.handleFailure(
+	err := client.handleFailure(
 		context.Background(),
 		newEventRegionFailure(region, &cdcpb.Error{ServerIsBusy: &errorpb.ServerIsBusy{Reason: "busy"}}),
 	)
@@ -195,8 +195,8 @@ func TestDoHandleFailureRemovesRuntimeForRangeReload(t *testing.T) {
 	client := &subscriptionClient{
 		regionRuntimeRegistry: newRegionRuntimeRegistry(),
 		rangeTaskCh:           make(chan rangeTask, 1),
+		failureBuffer:         newFailureBuffer(),
 	}
-	client.failures = newFailureHandler(client)
 
 	rawSpan := heartbeatpb.TableSpan{
 		TableID:  1,
@@ -210,7 +210,7 @@ func TestDoHandleFailureRemovesRuntimeForRangeReload(t *testing.T) {
 	region := newRegionInfo(tikv.NewRegionVerID(10, 1, 1), rawSpan, nil, subSpan, false)
 	client.ensureRegionRuntime(&region, time.Now())
 
-	err := client.failures.handleFailure(context.Background(), newRPCCtxUnavailableFailure(region))
+	err := client.handleFailure(context.Background(), newRPCCtxUnavailableFailure(region))
 	require.NoError(t, err)
 
 	_, ok := client.regionRuntimeRegistry.get(region.runtimeKey)
@@ -228,8 +228,8 @@ func TestDoHandleFailureRemovesRuntimeForRangeReload(t *testing.T) {
 func TestDoHandleFailureRemovesRuntimeForCancelledRequest(t *testing.T) {
 	client := &subscriptionClient{
 		regionRuntimeRegistry: newRegionRuntimeRegistry(),
+		failureBuffer:         newFailureBuffer(),
 	}
-	client.failures = newFailureHandler(client)
 
 	rawSpan := heartbeatpb.TableSpan{
 		TableID:  1,
@@ -243,7 +243,7 @@ func TestDoHandleFailureRemovesRuntimeForCancelledRequest(t *testing.T) {
 	region := newRegionInfo(tikv.NewRegionVerID(10, 1, 1), rawSpan, nil, subSpan, false)
 	client.ensureRegionRuntime(&region, time.Now())
 
-	err := client.failures.handleFailure(
+	err := client.handleFailure(
 		context.Background(),
 		newRequestCancelledFailure(region, regionFailureSourceDeregister),
 	)
@@ -256,8 +256,8 @@ func TestDoHandleFailureRemovesRuntimeForCancelledRequest(t *testing.T) {
 func TestDoHandleFailureRemovesRuntimeForStoppedSubscription(t *testing.T) {
 	client := &subscriptionClient{
 		regionRuntimeRegistry: newRegionRuntimeRegistry(),
+		failureBuffer:         newFailureBuffer(),
 	}
-	client.failures = newFailureHandler(client)
 
 	rawSpan := heartbeatpb.TableSpan{
 		TableID:  1,
@@ -271,9 +271,39 @@ func TestDoHandleFailureRemovesRuntimeForStoppedSubscription(t *testing.T) {
 	region := newRegionInfo(tikv.NewRegionVerID(10, 1, 1), rawSpan, nil, subSpan, false)
 	client.ensureRegionRuntime(&region, time.Now())
 
-	err := client.failures.handleFailure(context.Background(), newSubscriptionStoppedFailure(region))
+	err := client.handleFailure(context.Background(), newSubscriptionStoppedFailure(region))
 	require.NoError(t, err)
 
 	_, ok := client.regionRuntimeRegistry.get(region.runtimeKey)
 	require.False(t, ok)
+}
+
+func TestNormalizeWorkerSessionFailureForStoppedSubscription(t *testing.T) {
+	region := prepareRegionForSendTest(createTestRegionInfo(1, 1))
+	region.subscribedSpan.stopped.Store(true)
+
+	failure := normalizeWorkerSessionFailure(region, workerSessionFailure{
+		kind:   regionFailureKindSendRequestToStore,
+		source: regionFailureSourceWorkerSession,
+		cause:  errors.New("store down"),
+	})
+
+	require.Equal(t, regionFailureKindSubscriptionStopped, failure.kind)
+	require.Equal(t, regionFailureScopeSubscription, failure.scope)
+	require.Equal(t, regionFailureSourceSubscriptionStop, failure.source)
+}
+
+func TestNormalizeWorkerSessionFailureForActiveSubscription(t *testing.T) {
+	region := prepareRegionForSendTest(createTestRegionInfo(1, 1))
+
+	failure := normalizeWorkerSessionFailure(region, workerSessionFailure{
+		kind:   regionFailureKindSendRequestToStore,
+		source: regionFailureSourceWorkerSession,
+		cause:  errors.New("store down"),
+	})
+
+	require.Equal(t, regionFailureKindSendRequestToStore, failure.kind)
+	require.Equal(t, regionFailureScopeStoreSession, failure.scope)
+	require.Equal(t, regionFailureSourceWorkerSession, failure.source)
+	require.ErrorContains(t, failure.err, "store down")
 }

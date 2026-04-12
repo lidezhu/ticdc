@@ -49,15 +49,15 @@ var errWorkerSessionReconnect = errors.New("worker session reconnect")
 // regionRequestWorkerSession owns one grpc stream session to one TiKV store.
 // It is responsible for grpc send/recv, active region states and bootstrap request handling.
 type regionRequestWorkerSession struct {
-	workerID        uint64
-	storeAddr       string
-	pd              pd.Client
-	credential      *security.Credential
-	clusterID       uint64
-	requestCache    *requestCache
-	runtimeRegistry *regionRuntimeRegistry
-	failures        *failureHandler
-	pushRegionEvent func(SubscriptionID, regionEvent)
+	workerID            uint64
+	storeAddr           string
+	pd                  pd.Client
+	credential          *security.Credential
+	clusterID           uint64
+	requestCache        *requestCache
+	runtimeRegistry     *regionRuntimeRegistry
+	submitDirectFailure func(regionFailureInfo)
+	pushRegionEvent     func(SubscriptionID, regionEvent)
 
 	conn            *ConnAndClient
 	bootstrapRegion *regionReq
@@ -76,19 +76,19 @@ func newRegionRequestWorkerSession(
 	clusterID uint64,
 	requestCache *requestCache,
 	runtimeRegistry *regionRuntimeRegistry,
-	failures *failureHandler,
+	submitDirectFailure func(regionFailureInfo),
 	pushRegionEvent func(SubscriptionID, regionEvent),
 ) *regionRequestWorkerSession {
 	session := &regionRequestWorkerSession{
-		workerID:        workerID,
-		storeAddr:       storeAddr,
-		pd:              pd,
-		credential:      credential,
-		clusterID:       clusterID,
-		requestCache:    requestCache,
-		runtimeRegistry: runtimeRegistry,
-		failures:        failures,
-		pushRegionEvent: pushRegionEvent,
+		workerID:            workerID,
+		storeAddr:           storeAddr,
+		pd:                  pd,
+		credential:          credential,
+		clusterID:           clusterID,
+		requestCache:        requestCache,
+		runtimeRegistry:     runtimeRegistry,
+		submitDirectFailure: submitDirectFailure,
+		pushRegionEvent:     pushRegionEvent,
 	}
 	session.requestedRegions.subscriptions = make(map[SubscriptionID]regionFeedStates)
 	return session
@@ -540,7 +540,7 @@ func (s *regionRequestWorkerSession) handleStopTask(region regionInfo) error {
 }
 
 func (s *regionRequestWorkerSession) handleStoppedSubscription(region regionInfo) {
-	s.failures.submitDirectFailure(newSubscriptionStoppedFailure(region))
+	s.submitDirectFailure(newSubscriptionStoppedFailure(region))
 	s.requestCache.markDone()
 }
 
