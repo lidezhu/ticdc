@@ -15,6 +15,7 @@ package logpuller
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -26,6 +27,45 @@ import (
 
 // To generate a workerID in `newRegionRequestWorker`.
 var workerIDGen atomic.Uint64
+
+// requestedStore groups region request workers that share one TiKV address.
+type requestedStore struct {
+	storeAddr string
+	// Use to select a worker to send request.
+	nextWorker atomic.Uint32
+
+	requestWorkers struct {
+		sync.RWMutex
+		s []*regionRequestWorker
+	}
+}
+
+func newRequestedStore(storeAddr string) *requestedStore {
+	return &requestedStore{storeAddr: storeAddr}
+}
+
+func (rs *requestedStore) addWorker(worker *regionRequestWorker) {
+	rs.requestWorkers.Lock()
+	defer rs.requestWorkers.Unlock()
+	rs.requestWorkers.s = append(rs.requestWorkers.s, worker)
+}
+
+func (rs *requestedStore) getRequestWorker() *regionRequestWorker {
+	rs.requestWorkers.RLock()
+	defer rs.requestWorkers.RUnlock()
+
+	index := rs.nextWorker.Add(1) % uint32(len(rs.requestWorkers.s))
+	return rs.requestWorkers.s[index]
+}
+
+func (rs *requestedStore) snapshotWorkers() []*regionRequestWorker {
+	rs.requestWorkers.RLock()
+	defer rs.requestWorkers.RUnlock()
+
+	workers := make([]*regionRequestWorker, len(rs.requestWorkers.s))
+	copy(workers, rs.requestWorkers.s)
+	return workers
+}
 
 // regionRequestWorker is responsible for sending region requests to a specific TiKV store.
 // It owns the long-lived request cache and reconnection loop.
