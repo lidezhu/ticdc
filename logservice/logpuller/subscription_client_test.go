@@ -73,7 +73,7 @@ func TestGenerateResolveLockTask(t *testing.T) {
 	// Lock another range, no task will be triggered before initialized.
 	res = span.rangeLock.LockRange(context.Background(), []byte{'c'}, []byte{'d'}, 2, 100)
 	require.Equal(t, regionlock.LockRangeStatusSuccess, res.Status)
-	state := newRegionFeedState(regionInfo{lockedRangeState: res.LockedRangeState, subscribedSpan: span}, 1, worker)
+	state := newRegionFeedState(regionInfo{lockedRangeState: res.LockedRangeState, subscribedSpan: span}, 1, 0, worker.requestCache, nil, nil)
 	span.resolveStaleLocks(200)
 	select {
 	case task := <-client.resolveLockTaskCh:
@@ -250,7 +250,7 @@ func TestEnqueueRegionToAllStoresRetryWhenCacheFull(t *testing.T) {
 	worker := &regionRequestWorker{
 		requestCache: newRequestCache(1),
 	}
-	store := &requestedStore{storeAddr: "store-1"}
+	store := newRequestedStore("store-1")
 	store.requestWorkers.s = []*regionRequestWorker{worker}
 	client.stores.Store(store.storeAddr, store)
 
@@ -381,18 +381,16 @@ func TestSubscriptionWithFailedTiKV(t *testing.T) {
 	}
 }
 
-// TestErrCacheDispatchWithFullChannelAndCanceledContext tests that when errCh is full
-// and context is canceled, the dispatch method doesn't get stuck.
-func TestErrCacheDispatchWithFullChannelAndCanceledContext(t *testing.T) {
-	// Create errCache with a small errCh to easily fill it up
-	errCache := &errCache{
-		cache:  make([]regionErrorInfo, 0, 10),
-		errCh:  make(chan regionErrorInfo, 2), // Small buffer to easily fill
-		notify: make(chan struct{}, 10),
+// TestFailureBufferRunWithFullChannelAndCanceledContext tests that when the
+// dispatch channel is full and context is canceled, the failure buffer exits.
+func TestFailureBufferRunWithFullChannelAndCanceledContext(t *testing.T) {
+	failureBuffer := &failureBuffer{
+		pending: make([]regionFailureInfo, 0, 10),
+		ch:      make(chan regionFailureInfo, 2), // Small buffer to easily fill
+		notify:  make(chan struct{}, 10),
 	}
 
-	// Create a mock regionErrorInfo
-	mockErrInfo := regionErrorInfo{
+	mockFailure := regionFailureInfo{
 		regionInfo: regionInfo{
 			verID: tikv.NewRegionVerID(1, 1, 1),
 			span:  heartbeatpb.TableSpan{TableID: 1, StartKey: []byte("a"), EndKey: []byte("b")},
@@ -400,41 +398,29 @@ func TestErrCacheDispatchWithFullChannelAndCanceledContext(t *testing.T) {
 		err: errors.New("test error"),
 	}
 
-	// Fill up the errCh channel to make it full
-	errCache.errCh <- mockErrInfo
-	errCache.errCh <- mockErrInfo
+	failureBuffer.ch <- mockFailure
+	failureBuffer.ch <- mockFailure
 
-	// Add some errors to the cache
 	for i := 0; i < 5; i++ {
-		errCache.add(mockErrInfo)
+		failureBuffer.enqueue(mockFailure)
 	}
 
-	// Create a context that will be canceled
 	ctx, cancel := context.WithCancel(context.Background())
-
-	// Channel to signal when dispatch returns
 	dispatchDone := make(chan error, 1)
 
-	// Start dispatch in a goroutine
 	go func() {
-		err := errCache.dispatch(ctx)
+		err := failureBuffer.run(ctx)
 		dispatchDone <- err
 	}()
 
-	// Give dispatch some time to start and potentially get stuck
 	time.Sleep(50 * time.Millisecond)
-
-	// Cancel the context
 	cancel()
 
-	// Wait for dispatch to return with a timeout
 	select {
 	case err := <-dispatchDone:
-		// Verify that dispatch returned with context.Canceled error
 		require.Equal(t, context.Canceled, err)
 	case <-time.After(5 * time.Second):
-		// If we timeout here, it means dispatch is stuck
-		t.Fatal("dispatch method is stuck and didn't return after context cancellation")
+		t.Fatal("failure buffer run is stuck and didn't return after context cancellation")
 	}
 }
 

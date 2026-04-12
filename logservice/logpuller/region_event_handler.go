@@ -212,7 +212,7 @@ func (h *regionEventHandler) GetType(event regionEvent) dynstream.EventType {
 	log.Panic("unknown event type",
 		zap.Uint64("regionID", state.getRegionID()),
 		zap.Uint64("requestID", state.requestID),
-		zap.Uint64("workerID", state.worker.workerID))
+		zap.Uint64("workerID", state.workerID))
 	return dynstream.DefaultEventType
 }
 
@@ -226,27 +226,24 @@ func (h *regionEventHandler) OnDrop(event regionEvent) interface{} {
 		zap.Uint64("regionID", state.getRegionID()),
 		zap.Uint64("requestID", state.requestID),
 		zap.Bool("stateIsStale", state.isStale()),
-		zap.Uint64("workerID", state.worker.workerID),
+		zap.Uint64("workerID", state.workerID),
 	}
 	log.Warn("drop region event", fields...)
 	return nil
 }
 
 func (h *regionEventHandler) handleRegionError(state *regionFeedState) {
-	stepsToRemoved := state.markRemoved()
-	err := state.takeError()
-	worker := state.worker
-	if err != nil {
+	failure, removed := h.subClient.submitOrderedFailure(state)
+	if failure.err != nil {
 		log.Debug("region event handler get a region error",
-			zap.Uint64("workerID", worker.workerID),
+			zap.Uint64("workerID", state.workerID),
 			zap.Uint64("subscriptionID", uint64(state.region.subscribedSpan.subID)),
 			zap.Uint64("regionID", state.region.verID.GetID()),
-			zap.Bool("reschedule", stepsToRemoved),
-			zap.Error(err))
-	}
-	if stepsToRemoved {
-		worker.takeRegionState(SubscriptionID(state.requestID), state.getRegionID())
-		h.subClient.onRegionFail(newRegionErrorInfo(state.getRegionInfo(), err))
+			zap.Stringer("failureScope", failure.scope),
+			zap.Stringer("failureSource", failure.source),
+			zap.Stringer("failureKind", failure.kind),
+			zap.Bool("reschedule", removed),
+			zap.Error(failure.err))
 	}
 }
 
