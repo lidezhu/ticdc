@@ -220,7 +220,32 @@ func (h *failureHandler) reloadRegionRange(ctx context.Context, failure regionFa
 	h.client.scheduleRangeRequest(ctx, failure.span, failure.subscribedSpan, failure.filterLoop, TaskHighPrior)
 }
 
-func (h *failureHandler) planEventFailure(failure regionFailureInfo) (recoveryPlan, error) {
+func (h *failureHandler) planFailure(ctx context.Context, failure regionFailureInfo) (recoveryPlan, error) {
+	switch failure.scope {
+	case regionFailureScopeRegion:
+		return h.planRegionFailure(failure)
+	case regionFailureScopeStoreSession:
+		return h.planStoreSessionFailure(ctx, failure)
+	case regionFailureScopeSubscription:
+		return h.planSubscriptionFailure(failure)
+	default:
+		return recoveryPlan{}, errors.New("unknown failure scope")
+	}
+}
+
+func (h *failureHandler) planRegionFailure(failure regionFailureInfo) (recoveryPlan, error) {
+	switch failure.kind {
+	case regionFailureKindTiKVEvent:
+		return h.planTiKVEventFailure(failure)
+	case regionFailureKindRPCCtxUnavailable:
+		metricFeedRPCCtxUnavailable.Inc()
+		return recoveryPlan{action: recoveryActionReloadRange}, nil
+	default:
+		return recoveryPlan{}, errors.New("unexpected region failure kind")
+	}
+}
+
+func (h *failureHandler) planTiKVEventFailure(failure regionFailureInfo) (recoveryPlan, error) {
 	eerr, ok := failure.err.(*eventError)
 	if !ok || eerr == nil {
 		return recoveryPlan{}, errors.New("invalid tikv event failure")
@@ -268,13 +293,11 @@ func (h *failureHandler) planEventFailure(failure regionFailureInfo) (recoveryPl
 	return recoveryPlan{action: recoveryActionRetryRegion, priority: TaskHighPrior}, nil
 }
 
-func (h *failureHandler) planFailure(ctx context.Context, failure regionFailureInfo) (recoveryPlan, error) {
+func (h *failureHandler) planStoreSessionFailure(
+	ctx context.Context,
+	failure regionFailureInfo,
+) (recoveryPlan, error) {
 	switch failure.kind {
-	case regionFailureKindTiKVEvent:
-		return h.planEventFailure(failure)
-	case regionFailureKindRPCCtxUnavailable:
-		metricFeedRPCCtxUnavailable.Inc()
-		return recoveryPlan{action: recoveryActionReloadRange}, nil
 	case regionFailureKindGetStore:
 		metricGetStoreErr.Inc()
 		if h.client.regionCache != nil {
@@ -289,10 +312,17 @@ func (h *failureHandler) planFailure(ctx context.Context, failure regionFailureI
 			h.client.regionCache.OnSendFail(bo, failure.rpcCtx, regionScheduleReload, errors.Cause(failure.err))
 		}
 		return recoveryPlan{action: recoveryActionRetryRegion, priority: TaskHighPrior}, nil
+	default:
+		return recoveryPlan{}, errors.New("unexpected store session failure kind")
+	}
+}
+
+func (h *failureHandler) planSubscriptionFailure(failure regionFailureInfo) (recoveryPlan, error) {
+	switch failure.kind {
 	case regionFailureKindRequestCancelled, regionFailureKindSubscriptionStopped:
 		return recoveryPlan{action: recoveryActionRemoveRegion}, nil
 	default:
-		return recoveryPlan{}, failure.err
+		return recoveryPlan{}, errors.New("unexpected subscription failure kind")
 	}
 }
 

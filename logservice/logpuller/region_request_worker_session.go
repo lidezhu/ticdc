@@ -39,6 +39,13 @@ type sessionRunResult struct {
 	canceled bool
 }
 
+type sessionLoopExit struct {
+	source regionFailureSource
+	err    error
+}
+
+var errWorkerSessionReconnect = errors.New("worker session reconnect")
+
 // regionRequestWorkerSession owns one grpc stream session to one TiKV store.
 // It is responsible for grpc send/recv, active region states and bootstrap request handling.
 type regionRequestWorkerSession struct {
@@ -114,6 +121,52 @@ func isCanceledByContext(ctx context.Context, err error) bool {
 	return false
 }
 
+func (s *regionRequestWorkerSession) startLoop(
+	g *errgroup.Group,
+	cancel context.CancelFunc,
+	exitCh chan<- sessionLoopExit,
+	source regionFailureSource,
+	run func() error,
+) {
+	g.Go(func() error {
+		err := run()
+		exitCh <- sessionLoopExit{source: source, err: err}
+		cancel()
+		return err
+	})
+}
+
+// pickPrimaryLoopExit chooses the session exit reason.
+//
+// errgroup.Wait only gives one non-nil error. That is not enough here because
+// one loop can stop first and cancel the session, then the other loop returns
+// context.Canceled as a follow-up effect.
+//
+// Example:
+// 1. recv gets EOF, so this session should reconnect
+// 2. recv exit cancels the session context
+// 3. send then returns context.Canceled
+//
+// If we only use waitErr, we may report canceled instead of reconnect.
+func pickPrimaryLoopExit(
+	ctx context.Context,
+	exits []sessionLoopExit,
+	waitErr error,
+) sessionLoopExit {
+	for _, exit := range exits {
+		if exit.err != nil && !isCanceledByContext(ctx, exit.err) {
+			return exit
+		}
+	}
+	if waitErr != nil && !isCanceledByContext(ctx, waitErr) {
+		return sessionLoopExit{source: regionFailureSourceWorkerSession, err: waitErr}
+	}
+	if len(exits) == 0 {
+		return sessionLoopExit{source: regionFailureSourceWorkerSession, err: waitErr}
+	}
+	return exits[0]
+}
+
 func (s *regionRequestWorkerSession) run(ctx context.Context) (sessionRunResult, error) {
 	bootstrapRegion, err := s.waitBootstrapRegion(ctx)
 	if err != nil {
@@ -150,11 +203,6 @@ func (s *regionRequestWorkerSession) run(ctx context.Context) (sessionRunResult,
 func (s *regionRequestWorkerSession) runConnectedLoops(
 	ctx context.Context,
 ) (sessionRunResult, error) {
-	type loopExit struct {
-		source regionFailureSource
-		err    error
-	}
-
 	defer s.close()
 	defer func() {
 		log.Info("region request worker session exits",
@@ -167,22 +215,18 @@ func (s *regionRequestWorkerSession) runConnectedLoops(
 	defer cancel()
 
 	g, gctx := errgroup.WithContext(loopCtx)
-	exitCh := make(chan loopExit, 3)
-	g.Go(func() error {
-		err := s.receiveAndDispatchChangeEvents()
-		exitCh <- loopExit{source: regionFailureSourceWorkerRecv, err: err}
-		cancel()
-		return err
+	loopCount := 2
+	exitCh := make(chan sessionLoopExit, 3)
+	s.startLoop(g, cancel, exitCh, regionFailureSourceWorkerRecv, func() error {
+		return s.receiveAndDispatchChangeEvents(ctx)
 	})
-	g.Go(func() error {
-		err := s.processRegionSendTask(gctx)
-		exitCh <- loopExit{source: regionFailureSourceWorkerSend, err: err}
-		cancel()
-		return err
+	s.startLoop(g, cancel, exitCh, regionFailureSourceWorkerSend, func() error {
+		return s.processRegionSendTask(gctx)
 	})
 
 	failpoint.Inject("InjectForceReconnect", func() {
-		g.Go(func() error {
+		loopCount++
+		s.startLoop(g, cancel, exitCh, regionFailureSourceWorkerSession, func() error {
 			timer := time.NewTimer(10 * time.Second)
 			defer timer.Stop()
 
@@ -194,25 +238,18 @@ func (s *regionRequestWorkerSession) runConnectedLoops(
 
 			err := errors.New("inject force reconnect")
 			log.Info("inject force reconnect", zap.Error(err))
-			exitCh <- loopExit{source: regionFailureSourceWorkerSession, err: err}
-			cancel()
 			return err
 		})
 	})
 
-	exit := <-exitCh
 	waitErr := g.Wait()
-	if exit.err == nil || isCanceledByContext(ctx, exit.err) {
-		for remaining := len(exitCh); remaining > 0; remaining-- {
-			candidate := <-exitCh
-			if candidate.err != nil && !isCanceledByContext(ctx, candidate.err) {
-				exit = candidate
-				break
-			}
-		}
+	exits := make([]sessionLoopExit, 0, loopCount)
+	for i := 0; i < loopCount; i++ {
+		exits = append(exits, <-exitCh)
 	}
-	if exit.err == nil && waitErr != nil && !isCanceledByContext(ctx, waitErr) {
-		exit = loopExit{source: regionFailureSourceWorkerSession, err: waitErr}
+	exit := pickPrimaryLoopExit(ctx, exits, waitErr)
+	if errors.Cause(exit.err) == errWorkerSessionReconnect {
+		exit.err = nil
 	}
 	if isCanceledByContext(ctx, exit.err) {
 		return sessionRunResult{canceled: true}, nil
@@ -309,7 +346,7 @@ func (s *regionRequestWorkerSession) newState(region regionInfo) *regionFeedStat
 }
 
 // receiveAndDispatchChangeEvents receives events from the grpc stream and dispatches them to ds.
-func (s *regionRequestWorkerSession) receiveAndDispatchChangeEvents() error {
+func (s *regionRequestWorkerSession) receiveAndDispatchChangeEvents(ctx context.Context) error {
 	for {
 		changeEvent, err := s.conn.Client.Recv()
 		if err != nil {
@@ -318,8 +355,11 @@ func (s *regionRequestWorkerSession) receiveAndDispatchChangeEvents() error {
 				zap.String("addr", s.storeAddr),
 				zap.String("code", grpcstatus.Code(err).String()),
 				zap.Error(err))
+			if ctx.Err() != nil && isCanceledByContext(ctx, err) {
+				return err
+			}
 			if StatusIsEOF(grpcstatus.Convert(err)) {
-				return nil
+				return errWorkerSessionReconnect
 			}
 			return errors.Trace(err)
 		}

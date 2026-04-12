@@ -101,10 +101,11 @@ func (s *regionRequestWorker) handleSessionFailure(session *regionRequestWorkerS
 	)
 }
 
-func (s *regionRequestWorker) newWorkerSession(
+func (s *regionRequestWorker) runNextSession(
+	ctx context.Context,
 	credential *security.Credential,
-) *regionRequestWorkerSession {
-	return newRegionRequestWorkerSession(
+) (*regionRequestWorkerSession, workerSessionFailure, bool, error) {
+	session := newRegionRequestWorkerSession(
 		s.workerID,
 		s.store.storeAddr,
 		s.pd,
@@ -115,13 +116,6 @@ func (s *regionRequestWorker) newWorkerSession(
 		s.failures,
 		s.pushRegionEvent,
 	)
-}
-
-func (s *regionRequestWorker) runNextSession(
-	ctx context.Context,
-	credential *security.Credential,
-) (*regionRequestWorkerSession, workerSessionFailure, bool, error) {
-	session := s.newWorkerSession(credential)
 	result, err := session.run(ctx)
 	if err != nil {
 		return nil, workerSessionFailure{}, false, err

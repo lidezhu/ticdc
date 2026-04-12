@@ -15,6 +15,7 @@ package logpuller
 
 import (
 	"context"
+	"io"
 	"testing"
 
 	"github.com/pingcap/errors"
@@ -168,6 +169,63 @@ func TestRunConnectedLoopsReturnsReceiveFailure(t *testing.T) {
 	require.Equal(t, regionFailureKindSendRequestToStore, result.failure.kind)
 	require.Equal(t, regionFailureSourceWorkerRecv, result.failure.source)
 	require.ErrorIs(t, result.failure.cause, recvErr)
+}
+
+func TestRunConnectedLoopsTreatsEOFAsReconnect(t *testing.T) {
+	session := newRegionRequestWorkerSession(
+		1,
+		"store-1",
+		nil,
+		nil,
+		0,
+		newRequestCache(1),
+		newRegionRuntimeRegistry(),
+		nil,
+		func(SubscriptionID, regionEvent) {},
+	)
+	session.conn = &ConnAndClient{
+		Client: &mockEventFeedV2Client{recvErr: io.EOF},
+	}
+
+	result, err := session.runConnectedLoops(context.Background())
+	require.NoError(t, err)
+	require.False(t, result.canceled)
+	require.Equal(t, regionFailureKindSendRequestToStore, result.failure.kind)
+	require.Equal(t, regionFailureSourceWorkerRecv, result.failure.source)
+	require.NoError(t, result.failure.cause)
+}
+
+func TestRunConnectedLoopsPrefersSendFailureOverLoopCancellation(t *testing.T) {
+	requestCache := newRequestCache(10)
+	region := prepareRegionForSendTest(createTestRegionInfo(1, 1))
+	req := newRegionReq(region)
+
+	session := newRegionRequestWorkerSession(
+		1,
+		"store-1",
+		nil,
+		nil,
+		0,
+		requestCache,
+		newRegionRuntimeRegistry(),
+		nil,
+		func(SubscriptionID, regionEvent) {},
+	)
+	session.bootstrapRegion = &req
+	sendErr := errors.New("send failed")
+	session.conn = &ConnAndClient{
+		Client: &mockEventFeedV2Client{
+			sendErr: sendErr,
+			recvErr: context.Canceled,
+		},
+	}
+
+	result, err := session.runConnectedLoops(context.Background())
+	require.NoError(t, err)
+	require.False(t, result.canceled)
+	require.Equal(t, regionFailureKindSendRequestToStore, result.failure.kind)
+	require.Equal(t, regionFailureSourceWorkerSend, result.failure.source)
+	require.ErrorIs(t, result.failure.cause, sendErr)
 }
 
 type pushedResolvedEvent struct {
