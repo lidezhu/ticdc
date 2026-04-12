@@ -70,11 +70,10 @@ func TestGenerateResolveLockTask(t *testing.T) {
 	worker := &regionRequestWorker{
 		requestCache: &requestCache{},
 	}
-	controller := newRegionStateController(0, "", nil, worker.requestCache, nil)
 	// Lock another range, no task will be triggered before initialized.
 	res = span.rangeLock.LockRange(context.Background(), []byte{'c'}, []byte{'d'}, 2, 100)
 	require.Equal(t, regionlock.LockRangeStatusSuccess, res.Status)
-	state := newRegionFeedState(regionInfo{lockedRangeState: res.LockedRangeState, subscribedSpan: span}, 1, controller)
+	state := newRegionFeedState(regionInfo{lockedRangeState: res.LockedRangeState, subscribedSpan: span}, 1, 0, worker.requestCache, nil, nil)
 	span.resolveStaleLocks(200)
 	select {
 	case task := <-client.resolveLockTaskCh:

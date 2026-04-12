@@ -230,7 +230,7 @@ func (r *regionRequestRouter) routeActiveRegionTask(
 		return nil
 	}
 	r.client.updateRegionRuntimeInfo(region)
-	r.client.markRegionRuntimeRPCReady(region, time.Now())
+	r.client.markRegionRPCReady(region, time.Now())
 
 	store := r.getOrCreateRequestedStore(ctx, eg, region.rpcCtx.Addr)
 	worker := store.getRequestWorker()
@@ -411,7 +411,7 @@ func (r *regionRequestRouter) scheduleRegionRequest(ctx context.Context, region 
 	switch lockRangeResult.Status {
 	case regionlock.LockRangeStatusSuccess:
 		region.lockedRangeState = lockRangeResult.LockedRangeState
-		r.client.markRegionRuntimeQueued(region, lockRangeResult.LockedRangeState.Created, time.Now())
+		r.client.markRegionQueued(region, lockRangeResult.LockedRangeState.Created, time.Now())
 		r.regionTaskQueue.Push(NewRegionPriorityTask(priority, region, r.client.pdClock.CurrentTS()))
 	case regionlock.LockRangeStatusStale:
 		r.client.removeRegionRuntime(region, time.Now())

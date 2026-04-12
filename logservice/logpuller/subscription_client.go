@@ -31,7 +31,6 @@ import (
 	"github.com/pingcap/ticdc/pkg/spanz"
 	"github.com/pingcap/ticdc/pkg/util"
 	"github.com/pingcap/ticdc/utils/dynstream"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/tikv/client-go/v2/oracle"
 	"github.com/tikv/client-go/v2/tikv"
 	pd "github.com/tikv/pd/client"
@@ -68,6 +67,7 @@ var (
 	metricStoreSendRequestErr         = metrics.EventFeedErrorCounter.WithLabelValues("SendRequestToStore")
 	metricKvIsBusyCounter             = metrics.EventFeedErrorCounter.WithLabelValues("KvIsBusy")
 	metricKvCongestedCounter          = metrics.EventFeedErrorCounter.WithLabelValues("KvCongested")
+	metricBatchResolvedEventSize      = metrics.BatchResolvedEventSize.WithLabelValues("event-store")
 
 	metricSubscriptionClientDSChannelSize     = metrics.DynamicStreamEventChanSize.WithLabelValues("event-store")
 	metricSubscriptionClientDSPendingQueueLen = metrics.DynamicStreamPendingQueueLen.WithLabelValues("event-store")
@@ -153,10 +153,6 @@ type SubscriptionClientConfig struct {
 	RegionRequestWorkerPerStore uint
 }
 
-type sharedClientMetrics struct {
-	batchResolvedSize prometheus.Observer
-}
-
 // subscriptionClient is used to subscribe events of table ranges from TiKV.
 // All exported Methods are thread-safe.
 type SubscriptionClient interface {
@@ -181,7 +177,6 @@ type subscriptionClient struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	config    *SubscriptionClientConfig
-	metrics   sharedClientMetrics
 	clusterID uint64
 
 	regionRuntimeRegistry *regionRuntimeRegistry
@@ -257,14 +252,14 @@ func (s *subscriptionClient) markRegionRetryPending(region regionInfo, err error
 	s.regionRuntimeRegistry.markRetryPending(region.runtimeKey, err, now)
 }
 
-func (s *subscriptionClient) markRegionRuntimeRPCReady(region regionInfo, now time.Time) {
+func (s *subscriptionClient) markRegionRPCReady(region regionInfo, now time.Time) {
 	if s.regionRuntimeRegistry == nil || !region.runtimeKey.isValid() {
 		return
 	}
 	s.regionRuntimeRegistry.markRPCReady(region.runtimeKey, now)
 }
 
-func (s *subscriptionClient) markRegionRuntimeQueued(region regionInfo, acquiredTime, queuedTime time.Time) {
+func (s *subscriptionClient) markRegionQueued(region regionInfo, acquiredTime, queuedTime time.Time) {
 	if s.regionRuntimeRegistry == nil || !region.runtimeKey.isValid() {
 		return
 	}
@@ -341,8 +336,6 @@ func NewSubscriptionClient(
 	subClient.ds = ds
 	subClient.cond = sync.NewCond(&subClient.mu)
 	subClient.failures = newFailureHandler(subClient)
-
-	subClient.initMetrics()
 	return subClient
 }
 
@@ -360,11 +353,6 @@ func (s *subscriptionClient) Name() string {
 // AllocsubscriptionID gets an ID can be used in `Subscribe`.
 func (s *subscriptionClient) AllocSubscriptionID() SubscriptionID {
 	return SubscriptionID(subscriptionIDGen.Add(1))
-}
-
-func (s *subscriptionClient) initMetrics() {
-	// TODO: fix metrics
-	s.metrics.batchResolvedSize = metrics.BatchResolvedEventSize.WithLabelValues("event-store")
 }
 
 func (s *subscriptionClient) updateMetrics(ctx context.Context) error {

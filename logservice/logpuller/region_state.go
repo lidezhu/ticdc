@@ -82,6 +82,11 @@ type regionFeedState struct {
 	region    regionInfo
 	requestID uint64 // It is also the subscription ID
 	matcher   *matcher
+	workerID  uint64
+
+	requestCache    *requestCache
+	runtimeRegistry *regionRuntimeRegistry
+	takeState       func(SubscriptionID, uint64) *regionFeedState
 
 	// Transform: normal -> stopped -> removed.
 	// normal: the region is in replicating.
@@ -93,23 +98,38 @@ type regionFeedState struct {
 		v uint32
 		// The failure is normalized before entering region state, so all stale-event
 		// paths and direct failure paths converge on the same recovery model.
-		failure    regionFailureInfo
-		hasFailure bool
+		failure regionFailureInfo
 	}
-
-	controller *regionStateController
 }
 
-func newRegionFeedState(region regionInfo, requestID uint64, controller *regionStateController) *regionFeedState {
+func newRegionFeedState(
+	region regionInfo,
+	requestID uint64,
+	workerID uint64,
+	requestCache *requestCache,
+	runtimeRegistry *regionRuntimeRegistry,
+	takeState func(SubscriptionID, uint64) *regionFeedState,
+) *regionFeedState {
 	return &regionFeedState{
-		region:     region,
-		requestID:  requestID,
-		controller: controller,
+		region:          region,
+		requestID:       requestID,
+		workerID:        workerID,
+		requestCache:    requestCache,
+		runtimeRegistry: runtimeRegistry,
+		takeState:       takeState,
 	}
 }
 
 func (s *regionFeedState) start() {
 	s.matcher = newMatcher()
+}
+
+func (s *regionFeedState) markRequestStopped() {
+	s.requestCache.markStopped(s.region.subscribedSpan.subID, s.region.verID.GetID())
+}
+
+func (s *regionFeedState) resolveRequest() {
+	s.requestCache.resolve(s.region.subscribedSpan.subID, s.region.verID.GetID())
 }
 
 // markStopped moves a running region into stopped state and records the
@@ -120,31 +140,27 @@ func (s *regionFeedState) markStopped(failure regionFailureInfo) {
 	if s.state.v == stateNormal {
 		s.state.v = stateStopped
 		s.state.failure = failure
-		s.state.hasFailure = true
 	}
-	s.controller.markRequestStopped(s.region.subscribedSpan.subID, s.region.verID.GetID())
+	s.markRequestStopped()
 }
 
-// takeStoppedFailure moves a stopped region into removed state and returns the
-// failure that should be handed to the unified recovery path.
-func (s *regionFeedState) takeStoppedFailure() (regionFailureInfo, bool) {
+// detachFailure moves a stopped region into removed state, removes it from the
+// session map, and returns the failure that should be handed to recovery.
+func (s *regionFeedState) detachFailure() (regionFailureInfo, bool) {
 	s.state.Lock()
-	defer s.state.Unlock()
-	if s.state.v == stateStopped && s.state.hasFailure {
-		s.state.v = stateRemoved
-		s.matcher.clear()
-		s.controller.markRequestStopped(s.region.subscribedSpan.subID, s.region.verID.GetID())
-		failure := s.state.failure
-		s.state.failure = regionFailureInfo{}
-		s.state.hasFailure = false
-		return failure, true
+	if s.state.v != stateStopped {
+		s.state.Unlock()
+		return regionFailureInfo{}, false
 	}
-	if s.state.v == stateStopped {
-		s.state.v = stateRemoved
-		s.matcher.clear()
-		s.controller.markRequestStopped(s.region.subscribedSpan.subID, s.region.verID.GetID())
-	}
-	return regionFailureInfo{}, false
+	s.state.v = stateRemoved
+	s.matcher.clear()
+	failure := s.state.failure
+	s.state.failure = regionFailureInfo{}
+	s.state.Unlock()
+
+	s.markRequestStopped()
+	s.removeFromSession()
+	return failure, true
 }
 
 func (s *regionFeedState) isInitialized() bool {
@@ -153,7 +169,7 @@ func (s *regionFeedState) isInitialized() bool {
 
 func (s *regionFeedState) setInitialized() {
 	s.region.lockedRangeState.Initialized.Store(true)
-	s.controller.resolveRequest(s.region.subscribedSpan.subID, s.region.verID.GetID())
+	s.resolveRequest()
 }
 
 func (s *regionFeedState) getRegionID() uint64 {
@@ -192,31 +208,27 @@ func (s *regionFeedState) isStale() bool {
 	return s.state.v == stateStopped || s.state.v == stateRemoved
 }
 
-func (s *regionFeedState) workerID() uint64 {
-	return s.controller.getWorkerID()
-}
-
-func (s *regionFeedState) runtimeRegistry() *regionRuntimeRegistry {
-	if !s.region.runtimeKey.isValid() {
-		return nil
-	}
-	return s.controller.runtimeRegistry()
+func (s *regionFeedState) removeFromSession() *regionFeedState {
+	return s.takeState(SubscriptionID(s.requestID), s.getRegionID())
 }
 
 func (s *regionFeedState) updateRuntimeLastEvent(now time.Time) {
-	if registry := s.runtimeRegistry(); registry != nil {
-		registry.updateLastEvent(s.region.runtimeKey, now)
+	if !s.region.runtimeKey.isValid() {
+		return
 	}
+	s.runtimeRegistry.updateLastEvent(s.region.runtimeKey, now)
 }
 
 func (s *regionFeedState) markRuntimeReplicating(now time.Time) {
-	if registry := s.runtimeRegistry(); registry != nil {
-		registry.markReplicating(s.region.runtimeKey, now)
+	if !s.region.runtimeKey.isValid() {
+		return
 	}
+	s.runtimeRegistry.markReplicating(s.region.runtimeKey, now)
 }
 
 func (s *regionFeedState) updateRuntimeResolvedTs(resolvedTs uint64, now time.Time) {
-	if registry := s.runtimeRegistry(); registry != nil {
-		registry.updateResolvedTs(s.region.runtimeKey, resolvedTs, now)
+	if !s.region.runtimeKey.isValid() {
+		return
 	}
+	s.runtimeRegistry.updateResolvedTs(s.region.runtimeKey, resolvedTs, now)
 }

@@ -283,19 +283,7 @@ func (c *requestCache) clearStaleRequest() {
 
 // clear removes all requests and returns them
 func (c *requestCache) clear() []regionInfo {
-	var regions []regionInfo
-
-	// Drain pending requests from channel
-LOOP:
-	for {
-		select {
-		case req := <-c.pendingQueue:
-			regions = append(regions, req.regionInfo)
-			c.markDone()
-		default:
-			break LOOP
-		}
-	}
+	regions := c.drainPendingQueue()
 
 	c.sentRequests.Lock()
 	defer c.sentRequests.Unlock()
@@ -307,6 +295,23 @@ LOOP:
 			c.markDone()
 		}
 		delete(c.sentRequests.regionReqs, subID)
+	}
+	return regions
+}
+
+func (c *requestCache) drainPendingQueue() []regionInfo {
+	regions := make([]regionInfo, 0, len(c.pendingQueue))
+
+	// Drain pending requests from channel.
+LOOP:
+	for {
+		select {
+		case req := <-c.pendingQueue:
+			regions = append(regions, req.regionInfo)
+			c.markDone()
+		default:
+			break LOOP
+		}
 	}
 	return regions
 }

@@ -164,11 +164,10 @@ func (h *failureHandler) submitDirectFailure(failure regionFailureInfo) {
 // submitOrderedFailure is for stale region states that must preserve ordering
 // with previously dispatched region events.
 func (h *failureHandler) submitOrderedFailure(state *regionFeedState) (regionFailureInfo, bool) {
-	failure, removed := state.takeStoppedFailure()
-	if !removed {
+	failure, detached := state.detachFailure()
+	if !detached {
 		return regionFailureInfo{}, false
 	}
-	state.controller.removeRegionState(SubscriptionID(state.requestID), state.getRegionID())
 	h.submitDirectFailure(failure)
 	return failure, true
 }
@@ -176,18 +175,16 @@ func (h *failureHandler) submitOrderedFailure(state *regionFeedState) (regionFai
 // submitWorkerSessionFailure converts one worker/store-session failure into:
 // ordered failures for started regions and direct failures for pending regions.
 func (h *failureHandler) submitWorkerSessionFailure(
-	session *regionWorkerSession,
+	session *regionRequestWorkerSession,
 	pendingRegions []regionInfo,
 	sessionFailure workerSessionFailure,
 ) {
-	if session != nil {
-		for subID, states := range session.clearRegionStates() {
-			for _, state := range states {
-				state.markStopped(normalizeWorkerSessionFailure(state.getRegionInfo(), sessionFailure))
-				h.client.pushRegionEventToDS(subID, regionEvent{
-					states: []*regionFeedState{state},
-				})
-			}
+	for subID, states := range session.clearRegionStates() {
+		for _, state := range states {
+			state.markStopped(normalizeWorkerSessionFailure(state.getRegionInfo(), sessionFailure))
+			h.client.pushRegionEventToDS(subID, regionEvent{
+				states: []*regionFeedState{state},
+			})
 		}
 	}
 

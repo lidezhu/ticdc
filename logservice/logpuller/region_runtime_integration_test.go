@@ -111,7 +111,7 @@ func TestHandleResolvedTsUpdatesRuntimeRegistry(t *testing.T) {
 		regionRuntimeRegistry: newRegionRuntimeRegistry(),
 	}
 	client.failures = newFailureHandler(client)
-	worker := &regionRequestWorker{client: client}
+	worker := &regionRequestWorker{runtimeRegistry: client.regionRuntimeRegistry}
 
 	rawSpan := heartbeatpb.TableSpan{
 		TableID:  1,
@@ -138,8 +138,14 @@ func TestHandleResolvedTsUpdatesRuntimeRegistry(t *testing.T) {
 	region.runtimeKey = client.regionRuntimeRegistry.allocKey(subSpan.subID, region.verID.GetID())
 	client.regionRuntimeRegistry.updateRegionInfo(region.runtimeKey, region)
 
-	controller := newRegionStateController(worker.workerID, "", worker.client, worker.requestCache, nil)
-	state := newRegionFeedState(region, uint64(subSpan.subID), controller)
+	state := newRegionFeedState(
+		region,
+		uint64(subSpan.subID),
+		worker.workerID,
+		worker.requestCache,
+		client.regionRuntimeRegistry,
+		nil,
+	)
 	state.start()
 
 	resolvedTs := uint64(200)
