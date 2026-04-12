@@ -111,22 +111,38 @@ func (r *regionReq) finish() {
 type requestCache struct {
 	mu sync.Mutex
 
-	requests map[regionReqKey]*regionReq
+	// requests owns every live request in this worker, regardless of stage.
+	// It is the source of truth for pending-count accounting.
+	requests map[*regionReq]struct{}
+	// latest points to the newest request for a region key.
+	// A queued duplicate updates the existing request in place; an active duplicate
+	// enqueues a fresh request and moves latest to that newer one.
+	latest map[regionReqKey]*regionReq
+	// active records the request currently considered "sent" for a key.
+	// When a duplicate register is sent, the new request replaces the old active one.
+	active map[regionReqKey]*regionReq
+	// ready is the FIFO of queued requests waiting for the send loop.
+	// readyIdx lets us compact lazily instead of shifting on every pop.
 	ready    []*regionReq
 	readyIdx int
 	// queuedCount tracks requests that are still waiting for the send loop.
 	// It preserves the old pendingQueue capacity semantics for force requests.
 	queuedCount int
 
+	// maxPendingCount limits queued requests and, for non-force adds, total live requests.
 	maxPendingCount int
 
+	// readyAvailable wakes pop() when a new queued request becomes visible.
 	readyAvailable chan struct{}
+	// spaceAvailable wakes add() when pop()/finish()/resolve() releases capacity.
 	spaceAvailable chan struct{}
 }
 
 func newRequestCache(maxPendingCount int) *requestCache {
 	return &requestCache{
-		requests:        make(map[regionReqKey]*regionReq),
+		requests:        make(map[*regionReq]struct{}),
+		latest:          make(map[regionReqKey]*regionReq),
+		active:          make(map[regionReqKey]*regionReq),
 		ready:           make([]*regionReq, 0, maxPendingCount),
 		maxPendingCount: maxPendingCount,
 		readyAvailable:  make(chan struct{}, 1),
@@ -136,8 +152,8 @@ func newRequestCache(maxPendingCount int) *requestCache {
 
 // add admits a request into this worker window.
 // If the same request is still queued, the latest region info replaces the old one.
-// If the same request is already being processed or has been sent, the old request
-// stays authoritative and we log the duplicate for further investigation.
+// If the same request is already being processed or has been sent, enqueue a new
+// request so the worker can send another register, matching the old behavior.
 func (c *requestCache) add(ctx context.Context, region regionInfo, force bool) (bool, error) {
 	start := time.Now()
 	ticker := time.NewTicker(addReqRetryInterval)
@@ -175,8 +191,16 @@ func (c *requestCache) tryAdd(region regionInfo, force bool) bool {
 		}
 	}()
 
-	if existing, ok := c.requests[req.key]; ok {
-		return c.replacePendingLocked(existing, region)
+	if existing, ok := c.latest[req.key]; ok {
+		if existing.stage == regionReqStageQueued {
+			existing.regionInfo = region
+			return true
+		}
+		log.Warn("region request already active, enqueue duplicate register",
+			zap.Uint64("subID", uint64(existing.key.subID)),
+			zap.Uint64("regionID", existing.key.regionID),
+			zap.Bool("stop", existing.key.stop),
+			zap.Uint8("stage", uint8(existing.stage)))
 	}
 	if c.queuedCount >= c.maxPendingCount {
 		return false
@@ -185,23 +209,11 @@ func (c *requestCache) tryAdd(region regionInfo, force bool) bool {
 		return false
 	}
 
-	c.requests[req.key] = req
+	c.requests[req] = struct{}{}
+	c.latest[req.key] = req
 	c.ready = append(c.ready, req)
 	c.queuedCount++
 	shouldNotifyReady = true
-	return true
-}
-
-func (c *requestCache) replacePendingLocked(existing *regionReq, region regionInfo) bool {
-	if existing.stage == regionReqStageQueued {
-		existing.regionInfo = region
-		return true
-	}
-	log.Warn("region request already active when adding duplicate",
-		zap.Uint64("subID", uint64(existing.key.subID)),
-		zap.Uint64("regionID", existing.key.regionID),
-		zap.Bool("stop", existing.key.stop),
-		zap.Uint8("stage", uint8(existing.stage)))
 	return true
 }
 
@@ -238,7 +250,7 @@ func (c *requestCache) tryPop() *regionReq {
 		if req == nil {
 			continue
 		}
-		if current, ok := c.requests[req.key]; !ok || current != req || req.stage != regionReqStageQueued {
+		if _, ok := c.requests[req]; !ok || req.stage != regionReqStageQueued {
 			continue
 		}
 
@@ -254,11 +266,19 @@ func (c *requestCache) tryPop() *regionReq {
 }
 
 func (c *requestCache) markSent(req *regionReq) {
+	removed := false
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if current, ok := c.requests[req.key]; ok && current == req && req.stage == regionReqStageProcessing {
+	if _, ok := c.requests[req]; ok && req.stage == regionReqStageProcessing {
+		if old, ok := c.active[req.key]; ok && old != req {
+			removed = c.removeLocked(old) || removed
+		}
 		req.stage = regionReqStageSent
+		c.active[req.key] = req
+	}
+	c.mu.Unlock()
+
+	if removed {
+		c.notifySpace()
 	}
 }
 
@@ -293,18 +313,7 @@ func (c *requestCache) remove(req *regionReq) bool {
 
 	removed := false
 	c.mu.Lock()
-	if current, ok := c.requests[req.key]; ok && current == req {
-		stage := req.stage
-		delete(c.requests, req.key)
-		req.stage = regionReqStageFinished
-		if stage == regionReqStageQueued {
-			c.queuedCount--
-		}
-		if stage != regionReqStageSent {
-			c.compactReadyLocked()
-		}
-		removed = true
-	}
+	removed = c.removeLocked(req)
 	c.mu.Unlock()
 
 	if removed {
@@ -317,17 +326,14 @@ func (c *requestCache) takeUnsentRegions() []regionInfo {
 	c.mu.Lock()
 	regions := make([]regionInfo, 0, len(c.requests))
 	removed := 0
-	for key, req := range c.requests {
+	for req := range c.requests {
 		if req.stage == regionReqStageSent {
 			continue
 		}
 		regions = append(regions, req.regionInfo)
-		delete(c.requests, key)
-		if req.stage == regionReqStageQueued {
-			c.queuedCount--
+		if c.removeLocked(req) {
+			removed++
 		}
-		req.stage = regionReqStageFinished
-		removed++
 	}
 	if removed > 0 {
 		c.compactReadyLocked()
@@ -344,12 +350,14 @@ func (c *requestCache) takeUnsentRegions() []regionInfo {
 func (c *requestCache) clear() []regionInfo {
 	c.mu.Lock()
 	regions := make([]regionInfo, 0, len(c.requests))
-	for key, req := range c.requests {
+	for req := range c.requests {
 		regions = append(regions, req.regionInfo)
-		delete(c.requests, key)
+		delete(c.requests, req)
 		req.stage = regionReqStageFinished
 	}
 	removed := len(regions)
+	c.latest = make(map[regionReqKey]*regionReq)
+	c.active = make(map[regionReqKey]*regionReq)
 	c.ready = c.ready[:0]
 	c.readyIdx = 0
 	c.queuedCount = 0
@@ -365,6 +373,32 @@ func (c *requestCache) getPendingCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.requests)
+}
+
+func (c *requestCache) removeLocked(req *regionReq) bool {
+	if req == nil {
+		return false
+	}
+	if _, ok := c.requests[req]; !ok {
+		return false
+	}
+
+	stage := req.stage
+	delete(c.requests, req)
+	req.stage = regionReqStageFinished
+	if stage == regionReqStageQueued {
+		c.queuedCount--
+	}
+	if c.latest[req.key] == req {
+		delete(c.latest, req.key)
+	}
+	if c.active[req.key] == req {
+		delete(c.active, req.key)
+	}
+	if stage != regionReqStageSent {
+		c.compactReadyLocked()
+	}
+	return true
 }
 
 func (c *requestCache) notifyReady() {

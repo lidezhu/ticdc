@@ -195,6 +195,38 @@ func TestRequestCacheReplacesQueuedDuplicateRequest(t *testing.T) {
 	require.Equal(t, 0, cache.getPendingCount())
 }
 
+func TestRequestCacheKeepsDuplicateActiveRegister(t *testing.T) {
+	cache := newRequestCache(10)
+	ctx := context.Background()
+	region := createTestRegionInfo(1, 1)
+
+	ok, err := cache.add(ctx, region, false)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	firstReq, err := cache.pop(ctx)
+	require.NoError(t, err)
+	firstReq.markSent()
+	require.Equal(t, 1, cache.getPendingCount())
+
+	ok, err = cache.add(ctx, region, false)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, 2, cache.getPendingCount())
+
+	secondReq, err := cache.pop(ctx)
+	require.NoError(t, err)
+	require.NotSame(t, firstReq, secondReq)
+	secondReq.markSent()
+	require.Equal(t, 1, cache.getPendingCount())
+
+	firstReq.resolve()
+	require.Equal(t, 1, cache.getPendingCount())
+
+	secondReq.resolve()
+	require.Equal(t, 0, cache.getPendingCount())
+}
+
 func TestRequestCacheTakeUnsentRegionsKeepsSentRequests(t *testing.T) {
 	cache := newRequestCache(10)
 	ctx := context.Background()
