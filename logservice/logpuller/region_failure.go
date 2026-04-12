@@ -16,6 +16,8 @@ package logpuller
 import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/cdcpb"
+	"github.com/pingcap/log"
+	"go.uber.org/zap"
 )
 
 type regionFailureScope string
@@ -82,6 +84,10 @@ func (f workerSessionFailure) toRegionFailure(region regionInfo) regionFailureIn
 	case regionFailureKindSendRequestToStore:
 		return newSendRequestToStoreFailure(region, f.source, f.cause)
 	default:
+		log.Panic("unknown worker session failure kind",
+			zap.Stringer("failureKind", f.kind),
+			zap.Stringer("failureSource", f.source),
+			zap.Error(f.cause))
 		return regionFailureInfo{}
 	}
 }

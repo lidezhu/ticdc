@@ -163,7 +163,11 @@ func TestRunConnectedLoopsReturnsReceiveFailure(t *testing.T) {
 		Client: &mockEventFeedV2Client{recvErr: recvErr},
 	}
 
-	result, err := session.runConnectedLoops(context.Background())
+	parentCtx := context.Background()
+	sessionCtx, cancel := context.WithCancel(parentCtx)
+	defer cancel()
+
+	result, err := session.runConnectedLoops(parentCtx, sessionCtx, cancel)
 	require.NoError(t, err)
 	require.False(t, result.canceled)
 	require.Equal(t, regionFailureKindSendRequestToStore, result.failure.kind)
@@ -187,7 +191,11 @@ func TestRunConnectedLoopsTreatsEOFAsReconnect(t *testing.T) {
 		Client: &mockEventFeedV2Client{recvErr: io.EOF},
 	}
 
-	result, err := session.runConnectedLoops(context.Background())
+	parentCtx := context.Background()
+	sessionCtx, cancel := context.WithCancel(parentCtx)
+	defer cancel()
+
+	result, err := session.runConnectedLoops(parentCtx, sessionCtx, cancel)
 	require.NoError(t, err)
 	require.False(t, result.canceled)
 	require.Equal(t, regionFailureKindSendRequestToStore, result.failure.kind)
@@ -220,7 +228,11 @@ func TestRunConnectedLoopsPrefersSendFailureOverLoopCancellation(t *testing.T) {
 		},
 	}
 
-	result, err := session.runConnectedLoops(context.Background())
+	parentCtx := context.Background()
+	sessionCtx, cancel := context.WithCancel(parentCtx)
+	defer cancel()
+
+	result, err := session.runConnectedLoops(parentCtx, sessionCtx, cancel)
 	require.NoError(t, err)
 	require.False(t, result.canceled)
 	require.Equal(t, regionFailureKindSendRequestToStore, result.failure.kind)

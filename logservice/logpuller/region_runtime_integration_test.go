@@ -307,3 +307,13 @@ func TestNormalizeWorkerSessionFailureForActiveSubscription(t *testing.T) {
 	require.Equal(t, regionFailureSourceWorkerSession, failure.source)
 	require.ErrorContains(t, failure.err, "store down")
 }
+
+func TestWorkerSessionFailureToRegionFailurePanicsOnUnknownKind(t *testing.T) {
+	require.Panics(t, func() {
+		workerSessionFailure{
+			kind:   regionFailureKind("unknown"),
+			source: regionFailureSourceWorkerSession,
+			cause:  errors.New("unexpected"),
+		}.toRegionFailure(regionInfo{})
+	})
+}

@@ -178,7 +178,10 @@ func (s *regionRequestWorkerSession) run(ctx context.Context) (sessionRunResult,
 	req := newRegionReq(bootstrapRegion)
 	s.bootstrapRegion = &req
 
-	if err := s.checkStoreVersion(ctx); err != nil {
+	sessionCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	if err := s.checkStoreVersion(sessionCtx); err != nil {
 		if isCanceledByContext(ctx, err) {
 			return sessionRunResult{canceled: true}, nil
 		}
@@ -187,7 +190,7 @@ func (s *regionRequestWorkerSession) run(ctx context.Context) (sessionRunResult,
 		}, nil
 	}
 
-	s.conn, err = s.connectStore(ctx)
+	s.conn, err = s.connectStore(sessionCtx)
 	if err != nil {
 		if isCanceledByContext(ctx, err) {
 			return sessionRunResult{canceled: true}, nil
@@ -197,28 +200,29 @@ func (s *regionRequestWorkerSession) run(ctx context.Context) (sessionRunResult,
 		}, nil
 	}
 
-	return s.runConnectedLoops(ctx)
+	return s.runConnectedLoops(ctx, sessionCtx, cancel)
 }
 
 func (s *regionRequestWorkerSession) runConnectedLoops(
-	ctx context.Context,
+	parentCtx context.Context,
+	sessionCtx context.Context,
+	cancel context.CancelFunc,
 ) (sessionRunResult, error) {
 	defer s.close()
 	defer func() {
 		log.Info("region request worker session exits",
 			zap.Uint64("workerID", s.workerID),
 			zap.String("addr", s.storeAddr),
-			zap.Bool("canceled", ctx.Err() != nil))
+			zap.Bool("canceled", parentCtx.Err() != nil))
 	}()
 
-	loopCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	g, gctx := errgroup.WithContext(loopCtx)
+	// sessionCtx owns the grpc stream lifetime, so canceling it will unblock
+	// both send and recv loops consistently.
+	g, gctx := errgroup.WithContext(sessionCtx)
 	loopCount := 2
 	exitCh := make(chan sessionLoopExit, 3)
 	s.startLoop(g, cancel, exitCh, regionFailureSourceWorkerRecv, func() error {
-		return s.receiveAndDispatchChangeEvents(ctx)
+		return s.receiveAndDispatchChangeEvents(gctx)
 	})
 	s.startLoop(g, cancel, exitCh, regionFailureSourceWorkerSend, func() error {
 		return s.processRegionSendTask(gctx)
@@ -247,11 +251,11 @@ func (s *regionRequestWorkerSession) runConnectedLoops(
 	for i := 0; i < loopCount; i++ {
 		exits = append(exits, <-exitCh)
 	}
-	exit := pickPrimaryLoopExit(ctx, exits, waitErr)
+	exit := pickPrimaryLoopExit(parentCtx, exits, waitErr)
 	if errors.Cause(exit.err) == errWorkerSessionReconnect {
 		exit.err = nil
 	}
-	if isCanceledByContext(ctx, exit.err) {
+	if isCanceledByContext(parentCtx, exit.err) {
 		return sessionRunResult{canceled: true}, nil
 	}
 	return sessionRunResult{
@@ -391,55 +395,68 @@ func (s *regionRequestWorkerSession) cancelSubscriptionStates(subID Subscription
 
 func (s *regionRequestWorkerSession) dispatchRegionChangeEvents(events []*cdcpb.Event) {
 	for _, event := range events {
-		regionID := event.RegionId
 		subscriptionID := SubscriptionID(event.RequestId)
-		state := s.getRegionState(subscriptionID, regionID)
-		if state != nil {
-			regionEvent := regionEvent{
-				states: []*regionFeedState{state},
-			}
-			switch eventData := event.Event.(type) {
-			case *cdcpb.Event_Entries_:
-				if eventData == nil {
-					log.Warn("region request worker receives a region event with nil entries, ignore it",
-						zap.Uint64("workerID", s.workerID),
-						zap.Uint64("subscriptionID", uint64(subscriptionID)),
-						zap.Uint64("regionID", regionID))
-					continue
-				}
-				regionEvent.entries = eventData
-			case *cdcpb.Event_Admin_:
-				continue
-			case *cdcpb.Event_Error:
-				log.Debug("region request worker receives a region error",
-					zap.Uint64("workerID", s.workerID),
-					zap.Uint64("subscriptionID", uint64(subscriptionID)),
-					zap.Uint64("regionID", event.RegionId),
-					zap.Any("error", eventData.Error))
-				s.submitOrderedStateFailure(state, newEventRegionFailure(state.getRegionInfo(), eventData.Error))
-				continue
-			case *cdcpb.Event_ResolvedTs:
-				regionEvent.resolvedTs = eventData.ResolvedTs
-			case *cdcpb.Event_LongTxn_:
-				continue
-			default:
-				log.Panic("unknown event type", zap.Any("event", event))
-			}
-			s.emitRegionEvent(subscriptionID, regionEvent)
-		} else {
-			switch event.Event.(type) {
-			case *cdcpb.Event_Error:
-				log.Debug("region request worker receives an error for a stale region, ignore it",
-					zap.Uint64("workerID", s.workerID),
-					zap.Uint64("subscriptionID", uint64(subscriptionID)),
-					zap.Uint64("regionID", event.RegionId))
-			default:
-				log.Warn("region request worker receives a region event for an untracked region",
-					zap.Uint64("workerID", s.workerID),
-					zap.Uint64("subscriptionID", uint64(subscriptionID)),
-					zap.Uint64("regionID", event.RegionId))
-			}
+		if state := s.getRegionState(subscriptionID, event.RegionId); state != nil {
+			s.handleTrackedRegionEvent(subscriptionID, state, event)
+			continue
 		}
+		s.handleUntrackedRegionEvent(subscriptionID, event)
+	}
+}
+
+func (s *regionRequestWorkerSession) handleTrackedRegionEvent(
+	subscriptionID SubscriptionID,
+	state *regionFeedState,
+	event *cdcpb.Event,
+) {
+	regionEvent := regionEvent{
+		states: []*regionFeedState{state},
+	}
+	switch eventData := event.Event.(type) {
+	case *cdcpb.Event_Entries_:
+		if eventData == nil {
+			log.Warn("region request worker receives a region event with nil entries, ignore it",
+				zap.Uint64("workerID", s.workerID),
+				zap.Uint64("subscriptionID", uint64(subscriptionID)),
+				zap.Uint64("regionID", event.RegionId))
+			return
+		}
+		regionEvent.entries = eventData
+	case *cdcpb.Event_Admin_:
+		return
+	case *cdcpb.Event_Error:
+		log.Debug("region request worker receives a region error",
+			zap.Uint64("workerID", s.workerID),
+			zap.Uint64("subscriptionID", uint64(subscriptionID)),
+			zap.Uint64("regionID", event.RegionId),
+			zap.Any("error", eventData.Error))
+		s.submitOrderedStateFailure(state, newEventRegionFailure(state.getRegionInfo(), eventData.Error))
+		return
+	case *cdcpb.Event_ResolvedTs:
+		regionEvent.resolvedTs = eventData.ResolvedTs
+	case *cdcpb.Event_LongTxn_:
+		return
+	default:
+		log.Panic("unknown event type", zap.Any("event", event))
+	}
+	s.emitRegionEvent(subscriptionID, regionEvent)
+}
+
+func (s *regionRequestWorkerSession) handleUntrackedRegionEvent(
+	subscriptionID SubscriptionID,
+	event *cdcpb.Event,
+) {
+	switch event.Event.(type) {
+	case *cdcpb.Event_Error:
+		log.Debug("region request worker receives an error for a stale region, ignore it",
+			zap.Uint64("workerID", s.workerID),
+			zap.Uint64("subscriptionID", uint64(subscriptionID)),
+			zap.Uint64("regionID", event.RegionId))
+	default:
+		log.Warn("region request worker receives a region event for an untracked region",
+			zap.Uint64("workerID", s.workerID),
+			zap.Uint64("subscriptionID", uint64(subscriptionID)),
+			zap.Uint64("regionID", event.RegionId))
 	}
 }
 
