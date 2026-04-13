@@ -691,24 +691,20 @@ func (s *regionRequestWorkerSession) takeRegionStates(subscriptionID Subscriptio
 	return states
 }
 
-func (s *regionRequestWorkerSession) clearRegionStates() map[SubscriptionID]regionFeedStates {
-	s.requestedRegions.Lock()
-	defer s.requestedRegions.Unlock()
-	subscriptions := s.requestedRegions.subscriptions
-	s.requestedRegions.subscriptions = make(map[SubscriptionID]regionFeedStates)
-	return subscriptions
-}
-
-// takeFailureSnapshot collects everything that still belongs to this session
-// after runConnectedLoops has returned and the send/recv loops are no longer
-// mutating session state.
+// takeFailureSnapshot is only called after runConnectedLoops has returned.
+// At that point the old session loops have stopped, so no request can still
+// move from requestCache into requestedRegions. We can therefore drain
+// requestedRegions as startedRegions, then take the remaining unsent requests
+// from requestCache as pendingRegions, without classifying one request into
+// both sets.
 func (s *regionRequestWorkerSession) takeFailureSnapshot() workerSessionFailureSnapshot {
+	s.requestedRegions.Lock()
+	startedRegions := s.requestedRegions.subscriptions
+	s.requestedRegions.subscriptions = make(map[SubscriptionID]regionFeedStates)
+	s.requestedRegions.Unlock()
+
 	return workerSessionFailureSnapshot{
-		startedRegions: s.clearRegionStates(),
+		startedRegions: startedRegions,
 		pendingRegions: s.requestCache.takeUnsentRegions(),
 	}
-}
-
-func (s *regionRequestWorkerSession) takeNotStartedRegions() []regionInfo {
-	return s.requestCache.takeUnsentRegions()
 }

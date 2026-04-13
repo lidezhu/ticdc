@@ -105,9 +105,10 @@ func TestTakeNotStartedRegionsReleaseSlotForBootstrapRegion(t *testing.T) {
 	require.Equal(t, 1, requestCache.getPendingCount())
 
 	session.bootstrapRegion = req
-	regions := session.takeNotStartedRegions()
-	require.Len(t, regions, 1)
-	require.Equal(t, req.regionInfo.verID, regions[0].verID)
+	snapshot := session.takeFailureSnapshot()
+	require.Empty(t, snapshot.startedRegions)
+	require.Len(t, snapshot.pendingRegions, 1)
+	require.Equal(t, req.regionInfo.verID, snapshot.pendingRegions[0].verID)
 	require.Equal(t, 0, requestCache.getPendingCount())
 }
 
@@ -142,9 +143,10 @@ func TestSessionRunReturnsStartupFailureAndKeepsBootstrapRegion(t *testing.T) {
 	require.Error(t, result.failure.cause)
 	require.Nil(t, session.conn)
 
-	regions := session.takeNotStartedRegions()
-	require.Len(t, regions, 1)
-	require.Equal(t, region.verID, regions[0].verID)
+	snapshot := session.takeFailureSnapshot()
+	require.Empty(t, snapshot.startedRegions)
+	require.Len(t, snapshot.pendingRegions, 1)
+	require.Equal(t, region.verID, snapshot.pendingRegions[0].verID)
 	require.Equal(t, 0, requestCache.getPendingCount())
 }
 
@@ -518,7 +520,9 @@ func TestTakeNotStartedRegionsDoesNotReturnStoppedSentRegion(t *testing.T) {
 	session.takeRegionState(req.regionInfo.subscribedSpan.subID, req.regionInfo.verID.GetID())
 
 	require.Equal(t, 0, requestCache.getPendingCount())
-	require.Empty(t, session.takeNotStartedRegions())
+	snapshot := session.takeFailureSnapshot()
+	require.Empty(t, snapshot.startedRegions)
+	require.Empty(t, snapshot.pendingRegions)
 }
 
 func TestTakeNotStartedRegionsDoesNotIncludeActiveSentRegion(t *testing.T) {
@@ -550,8 +554,9 @@ func TestTakeNotStartedRegionsDoesNotIncludeActiveSentRegion(t *testing.T) {
 	session.addRegionState(req.regionInfo.subscribedSpan.subID, req.regionInfo.verID.GetID(), state)
 	req.markSent()
 
-	require.Empty(t, session.takeNotStartedRegions())
-	require.Equal(t, 1, len(session.clearRegionStates()[req.regionInfo.subscribedSpan.subID]))
+	snapshot := session.takeFailureSnapshot()
+	require.Empty(t, snapshot.pendingRegions)
+	require.Equal(t, 1, len(snapshot.startedRegions[req.regionInfo.subscribedSpan.subID]))
 	require.Equal(t, 1, requestCache.getPendingCount())
 }
 
