@@ -75,15 +75,21 @@ func TestRequestCacheForceBypassesWindowLimit(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, ok)
 
-	req, err := cache.pop(ctx)
-	require.NoError(t, err)
-	require.Equal(t, regionReqStageProcessing, req.stage)
-
 	region3 := createTestRegionInfo(1, 3)
 	ok, err = cache.add(ctx, region3, true)
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.Equal(t, 2, cache.getPendingCount())
+
+	req, err := cache.pop(ctx)
+	require.NoError(t, err)
+	require.Equal(t, regionReqStageProcessing, req.stage)
+
+	region4 := createTestRegionInfo(1, 4)
+	ok, err = cache.add(ctx, region4, true)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, 3, cache.getPendingCount())
 }
 
 func TestRequestCacheAddContextCancellation(t *testing.T) {
@@ -195,7 +201,7 @@ func TestRequestCacheReplacesQueuedDuplicateRequest(t *testing.T) {
 	require.Equal(t, 0, cache.getPendingCount())
 }
 
-func TestRequestCacheKeepsDuplicateActiveRegister(t *testing.T) {
+func TestRequestCacheRejectsDuplicateActiveRegion(t *testing.T) {
 	cache := newRequestCache(10)
 	ctx := context.Background()
 	region := createTestRegionInfo(1, 1)
@@ -210,6 +216,29 @@ func TestRequestCacheKeepsDuplicateActiveRegister(t *testing.T) {
 	require.Equal(t, 1, cache.getPendingCount())
 
 	ok, err = cache.add(ctx, region, false)
+	require.ErrorIs(t, err, errActiveDuplicateRegionRequest)
+	require.False(t, ok)
+	require.Equal(t, 1, cache.getPendingCount())
+
+	firstReq.resolve()
+	require.Equal(t, 0, cache.getPendingCount())
+}
+
+func TestRequestCacheKeepsDuplicateStopRequest(t *testing.T) {
+	cache := newRequestCache(10)
+	ctx := context.Background()
+	stopRegion := createTestRegionInfo(1, 1)
+	stopRegion.lockedRangeState = nil
+
+	ok, err := cache.add(ctx, stopRegion, true)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	firstReq, err := cache.pop(ctx)
+	require.NoError(t, err)
+	require.Equal(t, regionReqStageProcessing, firstReq.stage)
+
+	ok, err = cache.add(ctx, stopRegion, true)
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.Equal(t, 2, cache.getPendingCount())
@@ -217,13 +246,10 @@ func TestRequestCacheKeepsDuplicateActiveRegister(t *testing.T) {
 	secondReq, err := cache.pop(ctx)
 	require.NoError(t, err)
 	require.NotSame(t, firstReq, secondReq)
-	secondReq.markSent()
-	require.Equal(t, 1, cache.getPendingCount())
 
-	firstReq.resolve()
+	firstReq.finish()
 	require.Equal(t, 1, cache.getPendingCount())
-
-	secondReq.resolve()
+	secondReq.finish()
 	require.Equal(t, 0, cache.getPendingCount())
 }
 

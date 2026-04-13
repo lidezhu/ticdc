@@ -15,6 +15,7 @@ package logpuller
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -30,6 +31,8 @@ const (
 	addReqRetryLimit             = 3
 	abnormalRequestDurationInSec = 60 * 60 * 2 // 2 hours
 )
+
+var errActiveDuplicateRegionRequest = errors.New("active duplicate region request")
 
 type regionReqStage uint8
 
@@ -106,30 +109,30 @@ func (r *regionReq) finish() {
 // 1. admission control: limit how many requests are outstanding in this worker
 // 2. request lifecycle: track each request until it is initialized or terminated
 //
-// The source of truth is `requests`. A request uses one slot from add() until it
-// reaches a terminal state through resolve()/finish().
+// The source of truth is `requests`. A request enters `requests` in add() and
+// stays there until resolve()/finish() removes it.
 type requestCache struct {
 	mu sync.Mutex
 
 	// requests owns every live request in this worker, regardless of stage.
-	// It is the source of truth for pending-count accounting.
+	// len(requests) is the "pending request count" exported to metrics/logs:
+	// it includes queued, processing and sent requests.
 	requests map[*regionReq]struct{}
-	// latest points to the newest request for a region key.
-	// A queued duplicate updates the existing request in place; an active duplicate
-	// enqueues a fresh request and moves latest to that newer one.
-	latest map[regionReqKey]*regionReq
-	// active records the request currently considered "sent" for a key.
-	// When a duplicate register is sent, the new request replaces the old active one.
-	active map[regionReqKey]*regionReq
+	// current points to the newest live request for a key.
+	// A queued duplicate updates the existing queued request in place. A normal
+	// duplicate for a processing or sent request is rejected so the worker can
+	// reconnect. Stop requests stay compatible with the old behavior and may
+	// enqueue one newer request behind the current one.
+	current map[regionReqKey]*regionReq
 	// ready is the FIFO of queued requests waiting for the send loop.
 	// readyIdx lets us compact lazily instead of shifting on every pop.
 	ready    []*regionReq
 	readyIdx int
-	// queuedCount tracks requests that are still waiting for the send loop.
-	// It preserves the old pendingQueue capacity semantics for force requests.
-	queuedCount int
 
-	// maxPendingCount limits queued requests and, for non-force adds, total live requests.
+	// maxPendingCount limits the number of live requests in this worker for
+	// non-force adds. A live request stays in `requests` from add() until it is
+	// resolved or finished, so the limit covers queued, processing and sent
+	// requests together.
 	maxPendingCount int
 
 	// readyAvailable wakes pop() when a new queued request becomes visible.
@@ -141,8 +144,7 @@ type requestCache struct {
 func newRequestCache(maxPendingCount int) *requestCache {
 	return &requestCache{
 		requests:        make(map[*regionReq]struct{}),
-		latest:          make(map[regionReqKey]*regionReq),
-		active:          make(map[regionReqKey]*regionReq),
+		current:         make(map[regionReqKey]*regionReq),
 		ready:           make([]*regionReq, 0, maxPendingCount),
 		maxPendingCount: maxPendingCount,
 		readyAvailable:  make(chan struct{}, 1),
@@ -151,9 +153,10 @@ func newRequestCache(maxPendingCount int) *requestCache {
 }
 
 // add admits a request into this worker window.
-// If the same request is still queued, the latest region info replaces the old one.
-// If the same request is already being processed or has been sent, enqueue a new
-// request so the worker can send another register, matching the old behavior.
+// If the same key is still queued, the newer region info replaces the old one.
+// If a normal region request is already processing or sent, return
+// errActiveDuplicateRegionRequest so the worker can reconnect the whole session.
+// Stop requests stay compatible with the old behavior and may enqueue duplicates.
 func (c *requestCache) add(ctx context.Context, region regionInfo, force bool) (bool, error) {
 	start := time.Now()
 	ticker := time.NewTicker(addReqRetryInterval)
@@ -161,7 +164,11 @@ func (c *requestCache) add(ctx context.Context, region regionInfo, force bool) (
 	retries := addReqRetryLimit
 
 	for {
-		if c.tryAdd(region, force) {
+		ok, err := c.tryAdd(region, force)
+		if err != nil {
+			return false, err
+		}
+		if ok {
 			metrics.SubscriptionClientAddRegionRequestDuration.Observe(time.Since(start).Seconds())
 			return true, nil
 		}
@@ -179,7 +186,7 @@ func (c *requestCache) add(ctx context.Context, region regionInfo, force bool) (
 	}
 }
 
-func (c *requestCache) tryAdd(region regionInfo, force bool) bool {
+func (c *requestCache) tryAdd(region regionInfo, force bool) (bool, error) {
 	req := newRegionReq(c, region)
 	shouldNotifyReady := false
 
@@ -191,30 +198,29 @@ func (c *requestCache) tryAdd(region regionInfo, force bool) bool {
 		}
 	}()
 
-	if existing, ok := c.latest[req.key]; ok {
+	if existing, ok := c.current[req.key]; ok {
 		if existing.stage == regionReqStageQueued {
 			existing.regionInfo = region
-			return true
+			return true, nil
 		}
-		log.Warn("region request already active, enqueue duplicate register",
+		if !req.key.stop {
+			return false, errActiveDuplicateRegionRequest
+		}
+		log.Warn("stop request already active, enqueue duplicate deregister",
 			zap.Uint64("subID", uint64(existing.key.subID)),
 			zap.Uint64("regionID", existing.key.regionID),
 			zap.Bool("stop", existing.key.stop),
 			zap.Uint8("stage", uint8(existing.stage)))
 	}
-	if c.queuedCount >= c.maxPendingCount {
-		return false
-	}
 	if len(c.requests) >= c.maxPendingCount && !force {
-		return false
+		return false, nil
 	}
 
 	c.requests[req] = struct{}{}
-	c.latest[req.key] = req
+	c.current[req.key] = req
 	c.ready = append(c.ready, req)
-	c.queuedCount++
 	shouldNotifyReady = true
-	return true
+	return true, nil
 }
 
 // pop takes the next queued request and moves it into processing state.
@@ -233,14 +239,8 @@ func (c *requestCache) pop(ctx context.Context) (*regionReq, error) {
 }
 
 func (c *requestCache) tryPop() *regionReq {
-	shouldNotifySpace := false
 	c.mu.Lock()
-	defer func() {
-		c.mu.Unlock()
-		if shouldNotifySpace {
-			c.notifySpace()
-		}
-	}()
+	defer c.mu.Unlock()
 
 	for c.readyIdx < len(c.ready) {
 		req := c.ready[c.readyIdx]
@@ -255,9 +255,7 @@ func (c *requestCache) tryPop() *regionReq {
 		}
 
 		req.stage = regionReqStageProcessing
-		c.queuedCount--
 		c.compactReadyLocked()
-		shouldNotifySpace = true
 		return req
 	}
 
@@ -269,11 +267,14 @@ func (c *requestCache) markSent(req *regionReq) {
 	removed := false
 	c.mu.Lock()
 	if _, ok := c.requests[req]; ok && req.stage == regionReqStageProcessing {
-		if old, ok := c.active[req.key]; ok && old != req {
-			removed = c.removeLocked(old) || removed
+		// Stop duplicates are rare. Scan live requests only in this compatibility
+		// path so normal region sends stay O(1).
+		if req.key.stop {
+			if old := c.findSentLocked(req.key, req); old != nil {
+				removed = c.removeLocked(old) || removed
+			}
 		}
 		req.stage = regionReqStageSent
-		c.active[req.key] = req
 	}
 	c.mu.Unlock()
 
@@ -356,11 +357,9 @@ func (c *requestCache) clear() []regionInfo {
 		req.stage = regionReqStageFinished
 	}
 	removed := len(regions)
-	c.latest = make(map[regionReqKey]*regionReq)
-	c.active = make(map[regionReqKey]*regionReq)
+	c.current = make(map[regionReqKey]*regionReq)
 	c.ready = c.ready[:0]
 	c.readyIdx = 0
-	c.queuedCount = 0
 	c.mu.Unlock()
 
 	if removed > 0 {
@@ -369,6 +368,8 @@ func (c *requestCache) clear() []regionInfo {
 	return regions
 }
 
+// getPendingCount returns the number of live requests currently owned by this
+// worker. It includes queued, processing and sent requests.
 func (c *requestCache) getPendingCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -386,19 +387,25 @@ func (c *requestCache) removeLocked(req *regionReq) bool {
 	stage := req.stage
 	delete(c.requests, req)
 	req.stage = regionReqStageFinished
-	if stage == regionReqStageQueued {
-		c.queuedCount--
-	}
-	if c.latest[req.key] == req {
-		delete(c.latest, req.key)
-	}
-	if c.active[req.key] == req {
-		delete(c.active, req.key)
+	if c.current[req.key] == req {
+		delete(c.current, req.key)
 	}
 	if stage != regionReqStageSent {
 		c.compactReadyLocked()
 	}
 	return true
+}
+
+func (c *requestCache) findSentLocked(key regionReqKey, except *regionReq) *regionReq {
+	for req := range c.requests {
+		if req == except {
+			continue
+		}
+		if req.key == key && req.stage == regionReqStageSent {
+			return req
+		}
+	}
+	return nil
 }
 
 func (c *requestCache) notifyReady() {

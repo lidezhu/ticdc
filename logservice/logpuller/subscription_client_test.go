@@ -240,7 +240,7 @@ func TestPushRegionEventToDSUnblocksOnClose(t *testing.T) {
 	}
 }
 
-func TestEnqueueRegionToAllStoresRetryWhenCacheFull(t *testing.T) {
+func TestEnqueueRegionToAllStoresDoesNotRetryForcedStop(t *testing.T) {
 	ctx := context.Background()
 	client := &subscriptionClient{}
 
@@ -264,16 +264,8 @@ func TestEnqueueRegionToAllStoresRetryWhenCacheFull(t *testing.T) {
 	}
 	enqueued, err := client.enqueueRegionToAllStores(ctx, stopRegion)
 	require.NoError(t, err)
-	require.False(t, enqueued)
-
-	req, err := worker.requestCache.pop(ctx)
-	require.NoError(t, err)
-	req.finish()
-
-	enqueued, err = client.enqueueRegionToAllStores(ctx, stopRegion)
-	require.NoError(t, err)
 	require.True(t, enqueued)
-	require.Equal(t, 1, worker.requestCache.getPendingCount())
+	require.Equal(t, 2, worker.requestCache.getPendingCount())
 }
 
 func TestSubscriptionWithFailedTiKV(t *testing.T) {

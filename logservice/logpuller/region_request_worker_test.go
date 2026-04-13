@@ -131,6 +131,7 @@ func TestSessionRunReturnsStartupFailureAndKeepsBootstrapRegion(t *testing.T) {
 		newRegionRuntimeRegistry(),
 		nil,
 		nil,
+		nil,
 	)
 
 	result, err := session.run(context.Background())
@@ -179,6 +180,40 @@ func TestWorkerAddDuplicateQueuedRequestRefreshesEnqueueTime(t *testing.T) {
 	require.True(t, secondState.requestEnqueueTime.After(firstEnqueueTime))
 }
 
+func TestWorkerAddDuplicateActiveRegionRequestsReconnect(t *testing.T) {
+	requestCache := newRequestCache(10)
+	worker := &regionRequestWorker{
+		workerID:     1,
+		store:        &requestedStore{storeAddr: "store-1"},
+		requestCache: requestCache,
+	}
+	trigger := newSessionReconnectTrigger()
+	worker.setSessionReconnectTrigger(trigger)
+	defer worker.clearSessionReconnectTrigger(trigger)
+
+	region := prepareRegionForSendTest(createTestRegionInfo(1, 1))
+
+	ok, err := requestCache.add(context.Background(), region, false)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	req, err := requestCache.pop(context.Background())
+	require.NoError(t, err)
+	req.markSent()
+	require.Equal(t, 1, requestCache.getPendingCount())
+
+	ok, err = worker.add(context.Background(), region, false)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, 1, requestCache.getPendingCount())
+
+	select {
+	case <-trigger.done():
+	default:
+		t.Fatal("expected reconnect to be requested")
+	}
+}
+
 func TestRunConnectedLoopsReturnsReceiveFailure(t *testing.T) {
 	session := newRegionRequestWorkerSession(
 		1,
@@ -190,6 +225,7 @@ func TestRunConnectedLoopsReturnsReceiveFailure(t *testing.T) {
 		newRegionRuntimeRegistry(),
 		nil,
 		func(SubscriptionID, regionEvent) {},
+		nil,
 	)
 	recvErr := errors.New("recv failed")
 	session.conn = &ConnAndClient{
@@ -219,6 +255,7 @@ func TestRunConnectedLoopsTreatsEOFAsReconnect(t *testing.T) {
 		newRegionRuntimeRegistry(),
 		nil,
 		func(SubscriptionID, regionEvent) {},
+		nil,
 	)
 	session.conn = &ConnAndClient{
 		Client: &mockEventFeedV2Client{recvErr: io.EOF},
@@ -251,6 +288,7 @@ func TestRunConnectedLoopsPrefersSendFailureOverLoopCancellation(t *testing.T) {
 		newRegionRuntimeRegistry(),
 		nil,
 		func(SubscriptionID, regionEvent) {},
+		nil,
 	)
 	session.bootstrapRegion = req
 	sendErr := errors.New("send failed")
@@ -548,6 +586,7 @@ func TestProcessRegionSendTaskSendFailureCleansSentRequest(t *testing.T) {
 		0,
 		worker.requestCache,
 		newRegionRuntimeRegistry(),
+		nil,
 		nil,
 		nil,
 	)

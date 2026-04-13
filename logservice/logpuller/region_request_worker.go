@@ -15,13 +15,16 @@ package logpuller
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/pkg/security"
 	"github.com/pingcap/ticdc/pkg/util"
 	pd "github.com/tikv/pd/client"
+	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -77,12 +80,44 @@ type regionRequestWorker struct {
 	pushRegionEvent            func(SubscriptionID, regionEvent)
 	runtimeRegistry            *regionRuntimeRegistry
 	submitDirectFailure        func(regionFailureInfo)
-	submitWorkerSessionFailure func(*regionRequestWorkerSession, []regionInfo, workerSessionFailure)
+	submitWorkerSessionFailure func(map[SubscriptionID]regionFeedStates, []regionInfo, workerSessionFailure)
 
 	store *requestedStore
 
 	// request cache with flow control
 	requestCache *requestCache
+
+	sessionReconnect struct {
+		sync.Mutex
+		trigger *sessionReconnectTrigger
+	}
+}
+
+type sessionReconnectTrigger struct {
+	once sync.Once
+	ch   chan struct{}
+}
+
+func newSessionReconnectTrigger() *sessionReconnectTrigger {
+	return &sessionReconnectTrigger{
+		ch: make(chan struct{}),
+	}
+}
+
+func (c *sessionReconnectTrigger) requestReconnect() {
+	if c == nil {
+		return
+	}
+	c.once.Do(func() {
+		close(c.ch)
+	})
+}
+
+func (c *sessionReconnectTrigger) done() <-chan struct{} {
+	if c == nil {
+		return nil
+	}
+	return c.ch
 }
 
 func (s *regionRequestWorker) markRegionEnqueued(region regionInfo, now time.Time) {
@@ -93,19 +128,46 @@ func (s *regionRequestWorker) markRegionEnqueued(region regionInfo, now time.Tim
 }
 
 func (s *regionRequestWorker) handleSessionFailure(session *regionRequestWorkerSession, sessionFailure workerSessionFailure) {
-	// A store/session failure fans out into ordered failures for started regions
-	// and direct failures for requests that never became active states.
+	// runNextSession only returns after the session loops exit, so the started and
+	// not-started sets are already quiescent here.
+	snapshot := session.takeFailureSnapshot()
 	s.submitWorkerSessionFailure(
-		session,
-		session.takeNotStartedRegions(),
+		snapshot.startedRegions,
+		snapshot.pendingRegions,
 		sessionFailure,
 	)
+}
+
+func (s *regionRequestWorker) setSessionReconnectTrigger(trigger *sessionReconnectTrigger) {
+	s.sessionReconnect.Lock()
+	defer s.sessionReconnect.Unlock()
+	s.sessionReconnect.trigger = trigger
+}
+
+func (s *regionRequestWorker) clearSessionReconnectTrigger(trigger *sessionReconnectTrigger) {
+	s.sessionReconnect.Lock()
+	defer s.sessionReconnect.Unlock()
+	if s.sessionReconnect.trigger == trigger {
+		s.sessionReconnect.trigger = nil
+	}
+}
+
+func (s *regionRequestWorker) requestSessionReconnect() bool {
+	s.sessionReconnect.Lock()
+	trigger := s.sessionReconnect.trigger
+	s.sessionReconnect.Unlock()
+	if trigger == nil {
+		return false
+	}
+	trigger.requestReconnect()
+	return true
 }
 
 func (s *regionRequestWorker) runNextSession(
 	ctx context.Context,
 	credential *security.Credential,
 ) (*regionRequestWorkerSession, workerSessionFailure, bool, error) {
+	trigger := newSessionReconnectTrigger()
 	session := newRegionRequestWorkerSession(
 		s.workerID,
 		s.store.storeAddr,
@@ -116,7 +178,10 @@ func (s *regionRequestWorker) runNextSession(
 		s.runtimeRegistry,
 		s.submitDirectFailure,
 		s.pushRegionEvent,
+		trigger,
 	)
+	s.setSessionReconnectTrigger(trigger)
+	defer s.clearSessionReconnectTrigger(trigger)
 	result, err := session.run(ctx)
 	if err != nil {
 		return nil, workerSessionFailure{}, false, err
@@ -177,6 +242,19 @@ func newRegionRequestWorker(
 // add adds a region request to the worker window.
 func (s *regionRequestWorker) add(ctx context.Context, region regionInfo, force bool) (bool, error) {
 	ok, err := s.requestCache.add(ctx, region, force)
+	if err != nil {
+		if errors.Is(err, errActiveDuplicateRegionRequest) {
+			reconnectRequested := s.requestSessionReconnect()
+			log.Warn("duplicate active region request detected, reconnect worker session",
+				zap.Uint64("workerID", s.workerID),
+				zap.Uint64("subscriptionID", uint64(region.subscribedSpan.subID)),
+				zap.Uint64("regionID", region.verID.GetID()),
+				zap.String("addr", s.store.storeAddr),
+				zap.Bool("reconnectRequested", reconnectRequested))
+			return true, nil
+		}
+		return false, err
+	}
 	if ok && err == nil {
 		s.markRegionEnqueued(region, time.Now())
 	}

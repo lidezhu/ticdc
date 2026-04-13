@@ -44,6 +44,11 @@ type sessionLoopExit struct {
 	err    error
 }
 
+type workerSessionFailureSnapshot struct {
+	startedRegions map[SubscriptionID]regionFeedStates
+	pendingRegions []regionInfo
+}
+
 var errWorkerSessionReconnect = errors.New("worker session reconnect")
 
 // regionRequestWorkerSession owns one grpc stream session to one TiKV store.
@@ -58,6 +63,7 @@ type regionRequestWorkerSession struct {
 	runtimeRegistry     *regionRuntimeRegistry
 	submitDirectFailure func(regionFailureInfo)
 	pushRegionEvent     func(SubscriptionID, regionEvent)
+	reconnectTrigger    *sessionReconnectTrigger
 
 	conn            *ConnAndClient
 	bootstrapRegion *regionReq
@@ -78,6 +84,7 @@ func newRegionRequestWorkerSession(
 	runtimeRegistry *regionRuntimeRegistry,
 	submitDirectFailure func(regionFailureInfo),
 	pushRegionEvent func(SubscriptionID, regionEvent),
+	reconnectTrigger *sessionReconnectTrigger,
 ) *regionRequestWorkerSession {
 	session := &regionRequestWorkerSession{
 		workerID:            workerID,
@@ -89,6 +96,7 @@ func newRegionRequestWorkerSession(
 		runtimeRegistry:     runtimeRegistry,
 		submitDirectFailure: submitDirectFailure,
 		pushRegionEvent:     pushRegionEvent,
+		reconnectTrigger:    reconnectTrigger,
 	}
 	session.requestedRegions.subscriptions = make(map[SubscriptionID]regionFeedStates)
 	return session
@@ -226,6 +234,17 @@ func (s *regionRequestWorkerSession) runConnectedLoops(
 	s.startLoop(g, cancel, exitCh, regionFailureSourceWorkerSend, func() error {
 		return s.processRegionSendTask(gctx)
 	})
+	if s.reconnectTrigger != nil {
+		loopCount++
+		s.startLoop(g, cancel, exitCh, regionFailureSourceWorkerSession, func() error {
+			select {
+			case <-gctx.Done():
+				return gctx.Err()
+			case <-s.reconnectTrigger.done():
+				return errWorkerSessionReconnect
+			}
+		})
+	}
 
 	failpoint.Inject("InjectForceReconnect", func() {
 		loopCount++
@@ -678,6 +697,16 @@ func (s *regionRequestWorkerSession) clearRegionStates() map[SubscriptionID]regi
 	subscriptions := s.requestedRegions.subscriptions
 	s.requestedRegions.subscriptions = make(map[SubscriptionID]regionFeedStates)
 	return subscriptions
+}
+
+// takeFailureSnapshot collects everything that still belongs to this session
+// after runConnectedLoops has returned and the send/recv loops are no longer
+// mutating session state.
+func (s *regionRequestWorkerSession) takeFailureSnapshot() workerSessionFailureSnapshot {
+	return workerSessionFailureSnapshot{
+		startedRegions: s.clearRegionStates(),
+		pendingRegions: s.requestCache.takeUnsentRegions(),
+	}
 }
 
 func (s *regionRequestWorkerSession) takeNotStartedRegions() []regionInfo {
