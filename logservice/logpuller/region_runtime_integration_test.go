@@ -33,9 +33,10 @@ func TestScheduleRegionRequestUpdatesRuntimeRegistry(t *testing.T) {
 	client := &subscriptionClient{
 		regionRuntimeRegistry: newRegionRuntimeRegistry(),
 		pdClock:               pdutil.NewClock4Test(),
-		regionTaskQueue:       NewPriorityQueue(),
-		failureBuffer:         newFailureBuffer(),
 	}
+	client.ensureHelpers()
+	client.regionScheduler.regionTaskQueue = NewPriorityQueue()
+	client.regionScheduler.failureBuffer = newFailureBuffer()
 
 	rawSpan := heartbeatpb.TableSpan{
 		TableID:  1,
@@ -57,7 +58,7 @@ func TestScheduleRegionRequestUpdatesRuntimeRegistry(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	task, err := client.regionTaskQueue.Pop(ctx)
+	task, err := client.regionScheduler.regionTaskQueue.Pop(ctx)
 	require.NoError(t, err)
 	queued := task.GetRegionInfo()
 	require.True(t, queued.runtimeKey.isValid())
@@ -72,8 +73,9 @@ func TestScheduleRegionRequestUpdatesRuntimeRegistry(t *testing.T) {
 func TestOnRegionFailUpdatesRuntimeRegistry(t *testing.T) {
 	client := &subscriptionClient{
 		regionRuntimeRegistry: newRegionRuntimeRegistry(),
-		failureBuffer:         newFailureBuffer(),
 	}
+	client.ensureHelpers()
+	client.regionScheduler.failureBuffer = newFailureBuffer()
 	client.ctx, client.cancel = context.WithCancel(context.Background())
 	defer client.cancel()
 
@@ -162,9 +164,10 @@ func TestDoHandleFailureMarksRetryPendingForRetryableRegionError(t *testing.T) {
 	client := &subscriptionClient{
 		regionRuntimeRegistry: newRegionRuntimeRegistry(),
 		pdClock:               pdutil.NewClock4Test(),
-		regionTaskQueue:       NewPriorityQueue(),
-		failureBuffer:         newFailureBuffer(),
 	}
+	client.ensureHelpers()
+	client.regionScheduler.regionTaskQueue = NewPriorityQueue()
+	client.regionScheduler.failureBuffer = newFailureBuffer()
 
 	rawSpan := heartbeatpb.TableSpan{
 		TableID:  1,
@@ -194,9 +197,10 @@ func TestDoHandleFailureMarksRetryPendingForRetryableRegionError(t *testing.T) {
 func TestDoHandleFailureRemovesRuntimeForRangeReload(t *testing.T) {
 	client := &subscriptionClient{
 		regionRuntimeRegistry: newRegionRuntimeRegistry(),
-		rangeTaskCh:           make(chan rangeTask, 1),
-		failureBuffer:         newFailureBuffer(),
 	}
+	client.ensureHelpers()
+	client.regionScheduler.rangeTaskCh = make(chan rangeTask, 1)
+	client.regionScheduler.failureBuffer = newFailureBuffer()
 
 	rawSpan := heartbeatpb.TableSpan{
 		TableID:  1,
@@ -217,7 +221,7 @@ func TestDoHandleFailureRemovesRuntimeForRangeReload(t *testing.T) {
 	require.False(t, ok)
 
 	select {
-	case task := <-client.rangeTaskCh:
+	case task := <-client.regionScheduler.rangeTaskCh:
 		require.Equal(t, rawSpan, task.span)
 		require.Equal(t, subSpan, task.subscribedSpan)
 	case <-time.After(time.Second):
@@ -228,8 +232,9 @@ func TestDoHandleFailureRemovesRuntimeForRangeReload(t *testing.T) {
 func TestDoHandleFailureRemovesRuntimeForCancelledRequest(t *testing.T) {
 	client := &subscriptionClient{
 		regionRuntimeRegistry: newRegionRuntimeRegistry(),
-		failureBuffer:         newFailureBuffer(),
 	}
+	client.ensureHelpers()
+	client.regionScheduler.failureBuffer = newFailureBuffer()
 
 	rawSpan := heartbeatpb.TableSpan{
 		TableID:  1,
@@ -256,8 +261,9 @@ func TestDoHandleFailureRemovesRuntimeForCancelledRequest(t *testing.T) {
 func TestDoHandleFailureRemovesRuntimeForStoppedSubscription(t *testing.T) {
 	client := &subscriptionClient{
 		regionRuntimeRegistry: newRegionRuntimeRegistry(),
-		failureBuffer:         newFailureBuffer(),
 	}
+	client.ensureHelpers()
+	client.regionScheduler.failureBuffer = newFailureBuffer()
 
 	rawSpan := heartbeatpb.TableSpan{
 		TableID:  1,

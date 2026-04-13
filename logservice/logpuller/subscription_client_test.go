@@ -38,9 +38,9 @@ import (
 )
 
 func TestGenerateResolveLockTask(t *testing.T) {
-	client := &subscriptionClient{
-		resolveLockTaskCh: make(chan resolveLockTask, 10),
-	}
+	client := &subscriptionClient{}
+	client.ensureHelpers()
+	client.staleLockResolver.resolveLockTaskCh = make(chan resolveLockTask, 10)
 	client.ctx, client.cancel = context.WithCancel(context.Background())
 	rawSpan := heartbeatpb.TableSpan{
 		TableID:  1,
@@ -50,8 +50,7 @@ func TestGenerateResolveLockTask(t *testing.T) {
 	consumeKVEvents := func(_ []common.RawKVEntry, _ func()) bool { return false }
 	advanceResolvedTs := func(ts uint64) {}
 	span := client.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
-	client.totalSpans.spanMap = make(map[SubscriptionID]*subscribedSpan)
-	client.totalSpans.spanMap[SubscriptionID(1)] = span
+	client.subscribedSpans.add(SubscriptionID(1), span)
 	client.pdClock = pdutil.NewClock4Test()
 
 	// Lock a range, and then ResolveLock will trigger a task for it.
@@ -60,7 +59,7 @@ func TestGenerateResolveLockTask(t *testing.T) {
 	res.LockedRangeState.Initialized.Store(true)
 	span.resolveStaleLocks(200)
 	select {
-	case task := <-client.resolveLockTaskCh:
+	case task := <-client.staleLockResolver.resolveLockTaskCh:
 		require.Equal(t, uint64(1), task.regionID)
 		require.Equal(t, uint64(200), task.targetTs)
 	case <-time.After(100 * time.Millisecond):
@@ -73,12 +72,12 @@ func TestGenerateResolveLockTask(t *testing.T) {
 	state := newRegionFeedState(regionInfo{lockedRangeState: res.LockedRangeState, subscribedSpan: span}, 1, 0, nil, nil, nil)
 	span.resolveStaleLocks(200)
 	select {
-	case task := <-client.resolveLockTaskCh:
+	case task := <-client.staleLockResolver.resolveLockTaskCh:
 		require.Equal(t, uint64(1), task.regionID)
 	case <-time.After(100 * time.Millisecond):
 	}
 	select {
-	case <-client.resolveLockTaskCh:
+	case <-client.staleLockResolver.resolveLockTaskCh:
 		require.True(t, false, "shouldn't get a resolve lock task")
 	case <-time.After(100 * time.Millisecond):
 	}
@@ -87,24 +86,24 @@ func TestGenerateResolveLockTask(t *testing.T) {
 	state.setInitialized()
 	span.resolveStaleLocks(200)
 	select {
-	case <-client.resolveLockTaskCh:
+	case <-client.staleLockResolver.resolveLockTaskCh:
 	case <-time.After(100 * time.Millisecond):
 		require.True(t, false, "must get a resolve lock task")
 	}
 	select {
-	case <-client.resolveLockTaskCh:
+	case <-client.staleLockResolver.resolveLockTaskCh:
 	case <-time.After(100 * time.Millisecond):
 		require.True(t, false, "must get a resolve lock task")
 	}
-	require.Equal(t, 0, len(client.resolveLockTaskCh))
+	require.Equal(t, 0, len(client.staleLockResolver.resolveLockTaskCh))
 
-	close(client.resolveLockTaskCh)
+	close(client.staleLockResolver.resolveLockTaskCh)
 }
 
 func TestResolveLockTaskDroppedWhenChannelFull(t *testing.T) {
-	client := &subscriptionClient{
-		resolveLockTaskCh: make(chan resolveLockTask, 1),
-	}
+	client := &subscriptionClient{}
+	client.ensureHelpers()
+	client.staleLockResolver.resolveLockTaskCh = make(chan resolveLockTask, 1)
 	client.ctx, client.cancel = context.WithCancel(context.Background())
 	defer client.cancel()
 
@@ -122,7 +121,7 @@ func TestResolveLockTaskDroppedWhenChannelFull(t *testing.T) {
 	res.LockedRangeState.Initialized.Store(true)
 
 	// Fill the channel to simulate the resolver goroutine being blocked.
-	client.resolveLockTaskCh <- resolveLockTask{}
+	client.staleLockResolver.resolveLockTaskCh <- resolveLockTask{}
 
 	before := testutil.ToFloat64(metrics.SubscriptionClientResolveLockTaskDropCounter)
 	done := make(chan struct{})
@@ -138,20 +137,20 @@ func TestResolveLockTaskDroppedWhenChannelFull(t *testing.T) {
 	}
 
 	// No new task is added because the channel is still full.
-	require.Equal(t, 1, len(client.resolveLockTaskCh))
+	require.Equal(t, 1, len(client.staleLockResolver.resolveLockTaskCh))
 
 	after := testutil.ToFloat64(metrics.SubscriptionClientResolveLockTaskDropCounter)
 	require.Equal(t, before+1, after)
 
-	<-client.resolveLockTaskCh
-	close(client.resolveLockTaskCh)
+	<-client.staleLockResolver.resolveLockTaskCh
+	close(client.staleLockResolver.resolveLockTaskCh)
 }
 
 func TestStopTaskUsesSubscribedSpanFilterLoop(t *testing.T) {
-	client := &subscriptionClient{
-		resolveLockTaskCh: make(chan resolveLockTask, 1),
-		regionTaskQueue:   NewPriorityQueue(),
-	}
+	client := &subscriptionClient{}
+	client.ensureHelpers()
+	client.staleLockResolver.resolveLockTaskCh = make(chan resolveLockTask, 1)
+	client.regionScheduler.regionTaskQueue = NewPriorityQueue()
 	client.ctx, client.cancel = context.WithCancel(context.Background())
 	defer client.cancel()
 	client.pdClock = pdutil.NewClock4Test()
@@ -172,7 +171,7 @@ func TestStopTaskUsesSubscribedSpanFilterLoop(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	task, err := client.regionTaskQueue.Pop(ctx)
+	task, err := client.regionScheduler.regionTaskQueue.Pop(ctx)
 	require.NoError(t, err)
 	region := task.GetRegionInfo()
 	require.True(t, region.isStopped())
@@ -211,9 +210,10 @@ func (s *mockDynamicStream) GetMetrics() dynstream.Metrics[int, SubscriptionID] 
 
 func TestPushRegionEventToDSUnblocksOnClose(t *testing.T) {
 	client := &subscriptionClient{
-		ds:              &mockDynamicStream{},
-		regionTaskQueue: NewPriorityQueue(),
+		ds: &mockDynamicStream{},
 	}
+	client.ensureHelpers()
+	client.regionScheduler.regionTaskQueue = NewPriorityQueue()
 	client.ctx, client.cancel = context.WithCancel(context.Background())
 	client.cond = sync.NewCond(&client.mu)
 
@@ -243,13 +243,14 @@ func TestPushRegionEventToDSUnblocksOnClose(t *testing.T) {
 func TestEnqueueRegionToAllStoresDoesNotRetryForcedStop(t *testing.T) {
 	ctx := context.Background()
 	client := &subscriptionClient{}
+	client.ensureHelpers()
 
 	worker := &regionRequestWorker{
 		requestCache: newRequestCache(1),
 	}
 	store := newRequestedStore("store-1")
 	store.requestWorkers.s = []*regionRequestWorker{worker}
-	client.stores.Store(store.storeAddr, store)
+	client.requestedStores.stores.Store(store.storeAddr, store)
 
 	dummyRegion := regionInfo{
 		subscribedSpan:   &subscribedSpan{subID: SubscriptionID(2)},

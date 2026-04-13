@@ -67,24 +67,55 @@ func prepareRegionForSendTest(region regionInfo) regionInfo {
 	return region
 }
 
+func newTestRegionRequestWorker(requestCache *requestCache) *regionRequestWorker {
+	if requestCache == nil {
+		requestCache = newRequestCache(1)
+	}
+	return &regionRequestWorker{
+		workerID:            1,
+		clusterID:           123,
+		store:               &requestedStore{storeAddr: "store-1"},
+		requestCache:        requestCache,
+		runtimeRegistry:     newRegionRuntimeRegistry(),
+		pushRegionEvent:     func(SubscriptionID, regionEvent) {},
+		credential:          nil,
+		submitDirectFailure: func(regionFailureInfo) {},
+	}
+}
+
+func newTestRegionRequestWorkerSession(
+	worker *regionRequestWorker,
+) *regionRequestWorkerSession {
+	return newRegionRequestWorkerSession(
+		worker.workerID,
+		worker.store.storeAddr,
+		worker.pd,
+		worker.credential,
+		worker.clusterID,
+		worker.requestCache,
+		worker.runtimeRegistry,
+		worker.submitDirectFailure,
+		worker.pushRegionEvent,
+	)
+}
+
 func TestRegionStatesOperation(t *testing.T) {
-	session := &regionRequestWorkerSession{}
-	session.requestedRegions.subscriptions = make(map[SubscriptionID]regionFeedStates)
+	session := &regionRequestWorkerSession{activeRegions: newActiveRegionStates()}
 
-	require.Nil(t, session.getRegionState(1, 2))
-	require.Nil(t, session.takeRegionState(1, 2))
+	require.Nil(t, session.activeRegions.get(1, 2))
+	require.Nil(t, session.activeRegions.take(1, 2))
 
-	session.addRegionState(1, 2, &regionFeedState{})
-	require.NotNil(t, session.getRegionState(1, 2))
-	require.NotNil(t, session.takeRegionState(1, 2))
-	require.Nil(t, session.getRegionState(1, 2))
-	require.Equal(t, 0, len(session.requestedRegions.subscriptions))
+	session.activeRegions.add(1, 2, &regionFeedState{})
+	require.NotNil(t, session.activeRegions.get(1, 2))
+	require.NotNil(t, session.activeRegions.take(1, 2))
+	require.Nil(t, session.activeRegions.get(1, 2))
+	require.Equal(t, 0, len(session.activeRegions.subscriptions))
 
-	session.addRegionState(1, 2, &regionFeedState{})
-	require.NotNil(t, session.getRegionState(1, 2))
-	require.NotNil(t, session.takeRegionState(1, 2))
-	require.Nil(t, session.getRegionState(1, 2))
-	require.Equal(t, 0, len(session.requestedRegions.subscriptions))
+	session.activeRegions.add(1, 2, &regionFeedState{})
+	require.NotNil(t, session.activeRegions.get(1, 2))
+	require.NotNil(t, session.activeRegions.take(1, 2))
+	require.Nil(t, session.activeRegions.get(1, 2))
+	require.Equal(t, 0, len(session.activeRegions.subscriptions))
 }
 
 func TestTakeNotStartedRegionsReleaseSlotForBootstrapRegion(t *testing.T) {
@@ -120,19 +151,11 @@ func TestSessionRunReturnsStartupFailureAndKeepsBootstrapRegion(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	session := newRegionRequestWorkerSession(
-		1,
-		"store-1",
-		&mockSessionPDClient{
-			stores: []*metapb.Store{{Id: 1, Address: "store-1", Version: "0.0.1"}},
-		},
-		nil,
-		123,
-		requestCache,
-		newRegionRuntimeRegistry(),
-		nil,
-		nil,
-	)
+	worker := newTestRegionRequestWorker(requestCache)
+	worker.pd = &mockSessionPDClient{
+		stores: []*metapb.Store{{Id: 1, Address: "store-1", Version: "0.0.1"}},
+	}
+	session := newTestRegionRequestWorkerSession(worker)
 
 	result, err := session.run(context.Background())
 	require.NoError(t, err)
@@ -212,17 +235,7 @@ func TestWorkerAddDuplicateActiveRegionRequestsWarnAndKeepNewest(t *testing.T) {
 }
 
 func TestRunConnectedLoopsReturnsReceiveFailure(t *testing.T) {
-	session := newRegionRequestWorkerSession(
-		1,
-		"store-1",
-		nil,
-		nil,
-		0,
-		newRequestCache(1),
-		newRegionRuntimeRegistry(),
-		nil,
-		func(SubscriptionID, regionEvent) {},
-	)
+	session := newTestRegionRequestWorkerSession(newTestRegionRequestWorker(newRequestCache(1)))
 	recvErr := errors.New("recv failed")
 	session.conn = &ConnAndClient{
 		Client: &mockEventFeedV2Client{recvErr: recvErr},
@@ -241,17 +254,7 @@ func TestRunConnectedLoopsReturnsReceiveFailure(t *testing.T) {
 }
 
 func TestRunConnectedLoopsTreatsEOFAsReconnect(t *testing.T) {
-	session := newRegionRequestWorkerSession(
-		1,
-		"store-1",
-		nil,
-		nil,
-		0,
-		newRequestCache(1),
-		newRegionRuntimeRegistry(),
-		nil,
-		func(SubscriptionID, regionEvent) {},
-	)
+	session := newTestRegionRequestWorkerSession(newTestRegionRequestWorker(newRequestCache(1)))
 	session.conn = &ConnAndClient{
 		Client: &mockEventFeedV2Client{recvErr: io.EOF},
 	}
@@ -273,17 +276,7 @@ func TestRunConnectedLoopsPrefersSendFailureOverLoopCancellation(t *testing.T) {
 	region := prepareRegionForSendTest(createTestRegionInfo(1, 1))
 	req := newRegionReq(nil, region)
 
-	session := newRegionRequestWorkerSession(
-		1,
-		"store-1",
-		nil,
-		nil,
-		0,
-		requestCache,
-		newRegionRuntimeRegistry(),
-		nil,
-		func(SubscriptionID, regionEvent) {},
-	)
+	session := newTestRegionRequestWorkerSession(newTestRegionRequestWorker(requestCache))
 	session.bootstrapRegion = req
 	sendErr := errors.New("send failed")
 	session.conn = &ConnAndClient{
@@ -360,15 +353,16 @@ func newDispatchResolvedTsTestSession(regionCount int) (*regionRequestWorkerSess
 	}
 	session := &regionRequestWorkerSession{
 		pushRegionEvent: client.pushRegionEventToDS,
+		activeRegions:   newActiveRegionStates(),
 	}
-	session.requestedRegions.subscriptions = map[SubscriptionID]regionFeedStates{
+	session.activeRegions.subscriptions = map[SubscriptionID]regionFeedStates{
 		1: make(regionFeedStates, regionCount),
 	}
 	regions := make([]uint64, regionCount)
 	for i := 0; i < regionCount; i++ {
 		regionID := uint64(i + 1)
 		regions[i] = regionID
-		session.requestedRegions.subscriptions[1][regionID] = &regionFeedState{
+		session.activeRegions.subscriptions[1][regionID] = &regionFeedState{
 			requestID: 1,
 		}
 	}
@@ -396,7 +390,7 @@ func dispatchResolvedTsEventLegacyForBenchmark(s *regionRequestWorkerSession, re
 		resolvedStates = make([]*regionFeedState, 0, resolvedTsStateBatchSize)
 	}
 	for _, regionID := range resolvedTsEvent.Regions {
-		if state := s.getRegionState(subscriptionID, regionID); state != nil {
+		if state := s.activeRegions.get(subscriptionID, regionID); state != nil {
 			resolvedStates = append(resolvedStates, state)
 			if len(resolvedStates) >= resolvedTsStateBatchSize {
 				flush()
@@ -473,9 +467,9 @@ func BenchmarkDispatchResolvedTsEventSmallBatchCurrent(b *testing.B) {
 func TestTakeNotStartedRegionsDoesNotReturnStoppedSentRegion(t *testing.T) {
 	requestCache := newRequestCache(10)
 	session := &regionRequestWorkerSession{
-		requestCache: requestCache,
+		requestCache:  requestCache,
+		activeRegions: newActiveRegionStates(),
 	}
-	session.requestedRegions.subscriptions = make(map[SubscriptionID]regionFeedStates)
 
 	ctx := context.Background()
 	region := createTestRegionInfo(1, 1)
@@ -493,10 +487,10 @@ func TestTakeNotStartedRegionsDoesNotReturnStoppedSentRegion(t *testing.T) {
 		0,
 		req,
 		nil,
-		session.takeRegionState,
+		session.activeRegions.take,
 	)
 	state.start()
-	session.addRegionState(req.regionInfo.subscribedSpan.subID, req.regionInfo.verID.GetID(), state)
+	session.activeRegions.add(req.regionInfo.subscribedSpan.subID, req.regionInfo.verID.GetID(), state)
 
 	// Simulate the race we are fixing in processRegionSendTask:
 	// once a request is visible as sent, a fast region error may mark the
@@ -509,7 +503,7 @@ func TestTakeNotStartedRegionsDoesNotReturnStoppedSentRegion(t *testing.T) {
 		regionFailureSourceWorkerSend,
 		errors.New("send request to store error"),
 	))
-	session.takeRegionState(req.regionInfo.subscribedSpan.subID, req.regionInfo.verID.GetID())
+	session.activeRegions.take(req.regionInfo.subscribedSpan.subID, req.regionInfo.verID.GetID())
 
 	require.Equal(t, 0, requestCache.getPendingCount())
 	snapshot := session.takeFailureSnapshot()
@@ -520,9 +514,9 @@ func TestTakeNotStartedRegionsDoesNotReturnStoppedSentRegion(t *testing.T) {
 func TestTakeNotStartedRegionsDoesNotIncludeActiveSentRegion(t *testing.T) {
 	requestCache := newRequestCache(10)
 	session := &regionRequestWorkerSession{
-		requestCache: requestCache,
+		requestCache:  requestCache,
+		activeRegions: newActiveRegionStates(),
 	}
-	session.requestedRegions.subscriptions = make(map[SubscriptionID]regionFeedStates)
 
 	ctx := context.Background()
 	region := createTestRegionInfo(1, 1)
@@ -540,10 +534,10 @@ func TestTakeNotStartedRegionsDoesNotIncludeActiveSentRegion(t *testing.T) {
 		0,
 		req,
 		nil,
-		session.takeRegionState,
+		session.activeRegions.take,
 	)
 	state.start()
-	session.addRegionState(req.regionInfo.subscribedSpan.subID, req.regionInfo.verID.GetID(), state)
+	session.activeRegions.add(req.regionInfo.subscribedSpan.subID, req.regionInfo.verID.GetID(), state)
 	req.markSent()
 
 	snapshot := session.takeFailureSnapshot()
@@ -575,23 +569,13 @@ func TestProcessRegionSendTaskSendFailureCleansSentRequest(t *testing.T) {
 		Conn:   &grpc.ClientConn{},
 	}
 
-	session := newRegionRequestWorkerSession(
-		1,
-		worker.store.storeAddr,
-		nil,
-		nil,
-		0,
-		worker.requestCache,
-		newRegionRuntimeRegistry(),
-		nil,
-		nil,
-	)
+	session := newTestRegionRequestWorkerSession(worker)
 	session.conn = conn
 	session.bootstrapRegion = req
 	err = session.processRegionSendTask(ctx)
 	require.ErrorIs(t, err, sendErr)
 	require.Equal(t, 0, worker.requestCache.getPendingCount())
-	state := session.getRegionState(req.regionInfo.subscribedSpan.subID, req.regionInfo.verID.GetID())
+	state := session.activeRegions.get(req.regionInfo.subscribedSpan.subID, req.regionInfo.verID.GetID())
 	require.True(t, state == nil || state.isStale(), "region state should be removed or marked stale after send failure")
 	if state != nil {
 		failure, ok := state.detachFailure()
