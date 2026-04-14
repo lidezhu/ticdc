@@ -204,13 +204,7 @@ func (c *requestCache) tryAdd(region regionInfo, force bool) (bool, error) {
 			return true, nil
 		}
 		req.replacesActive = true
-		if req.key.stop {
-			log.Warn("stop request already active, enqueue duplicate deregister",
-				zap.Uint64("subID", uint64(existing.key.subID)),
-				zap.Uint64("regionID", existing.key.regionID),
-				zap.Bool("stop", existing.key.stop),
-				zap.Uint8("stage", uint8(existing.stage)))
-		} else {
+		if !req.key.stop {
 			log.Warn("duplicate active region request detected, keep newest request",
 				zap.Uint64("subID", uint64(existing.key.subID)),
 				zap.Uint64("regionID", existing.key.regionID),
