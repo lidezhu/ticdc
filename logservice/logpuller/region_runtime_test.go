@@ -225,11 +225,9 @@ func TestRegionRuntimeRegistryCollectSlowRegionReport(t *testing.T) {
 	require.Equal(t, uint64(1), report.samples[0].SubscriptionID)
 	require.Equal(t, uint64(101), report.samples[0].RegionID)
 	require.Equal(t, regionPhaseReplicating, report.samples[0].Phase)
-	require.Equal(t, 20*time.Minute, report.samples[0].ResolvedLag)
 	require.Equal(t, 20*time.Minute, report.samples[0].StuckFor)
 
 	require.Equal(t, uint64(102), report.samples[1].RegionID)
 	require.Equal(t, regionPhaseQueued, report.samples[1].Phase)
-	require.Equal(t, 11*time.Minute, report.samples[1].PhaseAge)
 	require.Equal(t, 11*time.Minute, report.samples[1].StuckFor)
 }

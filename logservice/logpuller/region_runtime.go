@@ -121,15 +121,14 @@ type slowRegionReport struct {
 type slowRegionSample struct {
 	SubscriptionID uint64
 	RegionID       uint64
-	TableID        int64
 	Phase          regionPhase
-	StuckFor       time.Duration
-	PhaseAge       time.Duration
-	ResolvedLag    time.Duration
-	StoreAddr      string
-	WorkerID       uint64
-	LastError      string
-	Span           string
+	// StuckFor is phase age for pending phases and resolved-ts lag for
+	// replicating phases.
+	StuckFor  time.Duration
+	StoreAddr string
+	WorkerID  uint64
+	LastError string
+	Span      string
 }
 
 func (s regionRuntimeState) clone() regionRuntimeState {
@@ -501,11 +500,8 @@ func (s regionRuntimeState) slowSample(now time.Time) (slowRegionSample, bool) {
 	return slowRegionSample{
 		SubscriptionID: uint64(s.key.subID),
 		RegionID:       s.key.regionID,
-		TableID:        s.tableID,
 		Phase:          s.phase,
 		StuckFor:       stuckFor,
-		PhaseAge:       s.phaseAge(now),
-		ResolvedLag:    s.resolvedLag(now),
 		StoreAddr:      s.storeAddr,
 		WorkerID:       s.workerID,
 		LastError:      s.lastError,
