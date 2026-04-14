@@ -63,3 +63,21 @@ func GetService[T any](name string) T {
 	v, _ := GetGlobalContext().serviceMap.Load(name)
 	return v.(T)
 }
+
+func LookupService[T any](name string) (T, bool) {
+	v, ok := GetGlobalContext().serviceMap.Load(name)
+	if !ok {
+		var zero T
+		return zero, false
+	}
+	service, ok := v.(T)
+	if !ok {
+		var zero T
+		return zero, false
+	}
+	return service, true
+}
+
+func DeleteService(name string) {
+	GetGlobalContext().serviceMap.Delete(name)
+}

@@ -174,6 +174,8 @@ type SubscriptionClient interface {
 	)
 	// unsubscribe a table span
 	Unsubscribe(subID SubscriptionID)
+	// get a point-in-time observability snapshot for debugging
+	GetObservabilitySnapshot(sampleLimit int) ObservabilitySnapshot
 }
 
 type subscriptionClient struct {
@@ -183,6 +185,7 @@ type subscriptionClient struct {
 	clusterID uint64
 
 	regionRuntimeRegistry *regionRuntimeRegistry
+	failureStats          *failureStats
 
 	pd           pd.Client
 	regionCache  *tikv.RegionCache
@@ -219,6 +222,9 @@ func (s *subscriptionClient) ensureHelpers() {
 	}
 	if s.regionRuntimeRegistry == nil {
 		s.regionRuntimeRegistry = newRegionRuntimeRegistry()
+	}
+	if s.failureStats == nil {
+		s.failureStats = newFailureStats()
 	}
 }
 
@@ -306,6 +312,7 @@ func NewSubscriptionClient(
 		lockResolver: lockResolver,
 
 		regionRuntimeRegistry: newRegionRuntimeRegistry(),
+		failureStats:          newFailureStats(),
 
 		credential: credential,
 	}
@@ -373,13 +380,23 @@ func (s *subscriptionClient) updateMetrics(ctx context.Context) error {
 				).Set(float64(areaMetric.MemoryUsage()))
 			}
 
-			pendingRegionReqCount := s.requestedStores.pendingRequestCount()
-			metrics.SubscriptionClientRequestedRegionCount.WithLabelValues("pending").Set(float64(pendingRegionReqCount))
+			requestStats := s.requestedStores.requestStats()
+			metrics.SubscriptionClientRequestedRegionCount.WithLabelValues("pending").Set(float64(requestStats.Total))
+			metrics.SubscriptionClientRequestedRegionCount.WithLabelValues("queued").Set(float64(requestStats.Queued))
+			metrics.SubscriptionClientRequestedRegionCount.WithLabelValues("processing").Set(float64(requestStats.Processing))
+			metrics.SubscriptionClientRequestedRegionCount.WithLabelValues("sent").Set(float64(requestStats.Sent))
 
 			counts := s.regionRuntimePhaseCounts()
 			for _, phase := range regionRuntimePhases {
 				metrics.SubscriptionClientRegionRuntimePhaseCount.WithLabelValues(string(phase)).Set(float64(counts[phase]))
 			}
+			slowRegionCount, slowRegionCountsByPhase := s.regionRuntimeRegistry.slowRegionCounts(s.pdClock.CurrentTime())
+			metrics.SubscriptionClientSlowRegionCount.Set(float64(slowRegionCount))
+			for _, phase := range regionRuntimePhases {
+				metrics.SubscriptionClientSlowRegionCountByPhase.WithLabelValues(string(phase)).Set(float64(slowRegionCountsByPhase[phase]))
+			}
+			_, unlockedRangeCount := s.collectUnlockedRangeCounts()
+			metrics.SubscriptionClientUnlockedRangeCount.Set(float64(unlockedRangeCount))
 
 			metrics.SubscriptionClientSubscribedRegionCount.Set(float64(s.subscribedSpans.requestedRegionCount()))
 		}
@@ -543,6 +560,76 @@ func (s *subscriptionClient) GetResolvedTsLag() float64 {
 	return s.subscribedSpans.getResolvedTsLag()
 }
 
+func phaseCountsToStrings(counts map[regionPhase]int) map[string]int {
+	result := make(map[string]int, len(counts))
+	for phase, count := range counts {
+		result[string(phase)] = count
+	}
+	return result
+}
+
+func convertSlowRegionSamples(samples []slowRegionSample) []SlowRegionSnapshot {
+	snapshots := make([]SlowRegionSnapshot, 0, len(samples))
+	for _, sample := range samples {
+		snapshots = append(snapshots, SlowRegionSnapshot{
+			SubscriptionID: sample.SubscriptionID,
+			RegionID:       sample.RegionID,
+			Phase:          string(sample.Phase),
+			StuckFor:       sample.StuckFor.String(),
+			StoreAddr:      sample.StoreAddr,
+			WorkerID:       sample.WorkerID,
+			LastError:      sample.LastError,
+			Span:           sample.Span,
+		})
+	}
+	return snapshots
+}
+
+func convertUnlockedRangeSamples(samples []unlockedRangeSample) []UnlockedRangeSnapshot {
+	snapshots := make([]UnlockedRangeSnapshot, 0, len(samples))
+	for _, sample := range samples {
+		snapshots = append(snapshots, UnlockedRangeSnapshot{
+			SubscriptionID: sample.SubscriptionID,
+			TableID:        sample.TableID,
+			HoleCount:      sample.HoleCount,
+			Holes:          append([]string(nil), sample.Holes...),
+		})
+	}
+	return snapshots
+}
+
+func (s *subscriptionClient) runtimeObservability(now time.Time, sampleLimit int) RuntimeObservability {
+	phaseCounts := s.regionRuntimePhaseCounts()
+	trackedRegionCount := 0
+	for _, count := range phaseCounts {
+		trackedRegionCount += count
+	}
+	slowReport := s.regionRuntimeRegistry.collectSlowRegionReport(now, sampleLimit)
+	unlockedReport := s.collectUnlockedRangeReport(sampleLimit, unlockedRangeSampleSpanLimit)
+
+	return RuntimeObservability{
+		TrackedRegionCount:            trackedRegionCount,
+		PhaseCounts:                   phaseCountsToStrings(phaseCounts),
+		SlowRegionCount:               slowReport.slowRegionCount,
+		SlowRegionCountsByPhase:       phaseCountsToStrings(slowReport.phaseCounts),
+		SlowRegions:                   convertSlowRegionSamples(slowReport.samples),
+		SubscriptionWithUnlockedRange: unlockedReport.subscriptionCount,
+		UnlockedRangeCount:            unlockedReport.unlockedRangeCount,
+		UnlockedRanges:                convertUnlockedRangeSamples(unlockedReport.samples),
+	}
+}
+
+func (s *subscriptionClient) GetObservabilitySnapshot(sampleLimit int) ObservabilitySnapshot {
+	sampleLimit = normalizeObservabilitySampleLimit(sampleLimit)
+	now := s.pdClock.CurrentTime()
+	return ObservabilitySnapshot{
+		GeneratedAt: now,
+		Runtime:     s.runtimeObservability(now, sampleLimit),
+		Stores:      s.requestedStores.snapshotStores(),
+		Failures:    s.failureStats.snapshot(),
+	}
+}
+
 func (s *subscriptionClient) scheduleRegionRequest(ctx context.Context, region regionInfo, priority TaskType) {
 	s.regionScheduler.scheduleRegionRequest(ctx, region, priority)
 }
@@ -588,6 +675,21 @@ type unlockedRangeSample struct {
 	TableID        int64
 	HoleCount      int
 	Holes          []string
+}
+
+func (s *subscriptionClient) collectUnlockedRangeCounts() (int, int) {
+	entries := s.subscribedSpans.snapshot()
+	subscriptionCount := 0
+	unlockedRangeCount := 0
+	for _, entry := range entries {
+		attr := entry.span.rangeLock.IterAll(nil)
+		if len(attr.UnLockedRanges) == 0 {
+			continue
+		}
+		subscriptionCount++
+		unlockedRangeCount += len(attr.UnLockedRanges)
+	}
+	return subscriptionCount, unlockedRangeCount
 }
 
 // collectUnlockedRangeReport keeps hole logging bounded as well, so one table
@@ -645,25 +747,27 @@ func (s *subscriptionClient) logSlowRegions(ctx context.Context) error {
 		case <-ticker.C:
 		}
 
-		currTime := s.pdClock.CurrentTime()
-		slowReport := s.regionRuntimeRegistry.collectSlowRegionReport(currTime, slowRegionLogSampleLimit)
-		if slowReport.slowRegionCount > 0 {
+		now := s.pdClock.CurrentTime()
+		runtimeSnapshot := s.runtimeObservability(now, slowRegionLogSampleLimit)
+		if runtimeSnapshot.SlowRegionCount > 0 {
 			log.Info("subscription client slow region summary",
-				zap.Int("trackedRegionCount", slowReport.totalRegionCount),
-				zap.Int("slowRegionCount", slowReport.slowRegionCount),
-				zap.Any("phaseCounts", slowReport.phaseCounts),
-				zap.Any("samples", slowReport.samples))
+				zap.Int("trackedRegionCount", runtimeSnapshot.TrackedRegionCount),
+				zap.Int("slowRegionCount", runtimeSnapshot.SlowRegionCount),
+				zap.Any("phaseCounts", runtimeSnapshot.SlowRegionCountsByPhase),
+				zap.Any("samples", runtimeSnapshot.SlowRegions))
 		}
 
-		unlockedReport := s.collectUnlockedRangeReport(
-			unlockedRangeLogSampleLimit,
-			unlockedRangeSampleSpanLimit,
-		)
-		if unlockedReport.subscriptionCount > 0 {
+		if runtimeSnapshot.SubscriptionWithUnlockedRange > 0 {
 			log.Info("subscription client unlocked range summary",
-				zap.Int("subscriptionCount", unlockedReport.subscriptionCount),
-				zap.Int("unlockedRangeCount", unlockedReport.unlockedRangeCount),
-				zap.Any("samples", unlockedReport.samples))
+				zap.Int("subscriptionCount", runtimeSnapshot.SubscriptionWithUnlockedRange),
+				zap.Int("unlockedRangeCount", runtimeSnapshot.UnlockedRangeCount),
+				zap.Any("samples", runtimeSnapshot.UnlockedRanges))
+		}
+		failures := s.failureStats.snapshot()
+		if len(failures) > 0 {
+			log.Info("subscription client failure summary",
+				zap.Int("failureKindCount", len(failures)),
+				zap.Any("failures", failures))
 		}
 	}
 }

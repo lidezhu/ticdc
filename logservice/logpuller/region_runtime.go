@@ -509,6 +509,26 @@ func (s regionRuntimeState) slowSample(now time.Time) (slowRegionSample, bool) {
 	}, true
 }
 
+func (r *regionRuntimeRegistry) slowRegionCounts(now time.Time) (int, map[regionPhase]int) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	counts := make(map[regionPhase]int)
+	total := 0
+	for _, state := range r.states {
+		threshold, ok := state.slowThreshold()
+		if !ok {
+			continue
+		}
+		if state.slowDuration(now) <= threshold {
+			continue
+		}
+		total++
+		counts[state.phase]++
+	}
+	return total, counts
+}
+
 // collectSlowRegionReport keeps slow-region logging aggregated: one tick gets
 // one summary plus a capped sample set instead of one log line per region.
 func (r *regionRuntimeRegistry) collectSlowRegionReport(

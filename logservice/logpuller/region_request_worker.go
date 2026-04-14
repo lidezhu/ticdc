@@ -15,6 +15,7 @@ package logpuller
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -44,6 +45,9 @@ type regionRequestWorker struct {
 
 	// request cache with flow control
 	requestCache *requestCache
+
+	sessionMu      sync.RWMutex
+	currentSession *regionRequestWorkerSession
 }
 
 func (s *regionRequestWorker) markRegionEnqueued(region regionInfo, now time.Time) {
@@ -64,6 +68,31 @@ func (s *regionRequestWorker) handleSessionFailure(session *regionRequestWorkerS
 	)
 }
 
+func (s *regionRequestWorker) setCurrentSession(session *regionRequestWorkerSession) {
+	s.sessionMu.Lock()
+	s.currentSession = session
+	s.sessionMu.Unlock()
+}
+
+func (s *regionRequestWorker) snapshot() WorkerObservability {
+	workerSnapshot := WorkerObservability{
+		WorkerID:     s.workerID,
+		RequestCache: s.requestCache.snapshot(),
+		SessionState: WorkerSessionStateDisconnected,
+	}
+
+	s.sessionMu.RLock()
+	session := s.currentSession
+	s.sessionMu.RUnlock()
+	if session == nil {
+		return workerSnapshot
+	}
+
+	workerSnapshot.SessionState = session.sessionState()
+	workerSnapshot.ActiveRegionCount = session.activeRegions.countActive()
+	return workerSnapshot
+}
+
 func (s *regionRequestWorker) runNextSession(
 	ctx context.Context,
 ) (*regionRequestWorkerSession, workerSessionFailure, bool, error) {
@@ -78,6 +107,9 @@ func (s *regionRequestWorker) runNextSession(
 		s.submitDirectFailure,
 		s.pushRegionEvent,
 	)
+	session.setStage(WorkerSessionStateWaitingBootstrap)
+	s.setCurrentSession(session)
+	defer s.setCurrentSession(nil)
 	result, err := session.run(ctx)
 	if err != nil {
 		return nil, workerSessionFailure{}, false, err

@@ -92,6 +92,34 @@ var (
 			Name:      "region_runtime_phase_count",
 			Help:      "The number of regions in each runtime phase",
 		}, []string{"phase"})
+	SubscriptionClientSlowRegionCount = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "ticdc",
+			Subsystem: "subscription_client",
+			Name:      "slow_region_count",
+			Help:      "The number of slow regions tracked by the log puller",
+		})
+	SubscriptionClientSlowRegionCountByPhase = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "ticdc",
+			Subsystem: "subscription_client",
+			Name:      "slow_region_count_by_phase",
+			Help:      "The number of slow regions in each runtime phase",
+		}, []string{"phase"})
+	SubscriptionClientUnlockedRangeCount = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "ticdc",
+			Subsystem: "subscription_client",
+			Name:      "unlocked_range_count",
+			Help:      "The number of unlocked ranges across all subscriptions",
+		})
+	SubscriptionClientFailureCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "ticdc",
+			Subsystem: "subscription_client",
+			Name:      "failure_total",
+			Help:      "The total number of log puller failures by scope, source and kind",
+		}, []string{"scope", "source", "kind"})
 
 	SubscriptionClientRegionEventHandleDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
@@ -122,6 +150,10 @@ func initLogPullerMetrics(registry *prometheus.Registry) {
 	registry.MustRegister(SubscriptionClientSubscribedRegionCount)
 	registry.MustRegister(SubscriptionClientResolveLockTaskDropCounter)
 	registry.MustRegister(SubscriptionClientRegionRuntimePhaseCount)
+	registry.MustRegister(SubscriptionClientSlowRegionCount)
+	registry.MustRegister(SubscriptionClientSlowRegionCountByPhase)
+	registry.MustRegister(SubscriptionClientUnlockedRangeCount)
+	registry.MustRegister(SubscriptionClientFailureCounter)
 	registry.MustRegister(SubscriptionClientRegionEventHandleDuration)
 	registry.MustRegister(SubscriptionClientConsumeKVEventsCallbackDuration)
 }

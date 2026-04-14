@@ -25,6 +25,7 @@ import (
 	"github.com/pingcap/ticdc/logservice/logpuller/regionlock"
 	"github.com/pingcap/ticdc/pkg/common"
 	cerror "github.com/pingcap/ticdc/pkg/errors"
+	"github.com/pingcap/ticdc/pkg/metrics"
 	"github.com/pingcap/ticdc/pkg/util"
 	kvclientv2 "github.com/tikv/client-go/v2/kv"
 	"github.com/tikv/client-go/v2/tikv"
@@ -349,7 +350,14 @@ func (b *failureBuffer) run(ctx context.Context) error {
 }
 
 func (s *regionRequestScheduler) submitDirectFailure(failure regionFailureInfo) {
-	s.client.recordRegionRuntimeError(failure.regionInfo, failure.err, time.Now())
+	now := time.Now()
+	s.client.recordRegionRuntimeError(failure.regionInfo, failure.err, now)
+	s.client.failureStats.record(failure, now)
+	metrics.SubscriptionClientFailureCounter.WithLabelValues(
+		failure.scope.String(),
+		failure.source.String(),
+		failure.kind.String(),
+	).Inc()
 	if failure.subscribedSpan.rangeLock.UnlockRange(
 		failure.span.StartKey, failure.span.EndKey,
 		failure.verID.GetID(), failure.verID.GetVer(), failure.resolvedTs()) {

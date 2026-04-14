@@ -15,6 +15,7 @@ package logpuller
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	"github.com/pingcap/errors"
@@ -66,6 +67,7 @@ type regionRequestWorkerSession struct {
 	conn            *ConnAndClient
 	bootstrapRegion *regionReq
 	activeRegions   activeRegionStates
+	stage           atomic.Uint32
 }
 
 func newRegionRequestWorkerSession(
@@ -94,6 +96,7 @@ func newRegionRequestWorkerSession(
 }
 
 func (s *regionRequestWorkerSession) close() {
+	s.setStage(WorkerSessionStateDisconnected)
 	if s.conn != nil && s.conn.Conn != nil {
 		_ = s.conn.Conn.Close()
 	}
@@ -105,6 +108,44 @@ func defaultWorkerSessionFailure(source regionFailureSource, cause error) worker
 		source: source,
 		cause:  cause,
 	}
+}
+
+func stageToUint(stage WorkerSessionState) uint32 {
+	switch stage {
+	case WorkerSessionStateWaitingBootstrap:
+		return 1
+	case WorkerSessionStateCheckingStore:
+		return 2
+	case WorkerSessionStateConnecting:
+		return 3
+	case WorkerSessionStateRunning:
+		return 4
+	default:
+		return 0
+	}
+}
+
+func uintToStage(v uint32) WorkerSessionState {
+	switch v {
+	case 1:
+		return WorkerSessionStateWaitingBootstrap
+	case 2:
+		return WorkerSessionStateCheckingStore
+	case 3:
+		return WorkerSessionStateConnecting
+	case 4:
+		return WorkerSessionStateRunning
+	default:
+		return WorkerSessionStateDisconnected
+	}
+}
+
+func (s *regionRequestWorkerSession) setStage(stage WorkerSessionState) {
+	s.stage.Store(stageToUint(stage))
+}
+
+func (s *regionRequestWorkerSession) sessionState() WorkerSessionState {
+	return uintToStage(s.stage.Load())
 }
 
 // isCanceledByContext only treats nil/context errors as cancellation,
@@ -164,6 +205,7 @@ func pickPrimaryLoopExit(
 }
 
 func (s *regionRequestWorkerSession) run(ctx context.Context) (sessionRunResult, error) {
+	s.setStage(WorkerSessionStateWaitingBootstrap)
 	bootstrapRegion, err := s.waitBootstrapRegion(ctx)
 	if err != nil {
 		if isCanceledByContext(ctx, err) {
@@ -176,6 +218,7 @@ func (s *regionRequestWorkerSession) run(ctx context.Context) (sessionRunResult,
 	sessionCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	s.setStage(WorkerSessionStateCheckingStore)
 	if err := s.checkStoreVersion(sessionCtx); err != nil {
 		if isCanceledByContext(ctx, err) {
 			return sessionRunResult{canceled: true}, nil
@@ -185,6 +228,7 @@ func (s *regionRequestWorkerSession) run(ctx context.Context) (sessionRunResult,
 		}, nil
 	}
 
+	s.setStage(WorkerSessionStateConnecting)
 	s.conn, err = s.connectStore(sessionCtx)
 	if err != nil {
 		if isCanceledByContext(ctx, err) {
@@ -195,6 +239,7 @@ func (s *regionRequestWorkerSession) run(ctx context.Context) (sessionRunResult,
 		}, nil
 	}
 
+	s.setStage(WorkerSessionStateRunning)
 	return s.runConnectedLoops(ctx, sessionCtx, cancel)
 }
 
