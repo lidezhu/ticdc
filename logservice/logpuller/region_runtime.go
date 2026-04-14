@@ -54,8 +54,10 @@ type regionRuntimeIdentity struct {
 }
 
 type regionRuntimeKey struct {
-	subID      SubscriptionID
-	regionID   uint64
+	subID    SubscriptionID
+	regionID uint64
+	// generation distinguishes different runtime attempts of the same
+	// subscription-region pair after retries / reloads.
 	generation uint64
 }
 
@@ -75,8 +77,8 @@ type regionRuntimeState struct {
 	storeAddr     string
 	workerID      uint64
 
-	phase          regionPhase
-	phaseEnterTime time.Time
+	phase      regionPhase
+	phaseSince time.Time
 
 	lastEventTime  time.Time
 	lastResolvedTs uint64
@@ -85,14 +87,14 @@ type regionRuntimeState struct {
 	lastErrorTime time.Time
 	retryCount    int
 
-	// phaseEnterTime records the current lifecycle phase boundary.
-	// The fields below keep distinct historical milestones that are still useful
-	// after the phase moves forward.
-	rangeLockAcquiredTime time.Time
-	requestEnqueueTime    time.Time
-	requestRPCReadyTime   time.Time
-	requestSendTime       time.Time
-	initializedTime       time.Time
+	// phaseSince tracks the current phase boundary.
+	// The fields below keep distinct milestones for the current attempt even
+	// after the phase has moved forward.
+	rangeLockTime     time.Time
+	workerEnqueueTime time.Time
+	rpcReadyTime      time.Time
+	requestSentTime   time.Time
+	replicatingSince  time.Time
 }
 
 func (s regionRuntimeState) clone() regionRuntimeState {
@@ -128,6 +130,9 @@ func cloneTableSpan(span heartbeatpb.TableSpan) heartbeatpb.TableSpan {
 	return cloned
 }
 
+// regionRuntimeRegistry keeps the latest lifecycle snapshot for each region
+// request attempt so slow / stuck regions can be inspected without walking the
+// scheduler, worker, and region state structures together.
 type regionRuntimeRegistry struct {
 	mu sync.RWMutex
 
@@ -176,14 +181,13 @@ func (r *regionRuntimeRegistry) upsert(
 	return state.clone()
 }
 
-func (r *regionRuntimeRegistry) transition(
+func (r *regionRuntimeRegistry) markRangeLockWait(
 	key regionRuntimeKey,
-	phase regionPhase,
-	phaseEnterTime time.Time,
+	waitTime time.Time,
 ) regionRuntimeState {
 	return r.upsert(key, func(state *regionRuntimeState) {
-		state.phase = phase
-		state.phaseEnterTime = phaseEnterTime
+		state.phase = regionPhaseRangeLockWait
+		state.phaseSince = waitTime
 	})
 }
 
@@ -196,7 +200,7 @@ func (r *regionRuntimeRegistry) updateRegionInfo(
 	})
 }
 
-func (r *regionRuntimeRegistry) registerRegion(
+func (r *regionRuntimeRegistry) markDiscovered(
 	key regionRuntimeKey,
 	region regionInfo,
 	discoveredTime time.Time,
@@ -204,7 +208,7 @@ func (r *regionRuntimeRegistry) registerRegion(
 	return r.upsert(key, func(state *regionRuntimeState) {
 		state.applyRegionInfo(region)
 		state.phase = regionPhaseDiscovered
-		state.phaseEnterTime = discoveredTime
+		state.phaseSince = discoveredTime
 	})
 }
 
@@ -259,28 +263,28 @@ func (r *regionRuntimeRegistry) markRetryPending(
 		state.lastErrorTime = retryTime
 		state.retryCount++
 		state.phase = regionPhaseRetryPending
-		state.phaseEnterTime = retryTime
+		state.phaseSince = retryTime
 	})
 }
 
-func (r *regionRuntimeRegistry) setRequestEnqueueTime(
+func (r *regionRuntimeRegistry) markRequestEnqueued(
 	key regionRuntimeKey,
 	enqueueTime time.Time,
 ) regionRuntimeState {
 	return r.upsert(key, func(state *regionRuntimeState) {
-		state.requestEnqueueTime = enqueueTime
+		state.workerEnqueueTime = enqueueTime
 	})
 }
 
 func (r *regionRuntimeRegistry) markQueued(
 	key regionRuntimeKey,
-	acquiredTime time.Time,
+	rangeLockTime time.Time,
 	queuedTime time.Time,
 ) regionRuntimeState {
 	return r.upsert(key, func(state *regionRuntimeState) {
-		state.rangeLockAcquiredTime = acquiredTime
+		state.rangeLockTime = rangeLockTime
 		state.phase = regionPhaseQueued
-		state.phaseEnterTime = queuedTime
+		state.phaseSince = queuedTime
 	})
 }
 
@@ -289,9 +293,9 @@ func (r *regionRuntimeRegistry) markRPCReady(
 	rpcReadyTime time.Time,
 ) regionRuntimeState {
 	return r.upsert(key, func(state *regionRuntimeState) {
-		state.requestRPCReadyTime = rpcReadyTime
+		state.rpcReadyTime = rpcReadyTime
 		state.phase = regionPhaseRPCReady
-		state.phaseEnterTime = rpcReadyTime
+		state.phaseSince = rpcReadyTime
 	})
 }
 
@@ -302,20 +306,30 @@ func (r *regionRuntimeRegistry) markWaitInitialized(
 ) regionRuntimeState {
 	return r.upsert(key, func(state *regionRuntimeState) {
 		state.workerID = workerID
-		state.requestSendTime = sendTime
+		state.requestSentTime = sendTime
 		state.phase = regionPhaseWaitInitialized
-		state.phaseEnterTime = sendTime
+		state.phaseSince = sendTime
 	})
 }
 
 func (r *regionRuntimeRegistry) markReplicating(
 	key regionRuntimeKey,
-	initializedTime time.Time,
+	replicatingTime time.Time,
 ) regionRuntimeState {
 	return r.upsert(key, func(state *regionRuntimeState) {
-		state.initializedTime = initializedTime
+		state.replicatingSince = replicatingTime
 		state.phase = regionPhaseReplicating
-		state.phaseEnterTime = initializedTime
+		state.phaseSince = replicatingTime
+	})
+}
+
+func (r *regionRuntimeRegistry) markRemoved(
+	key regionRuntimeKey,
+	removedTime time.Time,
+) regionRuntimeState {
+	return r.upsert(key, func(state *regionRuntimeState) {
+		state.phase = regionPhaseRemoved
+		state.phaseSince = removedTime
 	})
 }
 

@@ -218,13 +218,13 @@ func (s *subscriptionClient) ensureHelpers() {
 	}
 }
 
-func (s *subscriptionClient) ensureRegionRuntime(region *regionInfo, now time.Time) {
+func (s *subscriptionClient) markRegionDiscovered(region *regionInfo, now time.Time) {
 	if region.verID.GetID() == 0 {
 		return
 	}
 	if !region.runtimeKey.isValid() {
 		region.runtimeKey = s.regionRuntimeRegistry.allocKey(region.subscribedSpan.subID, region.verID.GetID())
-		s.regionRuntimeRegistry.registerRegion(region.runtimeKey, *region, now)
+		s.regionRuntimeRegistry.markDiscovered(region.runtimeKey, *region, now)
 	}
 }
 
@@ -235,11 +235,11 @@ func (s *subscriptionClient) updateRegionRuntimeInfo(region regionInfo) {
 	s.regionRuntimeRegistry.updateRegionInfo(region.runtimeKey, region)
 }
 
-func (s *subscriptionClient) transitionRegionRuntime(region regionInfo, phase regionPhase, now time.Time) {
+func (s *subscriptionClient) markRegionRangeLockWait(region regionInfo, now time.Time) {
 	if !region.runtimeKey.isValid() {
 		return
 	}
-	s.regionRuntimeRegistry.transition(region.runtimeKey, phase, now)
+	s.regionRuntimeRegistry.markRangeLockWait(region.runtimeKey, now)
 }
 
 func (s *subscriptionClient) markRegionRetryPending(region regionInfo, err error, now time.Time) {
@@ -282,7 +282,7 @@ func (s *subscriptionClient) removeRegionRuntime(region regionInfo, now time.Tim
 	if !region.runtimeKey.isValid() {
 		return
 	}
-	s.regionRuntimeRegistry.transition(region.runtimeKey, regionPhaseRemoved, now)
+	s.regionRuntimeRegistry.markRemoved(region.runtimeKey, now)
 	s.regionRuntimeRegistry.remove(region.runtimeKey)
 }
 
