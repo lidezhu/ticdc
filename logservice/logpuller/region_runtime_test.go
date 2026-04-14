@@ -63,8 +63,8 @@ func TestRegionRuntimeRegistryUpdateAndSnapshot(t *testing.T) {
 		subscribedSpan: subSpan,
 	}
 
-	registry.registerRegion(key, region, now)
-	registry.setRequestEnqueueTime(key, now.Add(500*time.Millisecond))
+	registry.markDiscovered(key, region, now)
+	registry.markRequestEnqueued(key, now.Add(500*time.Millisecond))
 	registry.markQueued(key, now.Add(time.Second), now.Add(2*time.Second))
 	registry.markWaitInitialized(key, 7, now.Add(3*time.Second))
 	registry.updateResolvedTs(key, 12345, now.Add(4*time.Second))
@@ -81,10 +81,10 @@ func TestRegionRuntimeRegistryUpdateAndSnapshot(t *testing.T) {
 	require.Equal(t, uint64(12345), state.lastResolvedTs)
 	require.Equal(t, "store busy", state.lastError)
 	require.Equal(t, 0, state.retryCount)
-	require.Equal(t, now.Add(time.Second), state.rangeLockAcquiredTime)
-	require.Equal(t, now.Add(3*time.Second), state.phaseEnterTime)
-	require.Equal(t, now.Add(3*time.Second), state.requestSendTime)
-	require.Equal(t, now.Add(500*time.Millisecond), state.requestEnqueueTime)
+	require.Equal(t, now.Add(time.Second), state.rangeLockTime)
+	require.Equal(t, now.Add(3*time.Second), state.phaseSince)
+	require.Equal(t, now.Add(3*time.Second), state.requestSentTime)
+	require.Equal(t, now.Add(500*time.Millisecond), state.workerEnqueueTime)
 
 	snapshots := registry.snapshot()
 	require.Len(t, snapshots, 1)
@@ -106,8 +106,8 @@ func TestRegionRuntimeRegistryMarkReplicating(t *testing.T) {
 	state, ok := registry.get(key)
 	require.True(t, ok)
 	require.Equal(t, regionPhaseReplicating, state.phase)
-	require.Equal(t, now, state.initializedTime)
-	require.Equal(t, now, state.phaseEnterTime)
+	require.Equal(t, now, state.replicatingSince)
+	require.Equal(t, now, state.phaseSince)
 }
 
 func TestRegionRuntimeRegistryRemoveBySubscription(t *testing.T) {
@@ -116,9 +116,9 @@ func TestRegionRuntimeRegistryRemoveBySubscription(t *testing.T) {
 	key2 := registry.allocKey(1, 102)
 	key3 := registry.allocKey(2, 201)
 
-	registry.transition(key1, regionPhaseDiscovered, time.Unix(1, 0))
-	registry.transition(key2, regionPhaseRemoved, time.Unix(2, 0))
-	registry.transition(key3, regionPhaseReplicating, time.Unix(3, 0))
+	registry.markDiscovered(key1, regionInfo{}, time.Unix(1, 0))
+	registry.markRemoved(key2, time.Unix(2, 0))
+	registry.markReplicating(key3, time.Unix(3, 0))
 
 	require.Len(t, registry.snapshot(), 3)
 	require.Equal(t, 2, registry.removeBySubscription(1))
@@ -142,9 +142,9 @@ func TestRegionRuntimeRegistryPhaseCounts(t *testing.T) {
 	key2 := registry.allocKey(1, 102)
 	key3 := registry.allocKey(2, 201)
 
-	registry.transition(key1, regionPhaseQueued, now)
-	registry.transition(key2, regionPhaseQueued, now.Add(time.Second))
-	registry.transition(key3, regionPhaseWaitInitialized, now.Add(2*time.Second))
+	registry.markQueued(key1, now, now)
+	registry.markQueued(key2, now.Add(time.Second), now.Add(time.Second))
+	registry.markWaitInitialized(key3, 0, now.Add(2*time.Second))
 
 	counts := registry.phaseCounts()
 	require.Equal(t, 2, counts[regionPhaseQueued])

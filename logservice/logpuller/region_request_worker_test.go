@@ -182,7 +182,7 @@ func TestWorkerAddDuplicateQueuedRequestRefreshesEnqueueTime(t *testing.T) {
 
 	region := prepareRegionForSendTest(createTestRegionInfo(1, 1))
 	region.runtimeKey = runtimeRegistry.allocKey(region.subscribedSpan.subID, region.verID.GetID())
-	runtimeRegistry.registerRegion(region.runtimeKey, region, time.Now())
+	runtimeRegistry.markDiscovered(region.runtimeKey, region, time.Now())
 
 	ok, err := worker.add(context.Background(), region, false)
 	require.NoError(t, err)
@@ -190,7 +190,7 @@ func TestWorkerAddDuplicateQueuedRequestRefreshesEnqueueTime(t *testing.T) {
 
 	firstState, ok := runtimeRegistry.get(region.runtimeKey)
 	require.True(t, ok)
-	firstEnqueueTime := firstState.requestEnqueueTime
+	firstEnqueueTime := firstState.workerEnqueueTime
 	require.False(t, firstEnqueueTime.IsZero())
 
 	time.Sleep(10 * time.Millisecond)
@@ -201,7 +201,7 @@ func TestWorkerAddDuplicateQueuedRequestRefreshesEnqueueTime(t *testing.T) {
 
 	secondState, ok := runtimeRegistry.get(region.runtimeKey)
 	require.True(t, ok)
-	require.True(t, secondState.requestEnqueueTime.After(firstEnqueueTime))
+	require.True(t, secondState.workerEnqueueTime.After(firstEnqueueTime))
 }
 
 func TestWorkerAddDuplicateActiveRegionRequestsWarnAndKeepNewest(t *testing.T) {

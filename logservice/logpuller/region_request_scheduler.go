@@ -244,12 +244,12 @@ func (s *regionRequestScheduler) divideSpanAndScheduleRegionRequests(
 }
 
 func (s *regionRequestScheduler) scheduleRegionRequest(ctx context.Context, region regionInfo, priority TaskType) {
-	s.client.ensureRegionRuntime(&region, time.Now())
+	s.client.markRegionDiscovered(&region, time.Now())
 	lockRangeResult := region.subscribedSpan.rangeLock.LockRange(
 		ctx, region.span.StartKey, region.span.EndKey, region.verID.GetID(), region.verID.GetVer())
 
 	if lockRangeResult.Status == regionlock.LockRangeStatusWait {
-		s.client.transitionRegionRuntime(region, regionPhaseRangeLockWait, time.Now())
+		s.client.markRegionRangeLockWait(region, time.Now())
 		lockRangeResult = lockRangeResult.WaitFn()
 	}
 

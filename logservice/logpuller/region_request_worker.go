@@ -50,7 +50,7 @@ func (s *regionRequestWorker) markRegionEnqueued(region regionInfo, now time.Tim
 	if !region.runtimeKey.isValid() {
 		return
 	}
-	s.runtimeRegistry.setRequestEnqueueTime(region.runtimeKey, now)
+	s.runtimeRegistry.markRequestEnqueued(region.runtimeKey, now)
 }
 
 func (s *regionRequestWorker) handleSessionFailure(session *regionRequestWorkerSession, sessionFailure workerSessionFailure) {
