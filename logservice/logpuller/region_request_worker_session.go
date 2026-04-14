@@ -15,7 +15,6 @@ package logpuller
 
 import (
 	"context"
-	"sync"
 	"time"
 
 	"github.com/pingcap/errors"
@@ -66,11 +65,7 @@ type regionRequestWorkerSession struct {
 
 	conn            *ConnAndClient
 	bootstrapRegion *regionReq
-
-	requestedRegions struct {
-		sync.RWMutex
-		subscriptions map[SubscriptionID]regionFeedStates
-	}
+	activeRegions   activeRegionStates
 }
 
 func newRegionRequestWorkerSession(
@@ -84,7 +79,7 @@ func newRegionRequestWorkerSession(
 	submitDirectFailure func(regionFailureInfo),
 	pushRegionEvent func(SubscriptionID, regionEvent),
 ) *regionRequestWorkerSession {
-	session := &regionRequestWorkerSession{
+	return &regionRequestWorkerSession{
 		workerID:            workerID,
 		storeAddr:           storeAddr,
 		pd:                  pd,
@@ -94,9 +89,8 @@ func newRegionRequestWorkerSession(
 		runtimeRegistry:     runtimeRegistry,
 		submitDirectFailure: submitDirectFailure,
 		pushRegionEvent:     pushRegionEvent,
+		activeRegions:       newActiveRegionStates(),
 	}
-	session.requestedRegions.subscriptions = make(map[SubscriptionID]regionFeedStates)
-	return session
 }
 
 func (s *regionRequestWorkerSession) close() {
@@ -164,9 +158,6 @@ func pickPrimaryLoopExit(
 		}
 	}
 	if waitErr != nil && !isCanceledByContext(ctx, waitErr) {
-		return sessionLoopExit{source: regionFailureSourceWorkerSession, err: waitErr}
-	}
-	if len(exits) == 0 {
 		return sessionLoopExit{source: regionFailureSourceWorkerSession, err: waitErr}
 	}
 	return exits[0]
@@ -350,7 +341,7 @@ func (s *regionRequestWorkerSession) newState(request *regionReq) *regionFeedSta
 		s.workerID,
 		request,
 		s.runtimeRegistry,
-		s.takeRegionState,
+		s.activeRegions.take,
 	)
 }
 
@@ -390,7 +381,7 @@ func (s *regionRequestWorkerSession) submitOrderedStateFailure(state *regionFeed
 }
 
 func (s *regionRequestWorkerSession) cancelSubscriptionStates(subID SubscriptionID) {
-	for _, state := range s.takeRegionStates(subID) {
+	for _, state := range s.activeRegions.takeSubscription(subID) {
 		s.submitOrderedStateFailure(
 			state,
 			newRequestCancelledFailure(state.getRegionInfo(), regionFailureSourceDeregister),
@@ -401,7 +392,7 @@ func (s *regionRequestWorkerSession) cancelSubscriptionStates(subID Subscription
 func (s *regionRequestWorkerSession) dispatchRegionChangeEvents(events []*cdcpb.Event) {
 	for _, event := range events {
 		subscriptionID := SubscriptionID(event.RequestId)
-		if state := s.getRegionState(subscriptionID, event.RegionId); state != nil {
+		if state := s.activeRegions.get(subscriptionID, event.RegionId); state != nil {
 			s.handleTrackedRegionEvent(subscriptionID, state, event)
 			continue
 		}
@@ -494,7 +485,7 @@ func (s *regionRequestWorkerSession) dispatchResolvedTsEvent(resolvedTsEvent *cd
 		resolvedStates = nil
 	}
 	for i, regionID := range resolvedTsEvent.Regions {
-		if state := s.getRegionState(subscriptionID, regionID); state != nil {
+		if state := s.activeRegions.get(subscriptionID, regionID); state != nil {
 			resolvedStates = append(resolvedStates, state)
 			if len(resolvedStates) >= resolvedTsStateBatchSize {
 				flush()
@@ -572,7 +563,7 @@ func (s *regionRequestWorkerSession) handleActiveRegionRequest(request *regionRe
 	subID := region.subscribedSpan.subID
 	state := s.newState(request)
 	state.start()
-	s.addRegionState(subID, region.verID.GetID(), state)
+	s.activeRegions.add(subID, region.verID.GetID(), state)
 
 	// Mark the request as sent before sending it to keep active-state tracking
 	// and request lifecycle tracking visible in the same order.
@@ -635,62 +626,15 @@ func (s *regionRequestWorkerSession) createRegionRequest(region regionInfo) *cdc
 	}
 }
 
-func (s *regionRequestWorkerSession) addRegionState(subscriptionID SubscriptionID, regionID uint64, state *regionFeedState) {
-	s.requestedRegions.Lock()
-	defer s.requestedRegions.Unlock()
-	states := s.requestedRegions.subscriptions[subscriptionID]
-	if states == nil {
-		states = make(regionFeedStates)
-		s.requestedRegions.subscriptions[subscriptionID] = states
-	}
-	states[regionID] = state
-}
-
-func (s *regionRequestWorkerSession) getRegionState(subscriptionID SubscriptionID, regionID uint64) *regionFeedState {
-	s.requestedRegions.RLock()
-	defer s.requestedRegions.RUnlock()
-	if states, ok := s.requestedRegions.subscriptions[subscriptionID]; ok {
-		return states[regionID]
-	}
-	return nil
-}
-
-func (s *regionRequestWorkerSession) takeRegionState(subscriptionID SubscriptionID, regionID uint64) *regionFeedState {
-	s.requestedRegions.Lock()
-	defer s.requestedRegions.Unlock()
-	if statesMap, ok := s.requestedRegions.subscriptions[subscriptionID]; ok {
-		state := statesMap[regionID]
-		delete(statesMap, regionID)
-		if len(statesMap) == 0 {
-			delete(s.requestedRegions.subscriptions, subscriptionID)
-		}
-		return state
-	}
-	return nil
-}
-
-func (s *regionRequestWorkerSession) takeRegionStates(subscriptionID SubscriptionID) regionFeedStates {
-	s.requestedRegions.Lock()
-	defer s.requestedRegions.Unlock()
-	states := s.requestedRegions.subscriptions[subscriptionID]
-	delete(s.requestedRegions.subscriptions, subscriptionID)
-	return states
-}
-
 // takeFailureSnapshot is only called after runConnectedLoops has returned.
 // At that point the old session loops have stopped, so no request can still
-// move from requestCache into requestedRegions. We can therefore drain
-// requestedRegions as startedRegions, then take the remaining unsent requests
+// move from requestCache into activeRegions. We can therefore drain
+// activeRegions as startedRegions, then take the remaining unsent requests
 // from requestCache as pendingRegions, without classifying one request into
 // both sets.
 func (s *regionRequestWorkerSession) takeFailureSnapshot() workerSessionFailureSnapshot {
-	s.requestedRegions.Lock()
-	startedRegions := s.requestedRegions.subscriptions
-	s.requestedRegions.subscriptions = make(map[SubscriptionID]regionFeedStates)
-	s.requestedRegions.Unlock()
-
 	return workerSessionFailureSnapshot{
-		startedRegions: startedRegions,
+		startedRegions: s.activeRegions.takeAll(),
 		pendingRegions: s.requestCache.takeUnsentRegions(),
 	}
 }

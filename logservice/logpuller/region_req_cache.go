@@ -120,9 +120,9 @@ type requestCache struct {
 	// it includes queued, processing and sent requests.
 	requests map[*regionReq]struct{}
 	// current points to the newest live request for a key.
-	// A queued duplicate updates the existing queued request in place. If an
+	// A queued duplicate updates the existing queued request in place. If the
 	// older request is already processing or sent, the newer request is still
-	// accepted and becomes the new current request for that key.
+	// queued and becomes current[key].
 	current map[regionReqKey]*regionReq
 	// ready is the FIFO of queued requests waiting for the send loop.
 	// readyIdx lets us compact lazily instead of shifting on every pop.
@@ -155,8 +155,8 @@ func newRequestCache(maxPendingCount int) *requestCache {
 // add admits a request into this worker window.
 // If the same key is still queued, the newer region info replaces the old one.
 // If the older request is already processing or sent, the newer request is
-// still queued, becomes current[key], and emits a warn log. Stop requests keep
-// the same compatibility path.
+// still queued, becomes current[key], and emits a warn log for normal regions.
+// Stop requests keep the same compatibility path.
 func (c *requestCache) add(ctx context.Context, region regionInfo, force bool) (bool, error) {
 	start := time.Now()
 	ticker := time.NewTicker(addReqRetryInterval)
