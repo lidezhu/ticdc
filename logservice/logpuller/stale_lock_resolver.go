@@ -78,9 +78,6 @@ func (s *staleLockResolver) runResolveLockChecker(ctx context.Context) error {
 		}
 		currentTime := s.client.pdClock.CurrentTime()
 		for _, entry := range s.client.subscribedSpans.snapshot() {
-			if entry.span == nil {
-				continue
-			}
 			targetTs := getResolvedTargetTs(entry.span, currentTime)
 			if targetTs > 0 {
 				targets = append(targets, staleLockResolveTarget{

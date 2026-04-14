@@ -49,7 +49,7 @@ func TestGenerateResolveLockTask(t *testing.T) {
 	}
 	consumeKVEvents := func(_ []common.RawKVEntry, _ func()) bool { return false }
 	advanceResolvedTs := func(ts uint64) {}
-	span := client.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
+	span := client.subscribedSpans.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
 	client.subscribedSpans.add(SubscriptionID(1), span)
 	client.pdClock = pdutil.NewClock4Test()
 
@@ -114,7 +114,7 @@ func TestResolveLockTaskDroppedWhenChannelFull(t *testing.T) {
 	}
 	consumeKVEvents := func(_ []common.RawKVEntry, _ func()) bool { return false }
 	advanceResolvedTs := func(ts uint64) {}
-	span := client.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
+	span := client.subscribedSpans.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
 
 	res := span.rangeLock.LockRange(context.Background(), []byte{'b'}, []byte{'c'}, 1, 100)
 	require.Equal(t, regionlock.LockRangeStatusSuccess, res.Status)
@@ -162,12 +162,12 @@ func TestStopTaskUsesSubscribedSpanFilterLoop(t *testing.T) {
 	}
 	consumeKVEvents := func(_ []common.RawKVEntry, _ func()) bool { return false }
 	advanceResolvedTs := func(ts uint64) {}
-	span := client.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, true)
+	span := client.subscribedSpans.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, true)
 
 	res := span.rangeLock.LockRange(context.Background(), rawSpan.StartKey, rawSpan.EndKey, 1, 1)
 	require.Equal(t, regionlock.LockRangeStatusSuccess, res.Status)
 
-	client.setTableStopped(span)
+	client.subscribedSpans.setTableStopped(span)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -240,32 +240,51 @@ func TestPushRegionEventToDSUnblocksOnClose(t *testing.T) {
 	}
 }
 
-func TestBroadcastStopRequestBypassesQueueLimit(t *testing.T) {
+func TestBroadcastStopRequestReachesAllWorkersAndBypassesQueueLimit(t *testing.T) {
 	ctx := context.Background()
 	client := &subscriptionClient{}
 	client.ensureHelpers()
 
-	worker := &regionRequestWorker{
-		requestCache: newRequestCache(1),
-	}
-	store := newRequestedStore("store-1")
-	store.requestWorkers.s = []*regionRequestWorker{worker}
-	client.requestedStores.stores.Store(store.storeAddr, store)
-
-	dummyRegion := regionInfo{
-		subscribedSpan:   &subscribedSpan{subID: SubscriptionID(2)},
-		lockedRangeState: &regionlock.LockedRangeState{},
-	}
-	ok, err := worker.add(ctx, dummyRegion, true)
-	require.NoError(t, err)
-	require.True(t, ok)
-
 	stopRegion := regionInfo{
 		subscribedSpan: &subscribedSpan{subID: SubscriptionID(1)},
 	}
-	err = client.requestedStores.broadcastStopRequest(ctx, stopRegion)
+
+	makeWorker := func(id uint64) *regionRequestWorker {
+		worker := &regionRequestWorker{
+			workerID:     id,
+			requestCache: newRequestCache(1),
+		}
+		dummyRegion := regionInfo{
+			subscribedSpan:   &subscribedSpan{subID: SubscriptionID(id + 100)},
+			lockedRangeState: &regionlock.LockedRangeState{},
+		}
+		ok, err := worker.add(ctx, dummyRegion, true)
+		require.NoError(t, err)
+		require.True(t, ok)
+		return worker
+	}
+
+	store1 := newRequestedStore("store-1")
+	store1.requestWorkers.s = []*regionRequestWorker{
+		makeWorker(1),
+		makeWorker(2),
+	}
+	store2 := newRequestedStore("store-2")
+	store2.requestWorkers.s = []*regionRequestWorker{
+		makeWorker(3),
+		makeWorker(4),
+	}
+	client.requestedStores.stores.Store(store1.storeAddr, store1)
+	client.requestedStores.stores.Store(store2.storeAddr, store2)
+
+	err := client.requestedStores.broadcastStopRequest(ctx, stopRegion)
 	require.NoError(t, err)
-	require.Equal(t, 2, worker.requestCache.getPendingCount())
+
+	for _, store := range []*requestedStore{store1, store2} {
+		for _, worker := range store.snapshotWorkers() {
+			require.Equal(t, 2, worker.requestCache.getPendingCount())
+		}
+	}
 }
 
 func TestSubscriptionWithFailedTiKV(t *testing.T) {

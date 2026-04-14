@@ -518,61 +518,6 @@ func (s *subscriptionClient) Close(ctx context.Context) error {
 	return nil
 }
 
-func (s *subscriptionClient) setTableStopped(rt *subscribedSpan) {
-	s.subscribedSpans.setTableStopped(rt)
-}
-
-func (s *subscriptionClient) newSubscribedSpan(
-	subID SubscriptionID,
-	span heartbeatpb.TableSpan,
-	startTs uint64,
-	consumeKVEvents func(raw []common.RawKVEntry, wakeCallback func()) bool,
-	advanceResolvedTs func(ts uint64),
-	advanceInterval int64,
-	filterLoop bool,
-) *subscribedSpan {
-	return s.subscribedSpans.newSubscribedSpan(
-		subID, span, startTs, consumeKVEvents, advanceResolvedTs, advanceInterval, filterLoop)
-}
-
-func (s *subscriptionClient) GetResolvedTsLag() float64 {
-	return s.subscribedSpans.getResolvedTsLag()
-}
-
-func (s *subscriptionClient) scheduleRegionRequest(ctx context.Context, region regionInfo, priority TaskType) {
-	s.regionScheduler.scheduleRegionRequest(ctx, region, priority)
-}
-
-func (s *subscriptionClient) scheduleRangeRequest(
-	ctx context.Context,
-	span heartbeatpb.TableSpan,
-	subscribedSpan *subscribedSpan,
-	filterLoop bool,
-	priority TaskType,
-) {
-	s.regionScheduler.scheduleRangeRequest(ctx, span, subscribedSpan, filterLoop, priority)
-}
-
-func (s *subscriptionClient) submitDirectFailure(failure regionFailureInfo) {
-	s.regionScheduler.submitDirectFailure(failure)
-}
-
-func (s *subscriptionClient) submitOrderedFailure(state *regionFeedState) (regionFailureInfo, bool) {
-	return s.regionScheduler.submitOrderedFailure(state)
-}
-
-func (s *subscriptionClient) submitWorkerSessionFailure(
-	startedRegions map[SubscriptionID]regionFeedStates,
-	pendingRegions []regionInfo,
-	sessionFailure workerSessionFailure,
-) {
-	s.regionScheduler.submitWorkerSessionFailure(startedRegions, pendingRegions, sessionFailure)
-}
-
-func (s *subscriptionClient) handleFailure(ctx context.Context, failure regionFailureInfo) error {
-	return s.regionScheduler.handleFailure(ctx, failure)
-}
-
 func (s *subscriptionClient) logSlowRegions(ctx context.Context) error {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
