@@ -77,9 +77,6 @@ func TestHandleEventEntryEventOutOfOrder(t *testing.T) {
 	}
 	ds.AddPath(subID, subSpan, dynstream.AreaSettings{})
 
-	worker := &regionRequestWorker{
-		requestCache: &requestCache{},
-	}
 	region := newRegionInfo(
 		tikv.RegionVerID{},
 		span,
@@ -88,7 +85,7 @@ func TestHandleEventEntryEventOutOfOrder(t *testing.T) {
 		false,
 	)
 	region.lockedRangeState = &regionlock.LockedRangeState{}
-	state := newRegionFeedState(region, 1, 0, worker.requestCache, nil, nil)
+	state := newRegionFeedState(region, 1, 0, nil, nil, nil)
 	state.start()
 
 	// Receive prewrite2 with empty value.
@@ -216,10 +213,7 @@ func TestHandleResolvedTs(t *testing.T) {
 	}
 
 	subID1 := SubscriptionID(1)
-	worker := &regionRequestWorker{
-		requestCache: &requestCache{},
-	}
-	state1 := newRegionFeedState(regionInfo{verID: tikv.NewRegionVerID(1, 1, 1)}, uint64(subID1), 0, worker.requestCache, nil, nil)
+	state1 := newRegionFeedState(regionInfo{verID: tikv.NewRegionVerID(1, 1, 1)}, uint64(subID1), 0, nil, nil, nil)
 	state1.start()
 	{
 		span := heartbeatpb.TableSpan{
@@ -243,7 +237,7 @@ func TestHandleResolvedTs(t *testing.T) {
 	}
 
 	subID2 := SubscriptionID(2)
-	state2 := newRegionFeedState(regionInfo{verID: tikv.NewRegionVerID(2, 2, 2)}, uint64(subID2), 0, worker.requestCache, nil, nil)
+	state2 := newRegionFeedState(regionInfo{verID: tikv.NewRegionVerID(2, 2, 2)}, uint64(subID2), 0, nil, nil, nil)
 	state2.start()
 	{
 		span := heartbeatpb.TableSpan{
@@ -267,7 +261,7 @@ func TestHandleResolvedTs(t *testing.T) {
 	}
 
 	subID3 := SubscriptionID(3)
-	state3 := newRegionFeedState(regionInfo{verID: tikv.NewRegionVerID(3, 3, 3)}, uint64(subID3), 0, worker.requestCache, nil, nil)
+	state3 := newRegionFeedState(regionInfo{verID: tikv.NewRegionVerID(3, 3, 3)}, uint64(subID3), 0, nil, nil, nil)
 	state3.start()
 	{
 		span := heartbeatpb.TableSpan{

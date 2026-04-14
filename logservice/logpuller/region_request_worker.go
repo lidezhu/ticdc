@@ -77,7 +77,7 @@ type regionRequestWorker struct {
 	pushRegionEvent            func(SubscriptionID, regionEvent)
 	runtimeRegistry            *regionRuntimeRegistry
 	submitDirectFailure        func(regionFailureInfo)
-	submitWorkerSessionFailure func(*regionRequestWorkerSession, []regionInfo, workerSessionFailure)
+	submitWorkerSessionFailure func(map[SubscriptionID]regionFeedStates, []regionInfo, workerSessionFailure)
 
 	store *requestedStore
 
@@ -93,11 +93,12 @@ func (s *regionRequestWorker) markRegionEnqueued(region regionInfo, now time.Tim
 }
 
 func (s *regionRequestWorker) handleSessionFailure(session *regionRequestWorkerSession, sessionFailure workerSessionFailure) {
-	// A store/session failure fans out into ordered failures for started regions
-	// and direct failures for requests that never became active states.
+	// runNextSession only returns after the session loops exit, so the started and
+	// not-started sets are already quiescent here.
+	snapshot := session.takeFailureSnapshot()
 	s.submitWorkerSessionFailure(
-		session,
-		session.takeNotStartedRegions(),
+		snapshot.startedRegions,
+		snapshot.pendingRegions,
 		sessionFailure,
 	)
 }
@@ -174,11 +175,13 @@ func newRegionRequestWorker(
 	return worker
 }
 
-// add adds a region request to the worker's cache.
-// It blocks if the cache is full until there's space or ctx is cancelled.
+// add adds a region request to the worker window.
 func (s *regionRequestWorker) add(ctx context.Context, region regionInfo, force bool) (bool, error) {
 	ok, err := s.requestCache.add(ctx, region, force)
-	if ok && err == nil {
+	if err != nil {
+		return false, err
+	}
+	if ok {
 		s.markRegionEnqueued(region, time.Now())
 	}
 	return ok, err

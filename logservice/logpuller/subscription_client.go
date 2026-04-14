@@ -595,7 +595,6 @@ func (s *subscriptionClient) pendingRequestCount() int {
 	s.stores.Range(func(_, value any) bool {
 		store := value.(*requestedStore)
 		for _, worker := range store.snapshotWorkers() {
-			worker.requestCache.clearStaleRequest()
 			pendingRegionReqCount += worker.requestCache.getPendingCount()
 		}
 		return true
@@ -976,11 +975,11 @@ func (s *subscriptionClient) submitOrderedFailure(state *regionFeedState) (regio
 }
 
 func (s *subscriptionClient) submitWorkerSessionFailure(
-	session *regionRequestWorkerSession,
+	startedRegions map[SubscriptionID]regionFeedStates,
 	pendingRegions []regionInfo,
 	sessionFailure workerSessionFailure,
 ) {
-	for subID, states := range session.clearRegionStates() {
+	for subID, states := range startedRegions {
 		for _, state := range states {
 			state.markStopped(normalizeWorkerSessionFailure(state.getRegionInfo(), sessionFailure))
 			s.pushRegionEventToDS(subID, regionEvent{

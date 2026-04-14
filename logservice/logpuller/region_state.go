@@ -84,7 +84,7 @@ type regionFeedState struct {
 	matcher   *matcher
 	workerID  uint64
 
-	requestCache    *requestCache
+	request         *regionReq
 	runtimeRegistry *regionRuntimeRegistry
 	takeState       func(SubscriptionID, uint64) *regionFeedState
 
@@ -106,7 +106,7 @@ func newRegionFeedState(
 	region regionInfo,
 	requestID uint64,
 	workerID uint64,
-	requestCache *requestCache,
+	request *regionReq,
 	runtimeRegistry *regionRuntimeRegistry,
 	takeState func(SubscriptionID, uint64) *regionFeedState,
 ) *regionFeedState {
@@ -114,7 +114,7 @@ func newRegionFeedState(
 		region:          region,
 		requestID:       requestID,
 		workerID:        workerID,
-		requestCache:    requestCache,
+		request:         request,
 		runtimeRegistry: runtimeRegistry,
 		takeState:       takeState,
 	}
@@ -124,12 +124,18 @@ func (s *regionFeedState) start() {
 	s.matcher = newMatcher()
 }
 
-func (s *regionFeedState) markRequestStopped() {
-	s.requestCache.markStopped(s.region.subscribedSpan.subID, s.region.verID.GetID())
+func (s *regionFeedState) finishRequest() {
+	if s.request == nil {
+		return
+	}
+	s.request.finish()
 }
 
 func (s *regionFeedState) resolveRequest() {
-	s.requestCache.resolve(s.region.subscribedSpan.subID, s.region.verID.GetID())
+	if s.request == nil {
+		return
+	}
+	s.request.resolve()
 }
 
 // markStopped moves a running region into stopped state and records the
@@ -141,7 +147,7 @@ func (s *regionFeedState) markStopped(failure regionFailureInfo) {
 		s.state.v = stateStopped
 		s.state.failure = failure
 	}
-	s.markRequestStopped()
+	s.finishRequest()
 }
 
 // detachFailure moves a stopped region into removed state, removes it from the
@@ -158,7 +164,6 @@ func (s *regionFeedState) detachFailure() (regionFailureInfo, bool) {
 	s.state.failure = regionFailureInfo{}
 	s.state.Unlock()
 
-	s.markRequestStopped()
 	s.removeFromSession()
 	return failure, true
 }
@@ -209,6 +214,9 @@ func (s *regionFeedState) isStale() bool {
 }
 
 func (s *regionFeedState) removeFromSession() *regionFeedState {
+	if s.takeState == nil {
+		return nil
+	}
 	return s.takeState(SubscriptionID(s.requestID), s.getRegionID())
 }
 

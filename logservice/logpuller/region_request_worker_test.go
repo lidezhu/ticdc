@@ -17,6 +17,7 @@ import (
 	"context"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/cdcpb"
@@ -103,10 +104,11 @@ func TestTakeNotStartedRegionsReleaseSlotForBootstrapRegion(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, requestCache.getPendingCount())
 
-	session.bootstrapRegion = &req
-	regions := session.takeNotStartedRegions()
-	require.Len(t, regions, 1)
-	require.Equal(t, req.regionInfo.verID, regions[0].verID)
+	session.bootstrapRegion = req
+	snapshot := session.takeFailureSnapshot()
+	require.Empty(t, snapshot.startedRegions)
+	require.Len(t, snapshot.pendingRegions, 1)
+	require.Equal(t, req.regionInfo.verID, snapshot.pendingRegions[0].verID)
 	require.Equal(t, 0, requestCache.getPendingCount())
 }
 
@@ -140,10 +142,73 @@ func TestSessionRunReturnsStartupFailureAndKeepsBootstrapRegion(t *testing.T) {
 	require.Error(t, result.failure.cause)
 	require.Nil(t, session.conn)
 
-	regions := session.takeNotStartedRegions()
-	require.Len(t, regions, 1)
-	require.Equal(t, region.verID, regions[0].verID)
+	snapshot := session.takeFailureSnapshot()
+	require.Empty(t, snapshot.startedRegions)
+	require.Len(t, snapshot.pendingRegions, 1)
+	require.Equal(t, region.verID, snapshot.pendingRegions[0].verID)
 	require.Equal(t, 0, requestCache.getPendingCount())
+}
+
+func TestWorkerAddDuplicateQueuedRequestRefreshesEnqueueTime(t *testing.T) {
+	requestCache := newRequestCache(10)
+	runtimeRegistry := newRegionRuntimeRegistry()
+	worker := &regionRequestWorker{
+		requestCache:    requestCache,
+		runtimeRegistry: runtimeRegistry,
+	}
+
+	region := prepareRegionForSendTest(createTestRegionInfo(1, 1))
+	region.runtimeKey = runtimeRegistry.allocKey(region.subscribedSpan.subID, region.verID.GetID())
+	runtimeRegistry.registerRegion(region.runtimeKey, region, time.Now())
+
+	ok, err := worker.add(context.Background(), region, false)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	firstState, ok := runtimeRegistry.get(region.runtimeKey)
+	require.True(t, ok)
+	firstEnqueueTime := firstState.requestEnqueueTime
+	require.False(t, firstEnqueueTime.IsZero())
+
+	time.Sleep(10 * time.Millisecond)
+
+	ok, err = worker.add(context.Background(), region, false)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	secondState, ok := runtimeRegistry.get(region.runtimeKey)
+	require.True(t, ok)
+	require.True(t, secondState.requestEnqueueTime.After(firstEnqueueTime))
+}
+
+func TestWorkerAddDuplicateActiveRegionRequestsWarnAndKeepNewest(t *testing.T) {
+	requestCache := newRequestCache(10)
+	worker := &regionRequestWorker{
+		workerID:     1,
+		store:        &requestedStore{storeAddr: "store-1"},
+		requestCache: requestCache,
+	}
+
+	region := prepareRegionForSendTest(createTestRegionInfo(1, 1))
+
+	ok, err := requestCache.add(context.Background(), region, false)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	req, err := requestCache.pop(context.Background())
+	require.NoError(t, err)
+	req.markSent()
+	require.Equal(t, 1, requestCache.getPendingCount())
+
+	ok, err = worker.add(context.Background(), region, false)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, 2, requestCache.getPendingCount())
+
+	latestReq, err := requestCache.pop(context.Background())
+	require.NoError(t, err)
+	latestReq.markSent()
+	require.Equal(t, 1, requestCache.getPendingCount())
 }
 
 func TestRunConnectedLoopsReturnsReceiveFailure(t *testing.T) {
@@ -206,7 +271,7 @@ func TestRunConnectedLoopsTreatsEOFAsReconnect(t *testing.T) {
 func TestRunConnectedLoopsPrefersSendFailureOverLoopCancellation(t *testing.T) {
 	requestCache := newRequestCache(10)
 	region := prepareRegionForSendTest(createTestRegionInfo(1, 1))
-	req := newRegionReq(region)
+	req := newRegionReq(nil, region)
 
 	session := newRegionRequestWorkerSession(
 		1,
@@ -219,7 +284,7 @@ func TestRunConnectedLoopsPrefersSendFailureOverLoopCancellation(t *testing.T) {
 		nil,
 		func(SubscriptionID, regionEvent) {},
 	)
-	session.bootstrapRegion = &req
+	session.bootstrapRegion = req
 	sendErr := errors.New("send failed")
 	session.conn = &ConnAndClient{
 		Client: &mockEventFeedV2Client{
@@ -426,7 +491,7 @@ func TestTakeNotStartedRegionsDoesNotReturnStoppedSentRegion(t *testing.T) {
 		req.regionInfo,
 		uint64(req.regionInfo.subscribedSpan.subID),
 		0,
-		requestCache,
+		req,
 		nil,
 		session.takeRegionState,
 	)
@@ -434,11 +499,11 @@ func TestTakeNotStartedRegionsDoesNotReturnStoppedSentRegion(t *testing.T) {
 	session.addRegionState(req.regionInfo.subscribedSpan.subID, req.regionInfo.verID.GetID(), state)
 
 	// Simulate the race we are fixing in processRegionSendTask:
-	// once a request is visible in sentRequests, a fast region error may mark the
+	// once a request is visible as sent, a fast region error may mark the
 	// region stopped before worker cleanup runs. In that case, markStopped should
 	// remove the sent request immediately, so takeNotStartedRegions must not return
 	// the stale region again during worker shutdown.
-	requestCache.markSent(req)
+	req.markSent()
 	state.markStopped(newSendRequestToStoreFailure(
 		req.regionInfo,
 		regionFailureSourceWorkerSend,
@@ -447,7 +512,9 @@ func TestTakeNotStartedRegionsDoesNotReturnStoppedSentRegion(t *testing.T) {
 	session.takeRegionState(req.regionInfo.subscribedSpan.subID, req.regionInfo.verID.GetID())
 
 	require.Equal(t, 0, requestCache.getPendingCount())
-	require.Empty(t, session.takeNotStartedRegions())
+	snapshot := session.takeFailureSnapshot()
+	require.Empty(t, snapshot.startedRegions)
+	require.Empty(t, snapshot.pendingRegions)
 }
 
 func TestTakeNotStartedRegionsDoesNotIncludeActiveSentRegion(t *testing.T) {
@@ -471,16 +538,17 @@ func TestTakeNotStartedRegionsDoesNotIncludeActiveSentRegion(t *testing.T) {
 		req.regionInfo,
 		uint64(req.regionInfo.subscribedSpan.subID),
 		0,
-		requestCache,
+		req,
 		nil,
 		session.takeRegionState,
 	)
 	state.start()
 	session.addRegionState(req.regionInfo.subscribedSpan.subID, req.regionInfo.verID.GetID(), state)
-	requestCache.markSent(req)
+	req.markSent()
 
-	require.Empty(t, session.takeNotStartedRegions())
-	require.Equal(t, 1, len(session.clearRegionStates()[req.regionInfo.subscribedSpan.subID]))
+	snapshot := session.takeFailureSnapshot()
+	require.Empty(t, snapshot.pendingRegions)
+	require.Equal(t, 1, len(snapshot.startedRegions[req.regionInfo.subscribedSpan.subID]))
 	require.Equal(t, 1, requestCache.getPendingCount())
 }
 
@@ -519,11 +587,10 @@ func TestProcessRegionSendTaskSendFailureCleansSentRequest(t *testing.T) {
 		nil,
 	)
 	session.conn = conn
-	session.bootstrapRegion = &req
+	session.bootstrapRegion = req
 	err = session.processRegionSendTask(ctx)
 	require.ErrorIs(t, err, sendErr)
 	require.Equal(t, 0, worker.requestCache.getPendingCount())
-	require.Empty(t, worker.requestCache.sentRequests.regionReqs)
 	state := session.getRegionState(req.regionInfo.subscribedSpan.subID, req.regionInfo.verID.GetID())
 	require.True(t, state == nil || state.isStale(), "region state should be removed or marked stale after send failure")
 	if state != nil {
