@@ -15,7 +15,6 @@ package logpuller
 
 import (
 	"context"
-	"errors"
 	"sync"
 	"time"
 
@@ -31,8 +30,6 @@ const (
 	addReqRetryLimit             = 3
 	abnormalRequestDurationInSec = 60 * 60 * 2 // 2 hours
 )
-
-var errActiveDuplicateRegionRequest = errors.New("active duplicate region request")
 
 type regionReqStage uint8
 
@@ -70,6 +67,10 @@ type regionReq struct {
 	cache *requestCache
 	key   regionReqKey
 	stage regionReqStage
+	// true when add() sees an older processing/sent request with the same key.
+	// When the newer request is sent, markSent removes that older sent request
+	// so the cache keeps only the newest live request for this key.
+	replacesActive bool
 }
 
 func newRegionReq(cache *requestCache, region regionInfo) *regionReq {
@@ -119,10 +120,9 @@ type requestCache struct {
 	// it includes queued, processing and sent requests.
 	requests map[*regionReq]struct{}
 	// current points to the newest live request for a key.
-	// A queued duplicate updates the existing queued request in place. A normal
-	// duplicate for a processing or sent request is rejected so the worker can
-	// reconnect. Stop requests stay compatible with the old behavior and may
-	// enqueue one newer request behind the current one.
+	// A queued duplicate updates the existing queued request in place. If an
+	// older request is already processing or sent, the newer request is still
+	// accepted and becomes the new current request for that key.
 	current map[regionReqKey]*regionReq
 	// ready is the FIFO of queued requests waiting for the send loop.
 	// readyIdx lets us compact lazily instead of shifting on every pop.
@@ -154,9 +154,9 @@ func newRequestCache(maxPendingCount int) *requestCache {
 
 // add admits a request into this worker window.
 // If the same key is still queued, the newer region info replaces the old one.
-// If a normal region request is already processing or sent, return
-// errActiveDuplicateRegionRequest so the worker can reconnect the whole session.
-// Stop requests stay compatible with the old behavior and may enqueue duplicates.
+// If the older request is already processing or sent, the newer request is
+// still queued, becomes current[key], and emits a warn log. Stop requests keep
+// the same compatibility path.
 func (c *requestCache) add(ctx context.Context, region regionInfo, force bool) (bool, error) {
 	start := time.Now()
 	ticker := time.NewTicker(addReqRetryInterval)
@@ -203,14 +203,20 @@ func (c *requestCache) tryAdd(region regionInfo, force bool) (bool, error) {
 			existing.regionInfo = region
 			return true, nil
 		}
-		if !req.key.stop {
-			return false, errActiveDuplicateRegionRequest
+		req.replacesActive = true
+		if req.key.stop {
+			log.Warn("stop request already active, enqueue duplicate deregister",
+				zap.Uint64("subID", uint64(existing.key.subID)),
+				zap.Uint64("regionID", existing.key.regionID),
+				zap.Bool("stop", existing.key.stop),
+				zap.Uint8("stage", uint8(existing.stage)))
+		} else {
+			log.Warn("duplicate active region request detected, keep newest request",
+				zap.Uint64("subID", uint64(existing.key.subID)),
+				zap.Uint64("regionID", existing.key.regionID),
+				zap.Uint8("stage", uint8(existing.stage)),
+				zap.Int("pendingCount", len(c.requests)))
 		}
-		log.Warn("stop request already active, enqueue duplicate deregister",
-			zap.Uint64("subID", uint64(existing.key.subID)),
-			zap.Uint64("regionID", existing.key.regionID),
-			zap.Bool("stop", existing.key.stop),
-			zap.Uint8("stage", uint8(existing.stage)))
 	}
 	if len(c.requests) >= c.maxPendingCount && !force {
 		return false, nil
@@ -267,9 +273,10 @@ func (c *requestCache) markSent(req *regionReq) {
 	removed := false
 	c.mu.Lock()
 	if _, ok := c.requests[req]; ok && req.stage == regionReqStageProcessing {
-		// Stop duplicates are rare. Scan live requests only in this compatibility
-		// path so normal region sends stay O(1).
-		if req.key.stop {
+		if req.replacesActive {
+			// Duplicate active regions are already unexpected; only this slow path
+			// scans live requests to retire the older sent one after the newer
+			// request has actually been sent.
 			if old := c.findSentLocked(req.key, req); old != nil {
 				removed = c.removeLocked(old) || removed
 			}
