@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"github.com/pingcap/ticdc/heartbeatpb"
+	"github.com/pingcap/ticdc/pkg/common"
+	"github.com/tikv/client-go/v2/oracle"
 	"github.com/tikv/client-go/v2/tikv"
 )
 
@@ -47,6 +49,11 @@ var regionRuntimePhases = []regionPhase{
 	regionPhaseRetryPending,
 	regionPhaseRemoved,
 }
+
+const (
+	slowRegionPendingThreshold        = 10 * time.Minute
+	slowRegionReplicatingLagThreshold = 6 * resolveLockMinInterval
+)
 
 type regionRuntimeIdentity struct {
 	subID    SubscriptionID
@@ -88,13 +95,41 @@ type regionRuntimeState struct {
 	retryCount    int
 
 	// phaseSince tracks the current phase boundary.
-	// The fields below keep distinct milestones for the current attempt even
-	// after the phase has moved forward.
-	rangeLockTime     time.Time
-	workerEnqueueTime time.Time
-	rpcReadyTime      time.Time
-	requestSentTime   time.Time
-	replicatingSince  time.Time
+	// timeline keeps the fixed milestones of the current attempt, so once the
+	// region moves forward we can still tell how it got there.
+	timeline regionRuntimeTimeline
+}
+
+type regionRuntimeTimeline struct {
+	discoveredAt     time.Time
+	rangeLockWaitAt  time.Time
+	rangeLockedAt    time.Time
+	queuedAt         time.Time
+	rpcReadyAt       time.Time
+	workerEnqueuedAt time.Time
+	requestSentAt    time.Time
+	replicatingSince time.Time
+}
+
+type slowRegionReport struct {
+	totalRegionCount int
+	slowRegionCount  int
+	phaseCounts      map[regionPhase]int
+	samples          []slowRegionSample
+}
+
+type slowRegionSample struct {
+	SubscriptionID uint64
+	RegionID       uint64
+	TableID        int64
+	Phase          regionPhase
+	StuckFor       time.Duration
+	PhaseAge       time.Duration
+	ResolvedLag    time.Duration
+	StoreAddr      string
+	WorkerID       uint64
+	LastError      string
+	Span           string
 }
 
 func (s regionRuntimeState) clone() regionRuntimeState {
@@ -186,6 +221,7 @@ func (r *regionRuntimeRegistry) markRangeLockWait(
 	waitTime time.Time,
 ) regionRuntimeState {
 	return r.upsert(key, func(state *regionRuntimeState) {
+		state.timeline.rangeLockWaitAt = waitTime
 		state.phase = regionPhaseRangeLockWait
 		state.phaseSince = waitTime
 	})
@@ -207,6 +243,7 @@ func (r *regionRuntimeRegistry) markDiscovered(
 ) regionRuntimeState {
 	return r.upsert(key, func(state *regionRuntimeState) {
 		state.applyRegionInfo(region)
+		state.timeline.discoveredAt = discoveredTime
 		state.phase = regionPhaseDiscovered
 		state.phaseSince = discoveredTime
 	})
@@ -272,7 +309,7 @@ func (r *regionRuntimeRegistry) markRequestEnqueued(
 	enqueueTime time.Time,
 ) regionRuntimeState {
 	return r.upsert(key, func(state *regionRuntimeState) {
-		state.workerEnqueueTime = enqueueTime
+		state.timeline.workerEnqueuedAt = enqueueTime
 	})
 }
 
@@ -280,9 +317,12 @@ func (r *regionRuntimeRegistry) markQueued(
 	key regionRuntimeKey,
 	rangeLockTime time.Time,
 	queuedTime time.Time,
+	initialResolvedTs uint64,
 ) regionRuntimeState {
 	return r.upsert(key, func(state *regionRuntimeState) {
-		state.rangeLockTime = rangeLockTime
+		state.timeline.rangeLockedAt = rangeLockTime
+		state.timeline.queuedAt = queuedTime
+		state.lastResolvedTs = initialResolvedTs
 		state.phase = regionPhaseQueued
 		state.phaseSince = queuedTime
 	})
@@ -293,20 +333,20 @@ func (r *regionRuntimeRegistry) markRPCReady(
 	rpcReadyTime time.Time,
 ) regionRuntimeState {
 	return r.upsert(key, func(state *regionRuntimeState) {
-		state.rpcReadyTime = rpcReadyTime
+		state.timeline.rpcReadyAt = rpcReadyTime
 		state.phase = regionPhaseRPCReady
 		state.phaseSince = rpcReadyTime
 	})
 }
 
-func (r *regionRuntimeRegistry) markWaitInitialized(
+func (r *regionRuntimeRegistry) markRequestSent(
 	key regionRuntimeKey,
 	workerID uint64,
 	sendTime time.Time,
 ) regionRuntimeState {
 	return r.upsert(key, func(state *regionRuntimeState) {
 		state.workerID = workerID
-		state.requestSentTime = sendTime
+		state.timeline.requestSentAt = sendTime
 		state.phase = regionPhaseWaitInitialized
 		state.phaseSince = sendTime
 	})
@@ -317,7 +357,7 @@ func (r *regionRuntimeRegistry) markReplicating(
 	replicatingTime time.Time,
 ) regionRuntimeState {
 	return r.upsert(key, func(state *regionRuntimeState) {
-		state.replicatingSince = replicatingTime
+		state.timeline.replicatingSince = replicatingTime
 		state.phase = regionPhaseReplicating
 		state.phaseSince = replicatingTime
 	})
@@ -400,4 +440,114 @@ func (r *regionRuntimeRegistry) removeBySubscription(subID SubscriptionID) int {
 		removed++
 	}
 	return removed
+}
+
+func normalizeDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return 0
+	}
+	return d
+}
+
+func (s regionRuntimeState) phaseAge(now time.Time) time.Duration {
+	if s.phaseSince.IsZero() {
+		return 0
+	}
+	return normalizeDuration(now.Sub(s.phaseSince))
+}
+
+func (s regionRuntimeState) resolvedLag(now time.Time) time.Duration {
+	if s.lastResolvedTs == 0 {
+		return 0
+	}
+	return normalizeDuration(now.Sub(oracle.GetTimeFromTS(s.lastResolvedTs)))
+}
+
+func (s regionRuntimeState) slowThreshold() (time.Duration, bool) {
+	switch s.phase {
+	case regionPhaseDiscovered,
+		regionPhaseRangeLockWait,
+		regionPhaseQueued,
+		regionPhaseRPCReady,
+		regionPhaseWaitInitialized,
+		regionPhaseRetryPending:
+		return slowRegionPendingThreshold, true
+	case regionPhaseReplicating:
+		return slowRegionReplicatingLagThreshold, true
+	default:
+		return 0, false
+	}
+}
+
+func (s regionRuntimeState) slowDuration(now time.Time) time.Duration {
+	if s.phase == regionPhaseReplicating {
+		if lag := s.resolvedLag(now); lag > 0 {
+			return lag
+		}
+	}
+	return s.phaseAge(now)
+}
+
+func (s regionRuntimeState) slowSample(now time.Time) (slowRegionSample, bool) {
+	threshold, ok := s.slowThreshold()
+	if !ok {
+		return slowRegionSample{}, false
+	}
+	stuckFor := s.slowDuration(now)
+	if stuckFor <= threshold {
+		return slowRegionSample{}, false
+	}
+
+	return slowRegionSample{
+		SubscriptionID: uint64(s.key.subID),
+		RegionID:       s.key.regionID,
+		TableID:        s.tableID,
+		Phase:          s.phase,
+		StuckFor:       stuckFor,
+		PhaseAge:       s.phaseAge(now),
+		ResolvedLag:    s.resolvedLag(now),
+		StoreAddr:      s.storeAddr,
+		WorkerID:       s.workerID,
+		LastError:      s.lastError,
+		Span:           common.FormatTableSpan(&s.span),
+	}, true
+}
+
+// collectSlowRegionReport keeps slow-region logging aggregated: one tick gets
+// one summary plus a capped sample set instead of one log line per region.
+func (r *regionRuntimeRegistry) collectSlowRegionReport(
+	now time.Time,
+	sampleLimit int,
+) slowRegionReport {
+	snapshots := r.snapshot()
+	report := slowRegionReport{
+		totalRegionCount: len(snapshots),
+		phaseCounts:      make(map[regionPhase]int),
+	}
+
+	for _, state := range snapshots {
+		sample, ok := state.slowSample(now)
+		if !ok {
+			continue
+		}
+		report.slowRegionCount++
+		report.phaseCounts[state.phase]++
+		report.samples = append(report.samples, sample)
+	}
+
+	sort.Slice(report.samples, func(i, j int) bool {
+		left := report.samples[i]
+		right := report.samples[j]
+		if left.StuckFor != right.StuckFor {
+			return left.StuckFor > right.StuckFor
+		}
+		if left.SubscriptionID != right.SubscriptionID {
+			return left.SubscriptionID < right.SubscriptionID
+		}
+		return left.RegionID < right.RegionID
+	})
+	if sampleLimit >= 0 && len(report.samples) > sampleLimit {
+		report.samples = report.samples[:sampleLimit]
+	}
+	return report
 }

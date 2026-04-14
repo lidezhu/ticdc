@@ -67,7 +67,9 @@ func TestScheduleRegionRequestUpdatesRuntimeRegistry(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, regionPhaseQueued, state.phase)
 	require.Equal(t, uint64(10), state.verID.GetID())
-	require.False(t, state.rangeLockTime.IsZero())
+	require.False(t, state.timeline.discoveredAt.IsZero())
+	require.False(t, state.timeline.rangeLockedAt.IsZero())
+	require.False(t, state.timeline.queuedAt.IsZero())
 }
 
 func TestOnRegionFailUpdatesRuntimeRegistry(t *testing.T) {

@@ -21,6 +21,7 @@ import (
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/ticdc/heartbeatpb"
 	"github.com/stretchr/testify/require"
+	"github.com/tikv/client-go/v2/oracle"
 	"github.com/tikv/client-go/v2/tikv"
 )
 
@@ -64,9 +65,11 @@ func TestRegionRuntimeRegistryUpdateAndSnapshot(t *testing.T) {
 	}
 
 	registry.markDiscovered(key, region, now)
-	registry.markRequestEnqueued(key, now.Add(500*time.Millisecond))
-	registry.markQueued(key, now.Add(time.Second), now.Add(2*time.Second))
-	registry.markWaitInitialized(key, 7, now.Add(3*time.Second))
+	registry.markRangeLockWait(key, now.Add(250*time.Millisecond))
+	registry.markQueued(key, now.Add(time.Second), now.Add(2*time.Second), 100)
+	registry.markRPCReady(key, now.Add(2500*time.Millisecond))
+	registry.markRequestEnqueued(key, now.Add(2700*time.Millisecond))
+	registry.markRequestSent(key, 7, now.Add(3*time.Second))
 	registry.updateResolvedTs(key, 12345, now.Add(4*time.Second))
 	registry.recordError(key, errors.New("store busy"), now.Add(5*time.Second))
 
@@ -81,10 +84,14 @@ func TestRegionRuntimeRegistryUpdateAndSnapshot(t *testing.T) {
 	require.Equal(t, uint64(12345), state.lastResolvedTs)
 	require.Equal(t, "store busy", state.lastError)
 	require.Equal(t, 0, state.retryCount)
-	require.Equal(t, now.Add(time.Second), state.rangeLockTime)
+	require.Equal(t, now, state.timeline.discoveredAt)
+	require.Equal(t, now.Add(250*time.Millisecond), state.timeline.rangeLockWaitAt)
+	require.Equal(t, now.Add(time.Second), state.timeline.rangeLockedAt)
+	require.Equal(t, now.Add(2*time.Second), state.timeline.queuedAt)
+	require.Equal(t, now.Add(2500*time.Millisecond), state.timeline.rpcReadyAt)
 	require.Equal(t, now.Add(3*time.Second), state.phaseSince)
-	require.Equal(t, now.Add(3*time.Second), state.requestSentTime)
-	require.Equal(t, now.Add(500*time.Millisecond), state.workerEnqueueTime)
+	require.Equal(t, now.Add(3*time.Second), state.timeline.requestSentAt)
+	require.Equal(t, now.Add(2700*time.Millisecond), state.timeline.workerEnqueuedAt)
 
 	snapshots := registry.snapshot()
 	require.Len(t, snapshots, 1)
@@ -106,7 +113,7 @@ func TestRegionRuntimeRegistryMarkReplicating(t *testing.T) {
 	state, ok := registry.get(key)
 	require.True(t, ok)
 	require.Equal(t, regionPhaseReplicating, state.phase)
-	require.Equal(t, now, state.replicatingSince)
+	require.Equal(t, now, state.timeline.replicatingSince)
 	require.Equal(t, now, state.phaseSince)
 }
 
@@ -142,12 +149,87 @@ func TestRegionRuntimeRegistryPhaseCounts(t *testing.T) {
 	key2 := registry.allocKey(1, 102)
 	key3 := registry.allocKey(2, 201)
 
-	registry.markQueued(key1, now, now)
-	registry.markQueued(key2, now.Add(time.Second), now.Add(time.Second))
-	registry.markWaitInitialized(key3, 0, now.Add(2*time.Second))
+	registry.markQueued(key1, now, now, 100)
+	registry.markQueued(key2, now.Add(time.Second), now.Add(time.Second), 100)
+	registry.markRequestSent(key3, 0, now.Add(2*time.Second))
 
 	counts := registry.phaseCounts()
 	require.Equal(t, 2, counts[regionPhaseQueued])
 	require.Equal(t, 1, counts[regionPhaseWaitInitialized])
 	require.Equal(t, 0, counts[regionPhaseReplicating])
+}
+
+func TestRegionRuntimeRegistryCollectSlowRegionReport(t *testing.T) {
+	registry := newRegionRuntimeRegistry()
+	now := time.Unix(1700003600, 0)
+
+	replicatingKey := registry.allocKey(1, 101)
+	replicatingRegion := regionInfo{
+		span: heartbeatpb.TableSpan{
+			TableID:  11,
+			StartKey: []byte("a"),
+			EndKey:   []byte("b"),
+		},
+		subscribedSpan: &subscribedSpan{
+			subID: 1,
+			span:  heartbeatpb.TableSpan{TableID: 11},
+		},
+	}
+	registry.markDiscovered(replicatingKey, replicatingRegion, now.Add(-30*time.Minute))
+	registry.markQueued(
+		replicatingKey,
+		now.Add(-29*time.Minute),
+		now.Add(-29*time.Minute),
+		oracle.GoTimeToTS(now.Add(-20*time.Minute)),
+	)
+	registry.markRequestSent(replicatingKey, 7, now.Add(-28*time.Minute))
+	registry.markReplicating(replicatingKey, now.Add(-28*time.Minute))
+
+	queuedKey := registry.allocKey(1, 102)
+	queuedRegion := regionInfo{
+		span: heartbeatpb.TableSpan{
+			TableID:  12,
+			StartKey: []byte("b"),
+			EndKey:   []byte("c"),
+		},
+		subscribedSpan: &subscribedSpan{
+			subID: 1,
+			span:  heartbeatpb.TableSpan{TableID: 12},
+		},
+	}
+	registry.markDiscovered(queuedKey, queuedRegion, now.Add(-12*time.Minute))
+	registry.markQueued(queuedKey, now.Add(-11*time.Minute), now.Add(-11*time.Minute), 100)
+
+	recentKey := registry.allocKey(2, 201)
+	recentRegion := regionInfo{
+		span: heartbeatpb.TableSpan{
+			TableID:  21,
+			StartKey: []byte("x"),
+			EndKey:   []byte("y"),
+		},
+		subscribedSpan: &subscribedSpan{
+			subID: 2,
+			span:  heartbeatpb.TableSpan{TableID: 21},
+		},
+	}
+	registry.markDiscovered(recentKey, recentRegion, now.Add(-2*time.Minute))
+	registry.markQueued(recentKey, now.Add(-time.Minute), now.Add(-time.Minute), 100)
+
+	report := registry.collectSlowRegionReport(now, 2)
+	require.Equal(t, 3, report.totalRegionCount)
+	require.Equal(t, 2, report.slowRegionCount)
+	require.Equal(t, 1, report.phaseCounts[regionPhaseReplicating])
+	require.Equal(t, 1, report.phaseCounts[regionPhaseQueued])
+	require.Len(t, report.samples, 2)
+
+	require.Equal(t, uint64(1), report.samples[0].SubscriptionID)
+	require.Equal(t, uint64(101), report.samples[0].RegionID)
+	require.Equal(t, regionPhaseReplicating, report.samples[0].Phase)
+	require.Equal(t, 20*time.Minute, report.samples[0].ResolvedLag)
+	require.Equal(t, 20*time.Minute, report.samples[0].StuckFor)
+
+	require.Equal(t, uint64(102), report.samples[1].RegionID)
+	require.Equal(t, regionPhaseQueued, report.samples[1].Phase)
+	require.Equal(t, 11*time.Minute, report.samples[1].PhaseAge)
+	require.Equal(t, 11*time.Minute, report.samples[1].StuckFor)
 }

@@ -178,6 +178,44 @@ func TestStopTaskUsesSubscribedSpanFilterLoop(t *testing.T) {
 	require.True(t, region.filterLoop)
 }
 
+func TestCollectUnlockedRangeReport(t *testing.T) {
+	client := &subscriptionClient{}
+	client.ensureHelpers()
+
+	consumeKVEvents := func(_ []common.RawKVEntry, _ func()) bool { return false }
+	advanceResolvedTs := func(uint64) {}
+
+	span1 := client.newSubscribedSpan(SubscriptionID(1), heartbeatpb.TableSpan{
+		TableID:  11,
+		StartKey: []byte{'a'},
+		EndKey:   []byte{'z'},
+	}, 100, consumeKVEvents, advanceResolvedTs, 0, false)
+	client.subscribedSpans.add(SubscriptionID(1), span1)
+	require.Equal(t, regionlock.LockRangeStatusSuccess,
+		span1.rangeLock.LockRange(context.Background(), []byte{'a'}, []byte{'b'}, 1, 1).Status)
+	require.Equal(t, regionlock.LockRangeStatusSuccess,
+		span1.rangeLock.LockRange(context.Background(), []byte{'c'}, []byte{'d'}, 2, 1).Status)
+
+	span2 := client.newSubscribedSpan(SubscriptionID(2), heartbeatpb.TableSpan{
+		TableID:  22,
+		StartKey: []byte{'m'},
+		EndKey:   []byte{'z'},
+	}, 100, consumeKVEvents, advanceResolvedTs, 0, false)
+	client.subscribedSpans.add(SubscriptionID(2), span2)
+	require.Equal(t, regionlock.LockRangeStatusSuccess,
+		span2.rangeLock.LockRange(context.Background(), []byte{'m'}, []byte{'z'}, 3, 1).Status)
+
+	report := client.collectUnlockedRangeReport(4, 2)
+	require.Equal(t, 1, report.subscriptionCount)
+	require.Equal(t, 2, report.unlockedRangeCount)
+	require.Len(t, report.samples, 1)
+	require.Equal(t, uint64(1), report.samples[0].SubscriptionID)
+	require.Equal(t, int64(11), report.samples[0].TableID)
+	require.Equal(t, 2, report.samples[0].HoleCount)
+	require.Len(t, report.samples[0].Holes, 2)
+	require.Contains(t, report.samples[0].Holes[0], "tableID: 11")
+}
+
 type mockDynamicStream struct{}
 
 func (s *mockDynamicStream) Start() {}

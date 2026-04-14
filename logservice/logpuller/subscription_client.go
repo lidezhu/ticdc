@@ -15,6 +15,7 @@ package logpuller
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,7 +31,6 @@ import (
 	"github.com/pingcap/ticdc/pkg/security"
 	"github.com/pingcap/ticdc/pkg/spanz"
 	"github.com/pingcap/ticdc/utils/dynstream"
-	"github.com/tikv/client-go/v2/oracle"
 	"github.com/tikv/client-go/v2/tikv"
 	pd "github.com/tikv/pd/client"
 	"go.uber.org/zap"
@@ -53,6 +53,10 @@ const (
 
 	// resolveLastRunGCThreshold is the size threshold to GC resolveLastRun and drop stale entries.
 	resolveLastRunGCThreshold = 1024
+
+	slowRegionLogSampleLimit     = 8
+	unlockedRangeLogSampleLimit  = 4
+	unlockedRangeSampleSpanLimit = 2
 )
 
 var (
@@ -260,7 +264,7 @@ func (s *subscriptionClient) markRegionQueued(region regionInfo, acquiredTime, q
 	if !region.runtimeKey.isValid() {
 		return
 	}
-	s.regionRuntimeRegistry.markQueued(region.runtimeKey, acquiredTime, queuedTime)
+	s.regionRuntimeRegistry.markQueued(region.runtimeKey, acquiredTime, queuedTime, region.resolvedTs())
 }
 
 func (s *subscriptionClient) recordRegionRuntimeError(region regionInfo, err error, now time.Time) {
@@ -573,6 +577,64 @@ func (s *subscriptionClient) handleFailure(ctx context.Context, failure regionFa
 	return s.regionScheduler.handleFailure(ctx, failure)
 }
 
+type unlockedRangeReport struct {
+	subscriptionCount  int
+	unlockedRangeCount int
+	samples            []unlockedRangeSample
+}
+
+type unlockedRangeSample struct {
+	SubscriptionID uint64
+	TableID        int64
+	HoleCount      int
+	Holes          []string
+}
+
+// collectUnlockedRangeReport keeps hole logging bounded as well, so one table
+// with many holes does not explode the periodic logs.
+func (s *subscriptionClient) collectUnlockedRangeReport(
+	sampleLimit int,
+	holeSampleLimit int,
+) unlockedRangeReport {
+	entries := s.subscribedSpans.snapshot()
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].subID < entries[j].subID
+	})
+
+	report := unlockedRangeReport{}
+	for _, entry := range entries {
+		attr := entry.span.rangeLock.IterAll(nil)
+		if len(attr.UnLockedRanges) == 0 {
+			continue
+		}
+
+		report.subscriptionCount++
+		report.unlockedRangeCount += len(attr.UnLockedRanges)
+		if len(report.samples) >= sampleLimit {
+			continue
+		}
+
+		holes := make([]string, 0, holeSampleLimit)
+		for i, hole := range attr.UnLockedRanges {
+			if i >= holeSampleLimit {
+				break
+			}
+			holeSpan := hole.Span
+			holeSpan.TableID = entry.span.span.TableID
+			holeSpan.KeyspaceID = entry.span.span.KeyspaceID
+			holes = append(holes, common.FormatTableSpan(&holeSpan))
+		}
+		report.samples = append(report.samples, unlockedRangeSample{
+			SubscriptionID: uint64(entry.subID),
+			TableID:        entry.span.span.TableID,
+			HoleCount:      len(attr.UnLockedRanges),
+			Holes:          holes,
+		})
+	}
+
+	return report
+}
+
 func (s *subscriptionClient) logSlowRegions(ctx context.Context) error {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -584,32 +646,24 @@ func (s *subscriptionClient) logSlowRegions(ctx context.Context) error {
 		}
 
 		currTime := s.pdClock.CurrentTime()
-		slowInitializeRegion := 0
-		for _, entry := range s.subscribedSpans.snapshot() {
-			rt := entry.span
-			attr := rt.rangeLock.IterAll(nil)
-			ckptTime := oracle.GetTimeFromTS(attr.SlowestRegion.ResolvedTs)
-			if attr.SlowestRegion.Initialized {
-				if currTime.Sub(ckptTime) > 6*resolveLockMinInterval {
-					log.Info("subscription client finds a initialized slow region",
-						zap.Uint64("subscriptionID", uint64(entry.subID)),
-						zap.Any("slowRegion", attr.SlowestRegion))
-				}
-			} else if currTime.Sub(attr.SlowestRegion.Created) > 10*time.Minute {
-				slowInitializeRegion += 1
-				log.Info("subscription client initializes a region too slow",
-					zap.Uint64("subscriptionID", uint64(entry.subID)),
-					zap.Any("slowRegion", attr.SlowestRegion))
-			} else if currTime.Sub(ckptTime) > 10*time.Minute {
-				log.Info("subscription client finds a uninitialized slow region",
-					zap.Uint64("subscriptionID", uint64(entry.subID)),
-					zap.Any("slowRegion", attr.SlowestRegion))
-			}
-			if len(attr.UnLockedRanges) > 0 {
-				log.Info("subscription client holes exist",
-					zap.Uint64("subscriptionID", uint64(entry.subID)),
-					zap.Any("holes", attr.UnLockedRanges))
-			}
+		slowReport := s.regionRuntimeRegistry.collectSlowRegionReport(currTime, slowRegionLogSampleLimit)
+		if slowReport.slowRegionCount > 0 {
+			log.Info("subscription client slow region summary",
+				zap.Int("trackedRegionCount", slowReport.totalRegionCount),
+				zap.Int("slowRegionCount", slowReport.slowRegionCount),
+				zap.Any("phaseCounts", slowReport.phaseCounts),
+				zap.Any("samples", slowReport.samples))
+		}
+
+		unlockedReport := s.collectUnlockedRangeReport(
+			unlockedRangeLogSampleLimit,
+			unlockedRangeSampleSpanLimit,
+		)
+		if unlockedReport.subscriptionCount > 0 {
+			log.Info("subscription client unlocked range summary",
+				zap.Int("subscriptionCount", unlockedReport.subscriptionCount),
+				zap.Int("unlockedRangeCount", unlockedReport.unlockedRangeCount),
+				zap.Any("samples", unlockedReport.samples))
 		}
 	}
 }

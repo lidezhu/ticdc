@@ -323,7 +323,7 @@ func (s *regionRequestWorkerSession) markRegionSent(region regionInfo, now time.
 	if !region.runtimeKey.isValid() {
 		return
 	}
-	s.runtimeRegistry.markWaitInitialized(region.runtimeKey, s.workerID, now)
+	s.runtimeRegistry.markRequestSent(region.runtimeKey, s.workerID, now)
 }
 
 func (s *regionRequestWorkerSession) requestHeader() *cdcpb.Header {
