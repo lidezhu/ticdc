@@ -32,9 +32,6 @@ func (s *activeRegionStates) add(subscriptionID SubscriptionID, regionID uint64,
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.subscriptions == nil {
-		s.subscriptions = make(map[SubscriptionID]regionFeedStates)
-	}
 	states := s.subscriptions[subscriptionID]
 	if states == nil {
 		states = make(regionFeedStates)

@@ -100,14 +100,8 @@ func (s *regionRequestScheduler) handleRegions(ctx context.Context, eg *errgroup
 
 		region := regionTask.GetRegionInfo()
 		if region.isStopped() {
-			enqueued, err := s.client.requestedStores.enqueueRegionToAllStores(ctx, region)
-			if err != nil {
+			if err := s.client.requestedStores.broadcastStopRequest(ctx, region); err != nil {
 				return err
-			}
-			if !enqueued {
-				log.Debug("enqueue stop request failed, retry later",
-					zap.Uint64("subscriptionID", uint64(region.subscribedSpan.subID)))
-				s.regionTaskQueue.Push(regionTask)
 			}
 			continue
 		}

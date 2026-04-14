@@ -240,7 +240,7 @@ func TestPushRegionEventToDSUnblocksOnClose(t *testing.T) {
 	}
 }
 
-func TestEnqueueRegionToAllStoresDoesNotRetryForcedStop(t *testing.T) {
+func TestBroadcastStopRequestBypassesQueueLimit(t *testing.T) {
 	ctx := context.Background()
 	client := &subscriptionClient{}
 	client.ensureHelpers()
@@ -263,9 +263,8 @@ func TestEnqueueRegionToAllStoresDoesNotRetryForcedStop(t *testing.T) {
 	stopRegion := regionInfo{
 		subscribedSpan: &subscribedSpan{subID: SubscriptionID(1)},
 	}
-	enqueued, err := client.enqueueRegionToAllStores(ctx, stopRegion)
+	err = client.requestedStores.broadcastStopRequest(ctx, stopRegion)
 	require.NoError(t, err)
-	require.True(t, enqueued)
 	require.Equal(t, 2, worker.requestCache.getPendingCount())
 }
 

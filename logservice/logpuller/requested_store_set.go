@@ -85,8 +85,7 @@ func (s *requestedStoreSet) getOrCreateRequestedStore(
 	return store
 }
 
-func (s *requestedStoreSet) enqueueRegionToAllStores(ctx context.Context, region regionInfo) (bool, error) {
-	enqueued := true
+func (s *requestedStoreSet) broadcastStopRequest(ctx context.Context, region regionInfo) error {
 	var firstErr error
 	s.stores.Range(func(_ any, value any) bool {
 		store := value.(*requestedStore)
@@ -94,16 +93,21 @@ func (s *requestedStoreSet) enqueueRegionToAllStores(ctx context.Context, region
 			ok, err := worker.add(ctx, region, true)
 			if err != nil {
 				firstErr = err
-				enqueued = false
+				log.Warn("broadcast stop request failed",
+					zap.Uint64("subscriptionID", uint64(region.subscribedSpan.subID)),
+					zap.Uint64("workerID", worker.workerID),
+					zap.String("addr", store.storeAddr),
+					zap.Error(err))
 				return false
 			}
 			if !ok {
-				enqueued = false
-				// It is likely the store is busy, no need to try other workers in this store now.
-				break
+				log.Panic("forced stop request should always be enqueued",
+					zap.Uint64("subscriptionID", uint64(region.subscribedSpan.subID)),
+					zap.Uint64("workerID", worker.workerID),
+					zap.String("addr", store.storeAddr))
 			}
 		}
 		return true
 	})
-	return enqueued, firstErr
+	return firstErr
 }

@@ -213,15 +213,12 @@ func (s *subscriptionClient) ensureHelpers() {
 	if s.staleLockResolver == nil {
 		s.staleLockResolver = newStaleLockResolver(s)
 	}
+	if s.regionRuntimeRegistry == nil {
+		s.regionRuntimeRegistry = newRegionRuntimeRegistry()
+	}
 }
 
 func (s *subscriptionClient) ensureRegionRuntime(region *regionInfo, now time.Time) {
-	if s.regionRuntimeRegistry == nil {
-		return
-	}
-	if region == nil || region.subscribedSpan == nil {
-		return
-	}
 	if region.verID.GetID() == 0 {
 		return
 	}
@@ -232,9 +229,6 @@ func (s *subscriptionClient) ensureRegionRuntime(region *regionInfo, now time.Ti
 }
 
 func (s *subscriptionClient) updateRegionRuntimeInfo(region regionInfo) {
-	if s.regionRuntimeRegistry == nil {
-		return
-	}
 	if !region.runtimeKey.isValid() {
 		return
 	}
@@ -242,9 +236,6 @@ func (s *subscriptionClient) updateRegionRuntimeInfo(region regionInfo) {
 }
 
 func (s *subscriptionClient) transitionRegionRuntime(region regionInfo, phase regionPhase, now time.Time) {
-	if s.regionRuntimeRegistry == nil {
-		return
-	}
 	if !region.runtimeKey.isValid() {
 		return
 	}
@@ -252,49 +243,43 @@ func (s *subscriptionClient) transitionRegionRuntime(region regionInfo, phase re
 }
 
 func (s *subscriptionClient) markRegionRetryPending(region regionInfo, err error, now time.Time) {
-	if s.regionRuntimeRegistry == nil || !region.runtimeKey.isValid() {
+	if !region.runtimeKey.isValid() {
 		return
 	}
 	s.regionRuntimeRegistry.markRetryPending(region.runtimeKey, err, now)
 }
 
 func (s *subscriptionClient) markRegionRPCReady(region regionInfo, now time.Time) {
-	if s.regionRuntimeRegistry == nil || !region.runtimeKey.isValid() {
+	if !region.runtimeKey.isValid() {
 		return
 	}
 	s.regionRuntimeRegistry.markRPCReady(region.runtimeKey, now)
 }
 
 func (s *subscriptionClient) markRegionQueued(region regionInfo, acquiredTime, queuedTime time.Time) {
-	if s.regionRuntimeRegistry == nil || !region.runtimeKey.isValid() {
+	if !region.runtimeKey.isValid() {
 		return
 	}
 	s.regionRuntimeRegistry.markQueued(region.runtimeKey, acquiredTime, queuedTime)
 }
 
 func (s *subscriptionClient) recordRegionRuntimeError(region regionInfo, err error, now time.Time) {
-	if s.regionRuntimeRegistry == nil || !region.runtimeKey.isValid() {
+	if !region.runtimeKey.isValid() {
 		return
 	}
 	s.regionRuntimeRegistry.recordError(region.runtimeKey, err, now)
 }
 
 func (s *subscriptionClient) regionRuntimePhaseCounts() map[regionPhase]int {
-	if s.regionRuntimeRegistry == nil {
-		return nil
-	}
 	return s.regionRuntimeRegistry.phaseCounts()
 }
 
 func (s *subscriptionClient) removeSubscriptionRuntime(subID SubscriptionID) {
-	if s.regionRuntimeRegistry == nil {
-		return
-	}
 	s.regionRuntimeRegistry.removeBySubscription(subID)
 }
 
 func (s *subscriptionClient) removeRegionRuntime(region regionInfo, now time.Time) {
-	if s.regionRuntimeRegistry == nil || !region.runtimeKey.isValid() {
+	if !region.runtimeKey.isValid() {
 		return
 	}
 	s.regionRuntimeRegistry.transition(region.runtimeKey, regionPhaseRemoved, now)
@@ -387,10 +372,9 @@ func (s *subscriptionClient) updateMetrics(ctx context.Context) error {
 			pendingRegionReqCount := s.requestedStores.pendingRequestCount()
 			metrics.SubscriptionClientRequestedRegionCount.WithLabelValues("pending").Set(float64(pendingRegionReqCount))
 
-			if counts := s.regionRuntimePhaseCounts(); counts != nil {
-				for _, phase := range regionRuntimePhases {
-					metrics.SubscriptionClientRegionRuntimePhaseCount.WithLabelValues(string(phase)).Set(float64(counts[phase]))
-				}
+			counts := s.regionRuntimePhaseCounts()
+			for _, phase := range regionRuntimePhases {
+				metrics.SubscriptionClientRegionRuntimePhaseCount.WithLabelValues(string(phase)).Set(float64(counts[phase]))
 			}
 
 			metrics.SubscriptionClientSubscribedRegionCount.Set(float64(s.subscribedSpans.requestedRegionCount()))
@@ -415,7 +399,6 @@ func (s *subscriptionClient) Subscribe(
 		return
 	}
 
-	s.ensureHelpers()
 	rt := s.subscribedSpans.newSubscribedSpan(subID, span, startTs, consumeKVEvents, advanceResolvedTs, advanceInterval, bdrMode)
 	s.subscribedSpans.add(subID, rt)
 
@@ -434,7 +417,6 @@ func (s *subscriptionClient) Subscribe(
 // Unsubscribe the given table span. All covered regions will be deregistered asynchronously.
 // NOTE: `span.TableID` must be set correctly.
 func (s *subscriptionClient) Unsubscribe(subID SubscriptionID) {
-	s.ensureHelpers()
 	rt := s.subscribedSpans.get(subID)
 	if rt == nil {
 		log.Warn("unknown subscription", zap.Uint64("subscriptionID", uint64(subID)))
@@ -503,7 +485,6 @@ func (s *subscriptionClient) Run(ctx context.Context) error {
 		log.Warn("subscription client should be in test mode, skip run")
 		return nil
 	}
-	s.ensureHelpers()
 	s.clusterID = s.pd.GetClusterID(ctx)
 
 	g, ctx := errgroup.WithContext(ctx)
@@ -538,7 +519,6 @@ func (s *subscriptionClient) Close(ctx context.Context) error {
 }
 
 func (s *subscriptionClient) setTableStopped(rt *subscribedSpan) {
-	s.ensureHelpers()
 	s.subscribedSpans.setTableStopped(rt)
 }
 
@@ -551,23 +531,15 @@ func (s *subscriptionClient) newSubscribedSpan(
 	advanceInterval int64,
 	filterLoop bool,
 ) *subscribedSpan {
-	s.ensureHelpers()
 	return s.subscribedSpans.newSubscribedSpan(
 		subID, span, startTs, consumeKVEvents, advanceResolvedTs, advanceInterval, filterLoop)
 }
 
 func (s *subscriptionClient) GetResolvedTsLag() float64 {
-	s.ensureHelpers()
 	return s.subscribedSpans.getResolvedTsLag()
 }
 
-func (s *subscriptionClient) enqueueRegionToAllStores(ctx context.Context, region regionInfo) (bool, error) {
-	s.ensureHelpers()
-	return s.requestedStores.enqueueRegionToAllStores(ctx, region)
-}
-
 func (s *subscriptionClient) scheduleRegionRequest(ctx context.Context, region regionInfo, priority TaskType) {
-	s.ensureHelpers()
 	s.regionScheduler.scheduleRegionRequest(ctx, region, priority)
 }
 
@@ -578,17 +550,14 @@ func (s *subscriptionClient) scheduleRangeRequest(
 	filterLoop bool,
 	priority TaskType,
 ) {
-	s.ensureHelpers()
 	s.regionScheduler.scheduleRangeRequest(ctx, span, subscribedSpan, filterLoop, priority)
 }
 
 func (s *subscriptionClient) submitDirectFailure(failure regionFailureInfo) {
-	s.ensureHelpers()
 	s.regionScheduler.submitDirectFailure(failure)
 }
 
 func (s *subscriptionClient) submitOrderedFailure(state *regionFeedState) (regionFailureInfo, bool) {
-	s.ensureHelpers()
 	return s.regionScheduler.submitOrderedFailure(state)
 }
 
@@ -597,12 +566,10 @@ func (s *subscriptionClient) submitWorkerSessionFailure(
 	pendingRegions []regionInfo,
 	sessionFailure workerSessionFailure,
 ) {
-	s.ensureHelpers()
 	s.regionScheduler.submitWorkerSessionFailure(startedRegions, pendingRegions, sessionFailure)
 }
 
 func (s *subscriptionClient) handleFailure(ctx context.Context, failure regionFailureInfo) error {
-	s.ensureHelpers()
 	return s.regionScheduler.handleFailure(ctx, failure)
 }
 
