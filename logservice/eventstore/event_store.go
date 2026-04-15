@@ -1284,73 +1284,74 @@ func (e *eventStore) writeEvents(
 	encoder *zstd.Encoder,
 	compressionBuf *[]byte,
 ) error {
-	metrics.EventStoreWriteRequestsCount.Inc()
-	prepareStart := time.Now()
-	batch := db.NewBatch()
-	defer batch.Close()
-	kvCount := 0
-	var totalValueBytesBefore int64
-	var totalValueBytesAfter int64
-	var dstBuf []byte
-	if compressionBuf != nil {
-		dstBuf = *compressionBuf
-	}
-	for _, event := range events {
-		kvCount += len(event.kvs)
-		for _, kv := range event.kvs {
-			if kv.CRTs <= event.currentResolvedTs {
-				log.Warn("event store received kv with commitTs less than resolvedTs",
-					zap.Uint64("commitTs", kv.CRTs),
-					zap.Uint64("resolvedTs", event.currentResolvedTs),
-					zap.Uint64("subscriptionID", uint64(event.subID)),
-					zap.Int64("tableID", event.tableID))
-				continue
-			}
+	return nil
+	// metrics.EventStoreWriteRequestsCount.Inc()
+	// prepareStart := time.Now()
+	// batch := db.NewBatch()
+	// defer batch.Close()
+	// kvCount := 0
+	// var totalValueBytesBefore int64
+	// var totalValueBytesAfter int64
+	// var dstBuf []byte
+	// if compressionBuf != nil {
+	// 	dstBuf = *compressionBuf
+	// }
+	// for _, event := range events {
+	// 	kvCount += len(event.kvs)
+	// 	for _, kv := range event.kvs {
+	// 		if kv.CRTs <= event.currentResolvedTs {
+	// 			log.Warn("event store received kv with commitTs less than resolvedTs",
+	// 				zap.Uint64("commitTs", kv.CRTs),
+	// 				zap.Uint64("resolvedTs", event.currentResolvedTs),
+	// 				zap.Uint64("subscriptionID", uint64(event.subID)),
+	// 				zap.Int64("tableID", event.tableID))
+	// 			continue
+	// 		}
 
-			compressionType := CompressionNone
-			rawValue := kv.Encode()
-			valueBytesBefore := int64(len(rawValue))
-			valueBytesAfter := valueBytesBefore
-			value := rawValue
-			if e.enableZstdCompression && len(rawValue) > e.compressionThreshold {
-				maxEncodedSize := encoder.MaxEncodedSize(len(rawValue))
-				if cap(dstBuf) < maxEncodedSize {
-					dstBuf = make([]byte, 0, maxEncodedSize)
-				} else {
-					dstBuf = dstBuf[:0]
-				}
-				value = encoder.EncodeAll(rawValue, dstBuf)
-				valueBytesAfter = int64(len(value))
-				compressionType = CompressionZSTD
-				metrics.EventStoreCompressedRowsCount.Inc()
-			}
+	// 		compressionType := CompressionNone
+	// 		rawValue := kv.Encode()
+	// 		valueBytesBefore := int64(len(rawValue))
+	// 		valueBytesAfter := valueBytesBefore
+	// 		value := rawValue
+	// 		if e.enableZstdCompression && len(rawValue) > e.compressionThreshold {
+	// 			maxEncodedSize := encoder.MaxEncodedSize(len(rawValue))
+	// 			if cap(dstBuf) < maxEncodedSize {
+	// 				dstBuf = make([]byte, 0, maxEncodedSize)
+	// 			} else {
+	// 				dstBuf = dstBuf[:0]
+	// 			}
+	// 			value = encoder.EncodeAll(rawValue, dstBuf)
+	// 			valueBytesAfter = int64(len(value))
+	// 			compressionType = CompressionZSTD
+	// 			metrics.EventStoreCompressedRowsCount.Inc()
+	// 		}
 
-			key := EncodeKey(uint64(event.subID), event.tableID, &kv, compressionType)
-			if err := batch.Set(key, value, pebble.NoSync); err != nil {
-				log.Panic("failed to update pebble batch", zap.Error(err))
-			}
-			totalValueBytesBefore += valueBytesBefore
-			totalValueBytesAfter += valueBytesAfter
-			if compressionType == CompressionZSTD {
-				dstBuf = dstBuf[:0]
-			}
-		}
-	}
-	if compressionBuf != nil {
-		*compressionBuf = dstBuf
-	}
-	kvEventCount.Add(float64(kvCount))
-	metrics.EventStoreWriteBatchEventsCountHist.Observe(float64(kvCount))
-	metrics.EventStoreWriteBatchSizeHist.Observe(float64(batch.Len()))
-	metrics.EventStoreWriteBytes.Add(float64(batch.Len()))
-	if totalValueBytesAfter > 0 {
-		metrics.EventStoreCompressionRatioHistogram.Observe(float64(totalValueBytesBefore) / float64(totalValueBytesAfter))
-	}
-	metrics.EventStoreWritePrepareDurationHistogram.Observe(time.Since(prepareStart).Seconds())
-	start := time.Now()
-	err := batch.Commit(pebble.NoSync)
-	metrics.EventStoreWriteDurationHistogram.Observe(time.Since(start).Seconds())
-	return err
+	// 		key := EncodeKey(uint64(event.subID), event.tableID, &kv, compressionType)
+	// 		if err := batch.Set(key, value, pebble.NoSync); err != nil {
+	// 			log.Panic("failed to update pebble batch", zap.Error(err))
+	// 		}
+	// 		totalValueBytesBefore += valueBytesBefore
+	// 		totalValueBytesAfter += valueBytesAfter
+	// 		if compressionType == CompressionZSTD {
+	// 			dstBuf = dstBuf[:0]
+	// 		}
+	// 	}
+	// }
+	// if compressionBuf != nil {
+	// 	*compressionBuf = dstBuf
+	// }
+	// kvEventCount.Add(float64(kvCount))
+	// metrics.EventStoreWriteBatchEventsCountHist.Observe(float64(kvCount))
+	// metrics.EventStoreWriteBatchSizeHist.Observe(float64(batch.Len()))
+	// metrics.EventStoreWriteBytes.Add(float64(batch.Len()))
+	// if totalValueBytesAfter > 0 {
+	// 	metrics.EventStoreCompressionRatioHistogram.Observe(float64(totalValueBytesBefore) / float64(totalValueBytesAfter))
+	// }
+	// metrics.EventStoreWritePrepareDurationHistogram.Observe(time.Since(prepareStart).Seconds())
+	// start := time.Now()
+	// err := batch.Commit(pebble.NoSync)
+	// metrics.EventStoreWriteDurationHistogram.Observe(time.Since(start).Seconds())
+	// return err
 }
 
 type eventStoreIter struct {
