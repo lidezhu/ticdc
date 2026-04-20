@@ -14,7 +14,6 @@
 package logpuller
 
 import (
-	"sort"
 	"sync"
 	"time"
 )
@@ -41,33 +40,51 @@ type RequestCacheSnapshot struct {
 	Sent       int `json:"sent"`
 }
 
-type SlowRegionSnapshot struct {
-	SubscriptionID uint64 `json:"subscription_id"`
-	RegionID       uint64 `json:"region_id"`
-	Phase          string `json:"phase"`
-	StuckFor       string `json:"stuck_for"`
-	StoreAddr      string `json:"store_addr,omitempty"`
-	WorkerID       uint64 `json:"worker_id,omitempty"`
-	LastError      string `json:"last_error,omitempty"`
-	Span           string `json:"span,omitempty"`
+type SpanResolvedTsBlockerType string
+
+const (
+	SpanResolvedTsBlockerUnlockedRange       SpanResolvedTsBlockerType = "unlocked_range"
+	SpanResolvedTsBlockerUninitializedRegion SpanResolvedTsBlockerType = "uninitialized_region"
+	SpanResolvedTsBlockerInitializedRegion   SpanResolvedTsBlockerType = "initialized_region"
+)
+
+type RegionRuntimeBlockerSnapshot struct {
+	Phase        string `json:"phase,omitempty"`
+	PhaseAge     string `json:"phase_age,omitempty"`
+	LastEventAgo string `json:"last_event_ago,omitempty"`
+	StoreAddr    string `json:"store_addr,omitempty"`
+	WorkerID     uint64 `json:"worker_id,omitempty"`
+	LastError    string `json:"last_error,omitempty"`
 }
 
-type UnlockedRangeSnapshot struct {
-	SubscriptionID uint64   `json:"subscription_id"`
-	TableID        int64    `json:"table_id"`
-	HoleCount      int      `json:"hole_count"`
-	Holes          []string `json:"holes,omitempty"`
+type SpanResolvedTsBlockerSnapshot struct {
+	Type        SpanResolvedTsBlockerType     `json:"type"`
+	RegionID    uint64                        `json:"region_id,omitempty"`
+	Span        string                        `json:"span,omitempty"`
+	ResolvedTs  uint64                        `json:"resolved_ts"`
+	Initialized *bool                         `json:"initialized,omitempty"`
+	CreatedAgo  string                        `json:"created_ago,omitempty"`
+	Runtime     *RegionRuntimeBlockerSnapshot `json:"runtime,omitempty"`
+}
+
+type StalledSpanSnapshot struct {
+	SubscriptionID       uint64                          `json:"subscription_id"`
+	TableID              int64                           `json:"table_id"`
+	Span                 string                          `json:"span"`
+	Initialized          bool                            `json:"initialized"`
+	ResolvedTs           uint64                          `json:"resolved_ts"`
+	ResolvedTsLag        string                          `json:"resolved_ts_lag"`
+	ResolvedTsUpdatedAgo string                          `json:"resolved_ts_updated_ago"`
+	LockedRegionCount    int                             `json:"locked_region_count"`
+	UnlockedRangeCount   int                             `json:"unlocked_range_count"`
+	BlockedBy            []SpanResolvedTsBlockerSnapshot `json:"blocked_by,omitempty"`
 }
 
 type RuntimeObservability struct {
-	TrackedRegionCount            int                     `json:"tracked_region_count"`
-	PhaseCounts                   map[string]int          `json:"phase_counts"`
-	SlowRegionCount               int                     `json:"slow_region_count"`
-	SlowRegionCountsByPhase       map[string]int          `json:"slow_region_counts_by_phase"`
-	SlowRegions                   []SlowRegionSnapshot    `json:"slow_regions,omitempty"`
-	SubscriptionWithUnlockedRange int                     `json:"subscription_with_unlocked_range"`
-	UnlockedRangeCount            int                     `json:"unlocked_range_count"`
-	UnlockedRanges                []UnlockedRangeSnapshot `json:"unlocked_ranges,omitempty"`
+	TrackedRegionCount int                   `json:"tracked_region_count"`
+	PhaseCounts        map[string]int        `json:"phase_counts"`
+	StalledSpanCount   int                   `json:"stalled_span_count"`
+	StalledSpans       []StalledSpanSnapshot `json:"stalled_spans,omitempty"`
 }
 
 type WorkerObservability struct {
@@ -85,20 +102,10 @@ type StoreObservability struct {
 	Workers           []WorkerObservability `json:"workers,omitempty"`
 }
 
-type FailureSnapshot struct {
-	Scope     string    `json:"scope"`
-	Source    string    `json:"source"`
-	Kind      string    `json:"kind"`
-	Count     uint64    `json:"count"`
-	LastAt    time.Time `json:"last_at"`
-	LastError string    `json:"last_error,omitempty"`
-}
-
 type ObservabilitySnapshot struct {
 	GeneratedAt time.Time            `json:"generated_at"`
 	Runtime     RuntimeObservability `json:"runtime"`
 	Stores      []StoreObservability `json:"stores,omitempty"`
-	Failures    []FailureSnapshot    `json:"failures,omitempty"`
 }
 
 type failureCounterKey struct {
@@ -142,36 +149,6 @@ func (s *failureStats) record(failure regionFailureInfo, now time.Time) {
 		state.lastError = ""
 	}
 	s.counts[key] = state
-}
-
-func (s *failureStats) snapshot() []FailureSnapshot {
-	s.mu.RLock()
-	snapshots := make([]FailureSnapshot, 0, len(s.counts))
-	for key, state := range s.counts {
-		snapshots = append(snapshots, FailureSnapshot{
-			Scope:     key.scope.String(),
-			Source:    key.source.String(),
-			Kind:      key.kind.String(),
-			Count:     state.count,
-			LastAt:    state.lastAt,
-			LastError: state.lastError,
-		})
-	}
-	s.mu.RUnlock()
-
-	sort.Slice(snapshots, func(i, j int) bool {
-		if snapshots[i].Count != snapshots[j].Count {
-			return snapshots[i].Count > snapshots[j].Count
-		}
-		if snapshots[i].Scope != snapshots[j].Scope {
-			return snapshots[i].Scope < snapshots[j].Scope
-		}
-		if snapshots[i].Source != snapshots[j].Source {
-			return snapshots[i].Source < snapshots[j].Source
-		}
-		return snapshots[i].Kind < snapshots[j].Kind
-	})
-	return snapshots
 }
 
 func normalizeObservabilitySampleLimit(sampleLimit int) int {

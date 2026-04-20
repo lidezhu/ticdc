@@ -131,6 +131,11 @@ type slowRegionSample struct {
 	Span      string
 }
 
+type slowRegionCandidate struct {
+	state    *regionRuntimeState
+	stuckFor time.Duration
+}
+
 func (s regionRuntimeState) clone() regionRuntimeState {
 	s.span = cloneTableSpan(s.span)
 	return s
@@ -383,14 +388,36 @@ func (r *regionRuntimeRegistry) get(key regionRuntimeKey) (regionRuntimeState, b
 	return state.clone(), true
 }
 
-func (r *regionRuntimeRegistry) snapshot() []regionRuntimeState {
+func (r *regionRuntimeRegistry) getLatest(
+	subID SubscriptionID,
+	regionID uint64,
+) (regionRuntimeState, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
+	identity := regionRuntimeIdentity{subID: subID, regionID: regionID}
+	for generation := r.generations[identity]; generation > 0; generation-- {
+		key := regionRuntimeKey{
+			subID:      subID,
+			regionID:   regionID,
+			generation: generation,
+		}
+		state, ok := r.states[key]
+		if ok {
+			return state.clone(), true
+		}
+	}
+	return regionRuntimeState{}, false
+}
+
+func (r *regionRuntimeRegistry) snapshot() []regionRuntimeState {
+	r.mu.RLock()
 	snapshots := make([]regionRuntimeState, 0, len(r.states))
 	for _, state := range r.states {
 		snapshots = append(snapshots, state.clone())
 	}
+	r.mu.RUnlock()
+
 	sort.Slice(snapshots, func(i, j int) bool {
 		left, right := snapshots[i].key, snapshots[j].key
 		if left.subID != right.subID {
@@ -487,26 +514,59 @@ func (s regionRuntimeState) slowDuration(now time.Time) time.Duration {
 	return s.phaseAge(now)
 }
 
-func (s regionRuntimeState) slowSample(now time.Time) (slowRegionSample, bool) {
-	threshold, ok := s.slowThreshold()
-	if !ok {
-		return slowRegionSample{}, false
+func betterSlowRegionCandidate(left, right slowRegionCandidate) bool {
+	if left.stuckFor != right.stuckFor {
+		return left.stuckFor > right.stuckFor
 	}
-	stuckFor := s.slowDuration(now)
-	if stuckFor <= threshold {
-		return slowRegionSample{}, false
+	if left.state.key.subID != right.state.key.subID {
+		return left.state.key.subID < right.state.key.subID
+	}
+	if left.state.key.regionID != right.state.key.regionID {
+		return left.state.key.regionID < right.state.key.regionID
+	}
+	return left.state.key.generation < right.state.key.generation
+}
+
+func insertSlowRegionCandidate(
+	candidates []slowRegionCandidate,
+	candidate slowRegionCandidate,
+	limit int,
+) []slowRegionCandidate {
+	if limit <= 0 {
+		return candidates
 	}
 
+	originalLen := len(candidates)
+	if originalLen == limit && !betterSlowRegionCandidate(candidate, candidates[originalLen-1]) {
+		return candidates
+	}
+
+	insertAt := sort.Search(originalLen, func(i int) bool {
+		return betterSlowRegionCandidate(candidate, candidates[i])
+	})
+	if originalLen < limit {
+		candidates = append(candidates, slowRegionCandidate{})
+		copy(candidates[insertAt+1:], candidates[insertAt:originalLen])
+		candidates[insertAt] = candidate
+		return candidates
+	}
+
+	copy(candidates[insertAt+1:], candidates[insertAt:originalLen-1])
+	candidates[insertAt] = candidate
+	return candidates
+}
+
+func makeSlowRegionSample(candidate slowRegionCandidate) slowRegionSample {
 	return slowRegionSample{
-		SubscriptionID: uint64(s.key.subID),
-		RegionID:       s.key.regionID,
-		Phase:          s.phase,
-		StuckFor:       stuckFor,
-		StoreAddr:      s.storeAddr,
-		WorkerID:       s.workerID,
-		LastError:      s.lastError,
-		Span:           common.FormatTableSpan(&s.span),
-	}, true
+		SubscriptionID: uint64(candidate.state.key.subID),
+		RegionID:       candidate.state.key.regionID,
+		Phase:          candidate.state.phase,
+		StuckFor:       candidate.stuckFor,
+		StoreAddr:      candidate.state.storeAddr,
+		WorkerID:       candidate.state.workerID,
+		LastError:      candidate.state.lastError,
+		Span:           common.FormatTableSpan(&candidate.state.span),
+	}
 }
 
 func (r *regionRuntimeRegistry) slowRegionCounts(now time.Time) (int, map[regionPhase]int) {
@@ -535,35 +595,69 @@ func (r *regionRuntimeRegistry) collectSlowRegionReport(
 	now time.Time,
 	sampleLimit int,
 ) slowRegionReport {
-	snapshots := r.snapshot()
 	report := slowRegionReport{
-		totalRegionCount: len(snapshots),
-		phaseCounts:      make(map[regionPhase]int),
+		phaseCounts: make(map[regionPhase]int),
 	}
 
-	for _, state := range snapshots {
-		sample, ok := state.slowSample(now)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if sampleLimit < 0 {
+		candidates := make([]slowRegionCandidate, 0)
+		for _, state := range r.states {
+			report.totalRegionCount++
+
+			threshold, ok := state.slowThreshold()
+			if !ok {
+				continue
+			}
+			stuckFor := state.slowDuration(now)
+			if stuckFor <= threshold {
+				continue
+			}
+
+			report.slowRegionCount++
+			report.phaseCounts[state.phase]++
+			candidates = append(candidates, slowRegionCandidate{
+				state:    state,
+				stuckFor: stuckFor,
+			})
+		}
+
+		sort.Slice(candidates, func(i, j int) bool {
+			return betterSlowRegionCandidate(candidates[i], candidates[j])
+		})
+		report.samples = make([]slowRegionSample, 0, len(candidates))
+		for _, candidate := range candidates {
+			report.samples = append(report.samples, makeSlowRegionSample(candidate))
+		}
+		return report
+	}
+
+	candidates := make([]slowRegionCandidate, 0, sampleLimit)
+	for _, state := range r.states {
+		report.totalRegionCount++
+
+		threshold, ok := state.slowThreshold()
 		if !ok {
 			continue
 		}
+		stuckFor := state.slowDuration(now)
+		if stuckFor <= threshold {
+			continue
+		}
+
 		report.slowRegionCount++
 		report.phaseCounts[state.phase]++
-		report.samples = append(report.samples, sample)
+		candidates = insertSlowRegionCandidate(candidates, slowRegionCandidate{
+			state:    state,
+			stuckFor: stuckFor,
+		}, sampleLimit)
 	}
 
-	sort.Slice(report.samples, func(i, j int) bool {
-		left := report.samples[i]
-		right := report.samples[j]
-		if left.StuckFor != right.StuckFor {
-			return left.StuckFor > right.StuckFor
-		}
-		if left.SubscriptionID != right.SubscriptionID {
-			return left.SubscriptionID < right.SubscriptionID
-		}
-		return left.RegionID < right.RegionID
-	})
-	if sampleLimit >= 0 && len(report.samples) > sampleLimit {
-		report.samples = report.samples[:sampleLimit]
+	report.samples = make([]slowRegionSample, 0, len(candidates))
+	for _, candidate := range candidates {
+		report.samples = append(report.samples, makeSlowRegionSample(candidate))
 	}
 	return report
 }

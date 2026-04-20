@@ -154,8 +154,8 @@ func newRegionRequestWorker(
 		credential:                 credential,
 		pushRegionEvent:            client.pushRegionEventToDS,
 		runtimeRegistry:            client.regionRuntimeRegistry,
-		submitDirectFailure:        client.submitDirectFailure,
-		submitWorkerSessionFailure: client.submitWorkerSessionFailure,
+		submitDirectFailure:        client.regionScheduler.submitDirectFailure,
+		submitWorkerSessionFailure: client.regionScheduler.submitWorkerSessionFailure,
 		store:                      store,
 		requestCache:               newRequestCache(requestCacheSize),
 	}

@@ -92,26 +92,33 @@ var (
 			Name:      "region_runtime_phase_count",
 			Help:      "The number of regions in each runtime phase",
 		}, []string{"phase"})
-	SubscriptionClientSlowRegionCount = prometheus.NewGauge(
+	SubscriptionClientStalledSpanCount = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: "ticdc",
 			Subsystem: "subscription_client",
-			Name:      "slow_region_count",
-			Help:      "The number of slow regions tracked by the log puller",
+			Name:      "stalled_span_count",
+			Help:      "The number of subscribed spans whose resolved ts has stopped advancing",
 		})
-	SubscriptionClientSlowRegionCountByPhase = prometheus.NewGaugeVec(
+	SubscriptionClientStalledSpanCountByBlockerType = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: "ticdc",
 			Subsystem: "subscription_client",
-			Name:      "slow_region_count_by_phase",
-			Help:      "The number of slow regions in each runtime phase",
-		}, []string{"phase"})
-	SubscriptionClientUnlockedRangeCount = prometheus.NewGauge(
+			Name:      "stalled_span_count_by_blocker_type",
+			Help:      "The number of stalled spans by objective resolved ts blocker type",
+		}, []string{"type"})
+	SubscriptionClientStalledSpanMaxResolvedTsLag = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: "ticdc",
 			Subsystem: "subscription_client",
-			Name:      "unlocked_range_count",
-			Help:      "The number of unlocked ranges across all subscriptions",
+			Name:      "stalled_span_max_resolved_ts_lag",
+			Help:      "The maximum resolved ts lag among stalled spans in seconds",
+		})
+	SubscriptionClientStalledSpanMaxResolvedTsUpdatedAge = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "ticdc",
+			Subsystem: "subscription_client",
+			Name:      "stalled_span_max_resolved_ts_updated_age",
+			Help:      "The maximum time since resolved ts update among stalled spans in seconds",
 		})
 	SubscriptionClientFailureCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -150,9 +157,10 @@ func initLogPullerMetrics(registry *prometheus.Registry) {
 	registry.MustRegister(SubscriptionClientSubscribedRegionCount)
 	registry.MustRegister(SubscriptionClientResolveLockTaskDropCounter)
 	registry.MustRegister(SubscriptionClientRegionRuntimePhaseCount)
-	registry.MustRegister(SubscriptionClientSlowRegionCount)
-	registry.MustRegister(SubscriptionClientSlowRegionCountByPhase)
-	registry.MustRegister(SubscriptionClientUnlockedRangeCount)
+	registry.MustRegister(SubscriptionClientStalledSpanCount)
+	registry.MustRegister(SubscriptionClientStalledSpanCountByBlockerType)
+	registry.MustRegister(SubscriptionClientStalledSpanMaxResolvedTsLag)
+	registry.MustRegister(SubscriptionClientStalledSpanMaxResolvedTsUpdatedAge)
 	registry.MustRegister(SubscriptionClientFailureCounter)
 	registry.MustRegister(SubscriptionClientRegionEventHandleDuration)
 	registry.MustRegister(SubscriptionClientConsumeKVEventsCallbackDuration)

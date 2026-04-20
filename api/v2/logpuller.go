@@ -27,11 +27,11 @@ import (
 // local log puller instance.
 //
 // @Summary Get the local log puller observability snapshot
-// @Description This API returns the local node's log puller runtime summary, worker/store snapshots and aggregated failures.
+// @Description This API returns the local node's log puller runtime summary, stalled span snapshots and worker/store snapshots.
 // @Tags common,v2
 // @Accept json
 // @Produce json
-// @Param sample_limit query int false "Maximum number of sampled slow regions / unlocked ranges to return"
+// @Param sample_limit query int false "Maximum number of sampled stalled spans to return"
 // @Success 200 {object} logpuller.ObservabilitySnapshot
 // @Failure 500,400 {object} model.HTTPError
 // @Router /api/v2/debug/logpuller [get]

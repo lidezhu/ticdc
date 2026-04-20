@@ -231,3 +231,45 @@ func TestRegionRuntimeRegistryCollectSlowRegionReport(t *testing.T) {
 	require.Equal(t, regionPhaseQueued, report.samples[1].Phase)
 	require.Equal(t, 11*time.Minute, report.samples[1].StuckFor)
 }
+
+func TestRegionRuntimeRegistryCollectSlowRegionReportKeepsTopSamples(t *testing.T) {
+	registry := newRegionRuntimeRegistry()
+	now := time.Unix(1700003600, 0)
+
+	addQueuedSlowRegion := func(subID SubscriptionID, regionID uint64, queuedAt time.Time) {
+		key := registry.allocKey(subID, regionID)
+		registry.markDiscovered(key, regionInfo{
+			span: heartbeatpb.TableSpan{
+				TableID:  int64(regionID),
+				StartKey: []byte("a"),
+				EndKey:   []byte("b"),
+			},
+			subscribedSpan: &subscribedSpan{
+				subID: subID,
+				span: heartbeatpb.TableSpan{
+					TableID: int64(regionID),
+				},
+			},
+		}, queuedAt.Add(-time.Minute))
+		registry.markQueued(key, queuedAt, queuedAt, 100)
+	}
+
+	addQueuedSlowRegion(2, 201, now.Add(-15*time.Minute))
+	addQueuedSlowRegion(1, 101, now.Add(-15*time.Minute))
+	addQueuedSlowRegion(1, 100, now.Add(-15*time.Minute))
+	addQueuedSlowRegion(1, 102, now.Add(-11*time.Minute))
+
+	report := registry.collectSlowRegionReport(now, 2)
+	require.Equal(t, 4, report.totalRegionCount)
+	require.Equal(t, 4, report.slowRegionCount)
+	require.Equal(t, 4, report.phaseCounts[regionPhaseQueued])
+	require.Len(t, report.samples, 2)
+
+	require.Equal(t, uint64(1), report.samples[0].SubscriptionID)
+	require.Equal(t, uint64(100), report.samples[0].RegionID)
+	require.Equal(t, 15*time.Minute, report.samples[0].StuckFor)
+
+	require.Equal(t, uint64(1), report.samples[1].SubscriptionID)
+	require.Equal(t, uint64(101), report.samples[1].RegionID)
+	require.Equal(t, 15*time.Minute, report.samples[1].StuckFor)
+}

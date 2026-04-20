@@ -68,7 +68,7 @@ func TestLogPullerObservability(t *testing.T) {
 		snapshot: logpuller.ObservabilitySnapshot{
 			Runtime: logpuller.RuntimeObservability{
 				TrackedRegionCount: 1,
-				SlowRegionCount:    1,
+				StalledSpanCount:   1,
 			},
 		},
 	})
@@ -81,5 +81,5 @@ func TestLogPullerObservability(t *testing.T) {
 	var snapshot logpuller.ObservabilitySnapshot
 	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &snapshot))
 	require.Equal(t, 1, snapshot.Runtime.TrackedRegionCount)
-	require.Equal(t, 1, snapshot.Runtime.SlowRegionCount)
+	require.Equal(t, 1, snapshot.Runtime.StalledSpanCount)
 }

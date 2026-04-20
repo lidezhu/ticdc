@@ -37,24 +37,23 @@ func TestSubscriptionClientGetObservabilitySnapshot(t *testing.T) {
 	client := &subscriptionClient{
 		pdClock:               clock,
 		regionRuntimeRegistry: newRegionRuntimeRegistry(),
-		failureStats:          newFailureStats(),
 	}
 	client.ensureHelpers()
 
-	region := createTestRegionInfo(1, 101)
-	region.rpcCtx = createRPCContext("tikv-1:20160", 11, 22)
-	region.runtimeKey = client.regionRuntimeRegistry.allocKey(region.subscribedSpan.subID, region.verID.GetID())
-	client.regionRuntimeRegistry.markDiscovered(region.runtimeKey, region, now.Add(-30*time.Minute))
+	storeRegion := createTestRegionInfo(1, 101)
+	storeRegion.rpcCtx = createRPCContext("tikv-1:20160", 11, 22)
+	storeRegion.runtimeKey = client.regionRuntimeRegistry.allocKey(storeRegion.subscribedSpan.subID, storeRegion.verID.GetID())
+	client.regionRuntimeRegistry.markDiscovered(storeRegion.runtimeKey, storeRegion, now.Add(-30*time.Minute))
 	client.regionRuntimeRegistry.markQueued(
-		region.runtimeKey,
+		storeRegion.runtimeKey,
 		now.Add(-29*time.Minute),
 		now.Add(-29*time.Minute),
 		oracle.GoTimeToTS(now.Add(-20*time.Minute)),
 	)
-	client.regionRuntimeRegistry.markRequestSent(region.runtimeKey, 7, now.Add(-28*time.Minute))
-	client.regionRuntimeRegistry.markReplicating(region.runtimeKey, now.Add(-28*time.Minute))
+	client.regionRuntimeRegistry.markRequestSent(storeRegion.runtimeKey, 7, now.Add(-28*time.Minute))
+	client.regionRuntimeRegistry.markReplicating(storeRegion.runtimeKey, now.Add(-28*time.Minute))
 
-	store := newRequestedStore(region.rpcCtx.Addr)
+	store := newRequestedStore(storeRegion.rpcCtx.Addr)
 	worker := &regionRequestWorker{
 		workerID:        7,
 		store:           store,
@@ -77,37 +76,100 @@ func TestSubscriptionClientGetObservabilitySnapshot(t *testing.T) {
 		nil,
 	)
 	session.setStage(WorkerSessionStateRunning)
-	session.activeRegions.add(region.subscribedSpan.subID, region.verID.GetID(), &regionFeedState{})
+	session.activeRegions.add(storeRegion.subscribedSpan.subID, storeRegion.verID.GetID(), &regionFeedState{})
 	worker.setCurrentSession(session)
 	store.addWorker(worker)
 	client.requestedStores.stores.Store(store.storeAddr, store)
 
-	span := client.newSubscribedSpan(SubscriptionID(2), heartbeatpb.TableSpan{
+	stalledResolvedTs := oracle.GoTimeToTS(now.Add(-20 * time.Minute))
+	span := client.subscribedSpans.newSubscribedSpan(SubscriptionID(2), heartbeatpb.TableSpan{
 		TableID:  22,
 		StartKey: []byte("a"),
 		EndKey:   []byte("z"),
-	}, 100, func(_ []common.RawKVEntry, _ func()) bool { return false }, func(uint64) {}, 0, false)
+	}, stalledResolvedTs, func(_ []common.RawKVEntry, _ func()) bool { return false }, func(uint64) {}, 0, false)
 	client.subscribedSpans.add(span.subID, span)
-	require.Equal(t, regionlock.LockRangeStatusSuccess,
-		span.rangeLock.LockRange(context.Background(), []byte("a"), []byte("b"), 1, 1).Status)
-	require.Equal(t, regionlock.LockRangeStatusSuccess,
-		span.rangeLock.LockRange(context.Background(), []byte("c"), []byte("d"), 2, 1).Status)
+	span.initialized.Store(true)
+	span.resolvedTs.Store(stalledResolvedTs)
+	span.resolvedTsUpdated.Store(now.Add(-45 * time.Second).Unix())
 
-	client.failureStats.record(
-		newSendRequestToStoreFailure(region, regionFailureSourceWorkerSend, errors.New("boom")),
-		now,
+	res := span.rangeLock.LockRange(context.Background(), []byte("a"), []byte("b"), 1, 1)
+	require.Equal(t, regionlock.LockRangeStatusSuccess, res.Status)
+	res.LockedRangeState.ResolvedTs.Store(stalledResolvedTs)
+	res.LockedRangeState.Initialized.Store(false)
+	res.LockedRangeState.Created = now.Add(-10 * time.Minute)
+
+	res = span.rangeLock.LockRange(context.Background(), []byte("c"), []byte("d"), 2, 1)
+	require.Equal(t, regionlock.LockRangeStatusSuccess, res.Status)
+	res.LockedRangeState.ResolvedTs.Store(stalledResolvedTs)
+	res.LockedRangeState.Initialized.Store(true)
+	res.LockedRangeState.Created = now.Add(-9 * time.Minute)
+
+	uninitializedRegion := newRegionInfo(
+		tikv.NewRegionVerID(1, 1, 1),
+		heartbeatpb.TableSpan{
+			TableID:  22,
+			StartKey: []byte("a"),
+			EndKey:   []byte("b"),
+		},
+		createRPCContext("tikv-2:20160", 33, 44),
+		span,
+		false,
 	)
+	uninitializedKey := client.regionRuntimeRegistry.allocKey(span.subID, 1)
+	client.regionRuntimeRegistry.markDiscovered(uninitializedKey, uninitializedRegion, now.Add(-15*time.Minute))
+	client.regionRuntimeRegistry.markRequestSent(uninitializedKey, 9, now.Add(-14*time.Minute))
+	client.regionRuntimeRegistry.recordError(uninitializedKey, errors.New("still waiting init"), now.Add(-50*time.Second))
+
+	initializedRegion := newRegionInfo(
+		tikv.NewRegionVerID(2, 1, 1),
+		heartbeatpb.TableSpan{
+			TableID:  22,
+			StartKey: []byte("c"),
+			EndKey:   []byte("d"),
+		},
+		createRPCContext("tikv-2:20160", 34, 44),
+		span,
+		false,
+	)
+	initializedKey := client.regionRuntimeRegistry.allocKey(span.subID, 2)
+	client.regionRuntimeRegistry.markDiscovered(initializedKey, initializedRegion, now.Add(-12*time.Minute))
+	client.regionRuntimeRegistry.markQueued(
+		initializedKey,
+		now.Add(-11*time.Minute),
+		now.Add(-11*time.Minute),
+		stalledResolvedTs,
+	)
+	client.regionRuntimeRegistry.markRequestSent(initializedKey, 9, now.Add(-10*time.Minute))
+	client.regionRuntimeRegistry.markReplicating(initializedKey, now.Add(-10*time.Minute))
+	client.regionRuntimeRegistry.updateLastEvent(initializedKey, now.Add(-90*time.Second))
 
 	snapshot := client.GetObservabilitySnapshot(4)
 	require.Equal(t, now, snapshot.GeneratedAt)
-	require.Equal(t, 1, snapshot.Runtime.TrackedRegionCount)
-	require.Equal(t, 1, snapshot.Runtime.SlowRegionCount)
-	require.Len(t, snapshot.Runtime.SlowRegions, 1)
-	require.Equal(t, "replicating", snapshot.Runtime.SlowRegions[0].Phase)
-	require.Equal(t, "20m0s", snapshot.Runtime.SlowRegions[0].StuckFor)
-	require.Equal(t, 1, snapshot.Runtime.SubscriptionWithUnlockedRange)
-	require.Equal(t, 2, snapshot.Runtime.UnlockedRangeCount)
-	require.Len(t, snapshot.Runtime.UnlockedRanges, 1)
+	require.Equal(t, 3, snapshot.Runtime.TrackedRegionCount)
+	require.Equal(t, 1, snapshot.Runtime.StalledSpanCount)
+	require.Len(t, snapshot.Runtime.StalledSpans, 1)
+	require.Equal(t, uint64(2), snapshot.Runtime.StalledSpans[0].SubscriptionID)
+	require.Equal(t, int64(22), snapshot.Runtime.StalledSpans[0].TableID)
+	require.Equal(t, stalledResolvedTs, snapshot.Runtime.StalledSpans[0].ResolvedTs)
+	require.Equal(t, "20m0s", snapshot.Runtime.StalledSpans[0].ResolvedTsLag)
+	require.Equal(t, "45s", snapshot.Runtime.StalledSpans[0].ResolvedTsUpdatedAgo)
+	require.Equal(t, 2, snapshot.Runtime.StalledSpans[0].LockedRegionCount)
+	require.Equal(t, 2, snapshot.Runtime.StalledSpans[0].UnlockedRangeCount)
+	require.Len(t, snapshot.Runtime.StalledSpans[0].BlockedBy, 4)
+	require.Equal(t, SpanResolvedTsBlockerUninitializedRegion, snapshot.Runtime.StalledSpans[0].BlockedBy[0].Type)
+	require.Equal(t, uint64(1), snapshot.Runtime.StalledSpans[0].BlockedBy[0].RegionID)
+	require.NotNil(t, snapshot.Runtime.StalledSpans[0].BlockedBy[0].Initialized)
+	require.False(t, *snapshot.Runtime.StalledSpans[0].BlockedBy[0].Initialized)
+	require.NotNil(t, snapshot.Runtime.StalledSpans[0].BlockedBy[0].Runtime)
+	require.Equal(t, "wait_initialized", snapshot.Runtime.StalledSpans[0].BlockedBy[0].Runtime.Phase)
+	require.Equal(t, "tikv-2:20160", snapshot.Runtime.StalledSpans[0].BlockedBy[0].Runtime.StoreAddr)
+	require.Equal(t, uint64(9), snapshot.Runtime.StalledSpans[0].BlockedBy[0].Runtime.WorkerID)
+	require.Equal(t, SpanResolvedTsBlockerUnlockedRange, snapshot.Runtime.StalledSpans[0].BlockedBy[1].Type)
+	require.Equal(t, SpanResolvedTsBlockerInitializedRegion, snapshot.Runtime.StalledSpans[0].BlockedBy[2].Type)
+	require.NotNil(t, snapshot.Runtime.StalledSpans[0].BlockedBy[2].Runtime)
+	require.Equal(t, "replicating", snapshot.Runtime.StalledSpans[0].BlockedBy[2].Runtime.Phase)
+	require.Equal(t, "1m30s", snapshot.Runtime.StalledSpans[0].BlockedBy[2].Runtime.LastEventAgo)
+	require.Equal(t, SpanResolvedTsBlockerUnlockedRange, snapshot.Runtime.StalledSpans[0].BlockedBy[3].Type)
 	require.Len(t, snapshot.Stores, 1)
 	require.Equal(t, "tikv-1:20160", snapshot.Stores[0].StoreAddr)
 	require.Equal(t, 1, snapshot.Stores[0].ActiveRegionCount)
@@ -115,11 +177,6 @@ func TestSubscriptionClientGetObservabilitySnapshot(t *testing.T) {
 	require.Equal(t, 1, snapshot.Stores[0].RequestCache.Queued)
 	require.Len(t, snapshot.Stores[0].Workers, 1)
 	require.Equal(t, WorkerSessionStateRunning, snapshot.Stores[0].Workers[0].SessionState)
-	require.Len(t, snapshot.Failures, 1)
-	require.Equal(t, "store_session", snapshot.Failures[0].Scope)
-	require.Equal(t, "worker_send", snapshot.Failures[0].Source)
-	require.Equal(t, "send_request_to_store", snapshot.Failures[0].Kind)
-	require.Equal(t, uint64(1), snapshot.Failures[0].Count)
 }
 
 func createRPCContext(addr string, peerID uint64, storeID uint64) *tikv.RPCContext {

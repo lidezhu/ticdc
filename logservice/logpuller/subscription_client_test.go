@@ -49,7 +49,7 @@ func TestGenerateResolveLockTask(t *testing.T) {
 	}
 	consumeKVEvents := func(_ []common.RawKVEntry, _ func()) bool { return false }
 	advanceResolvedTs := func(ts uint64) {}
-	span := client.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
+	span := client.subscribedSpans.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
 	client.subscribedSpans.add(SubscriptionID(1), span)
 	client.pdClock = pdutil.NewClock4Test()
 
@@ -114,7 +114,7 @@ func TestResolveLockTaskDroppedWhenChannelFull(t *testing.T) {
 	}
 	consumeKVEvents := func(_ []common.RawKVEntry, _ func()) bool { return false }
 	advanceResolvedTs := func(ts uint64) {}
-	span := client.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
+	span := client.subscribedSpans.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
 
 	res := span.rangeLock.LockRange(context.Background(), []byte{'b'}, []byte{'c'}, 1, 100)
 	require.Equal(t, regionlock.LockRangeStatusSuccess, res.Status)
@@ -162,12 +162,12 @@ func TestStopTaskUsesSubscribedSpanFilterLoop(t *testing.T) {
 	}
 	consumeKVEvents := func(_ []common.RawKVEntry, _ func()) bool { return false }
 	advanceResolvedTs := func(ts uint64) {}
-	span := client.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, true)
+	span := client.subscribedSpans.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, true)
 
 	res := span.rangeLock.LockRange(context.Background(), rawSpan.StartKey, rawSpan.EndKey, 1, 1)
 	require.Equal(t, regionlock.LockRangeStatusSuccess, res.Status)
 
-	client.setTableStopped(span)
+	client.subscribedSpans.setTableStopped(span)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -178,42 +178,66 @@ func TestStopTaskUsesSubscribedSpanFilterLoop(t *testing.T) {
 	require.True(t, region.filterLoop)
 }
 
-func TestCollectUnlockedRangeReport(t *testing.T) {
-	client := &subscriptionClient{}
+func TestCollectStalledSpanReport(t *testing.T) {
+	clock := pdutil.NewClock4Test().(*pdutil.Clock4Test)
+	now := time.Unix(1700003600, 0)
+	clock.SetTS(oracle.GoTimeToTS(now))
+
+	client := &subscriptionClient{
+		pdClock:               clock,
+		regionRuntimeRegistry: newRegionRuntimeRegistry(),
+	}
 	client.ensureHelpers()
 
 	consumeKVEvents := func(_ []common.RawKVEntry, _ func()) bool { return false }
 	advanceResolvedTs := func(uint64) {}
 
-	span1 := client.newSubscribedSpan(SubscriptionID(1), heartbeatpb.TableSpan{
+	stalledTs1 := oracle.GoTimeToTS(now.Add(-15 * time.Minute))
+	span1 := client.subscribedSpans.newSubscribedSpan(SubscriptionID(1), heartbeatpb.TableSpan{
 		TableID:  11,
 		StartKey: []byte{'a'},
 		EndKey:   []byte{'z'},
-	}, 100, consumeKVEvents, advanceResolvedTs, 0, false)
+	}, stalledTs1, consumeKVEvents, advanceResolvedTs, 0, false)
 	client.subscribedSpans.add(SubscriptionID(1), span1)
-	require.Equal(t, regionlock.LockRangeStatusSuccess,
-		span1.rangeLock.LockRange(context.Background(), []byte{'a'}, []byte{'b'}, 1, 1).Status)
-	require.Equal(t, regionlock.LockRangeStatusSuccess,
-		span1.rangeLock.LockRange(context.Background(), []byte{'c'}, []byte{'d'}, 2, 1).Status)
+	span1.initialized.Store(true)
+	span1.resolvedTs.Store(stalledTs1)
+	span1.resolvedTsUpdated.Store(now.Add(-55 * time.Second).Unix())
 
-	span2 := client.newSubscribedSpan(SubscriptionID(2), heartbeatpb.TableSpan{
+	res := span1.rangeLock.LockRange(context.Background(), []byte{'a'}, []byte{'b'}, 1, 1)
+	require.Equal(t, regionlock.LockRangeStatusSuccess, res.Status)
+	res.LockedRangeState.ResolvedTs.Store(stalledTs1)
+	res.LockedRangeState.Initialized.Store(true)
+
+	stalledTs2 := oracle.GoTimeToTS(now.Add(-20 * time.Minute))
+	span2 := client.subscribedSpans.newSubscribedSpan(SubscriptionID(2), heartbeatpb.TableSpan{
 		TableID:  22,
 		StartKey: []byte{'m'},
 		EndKey:   []byte{'z'},
-	}, 100, consumeKVEvents, advanceResolvedTs, 0, false)
+	}, stalledTs2, consumeKVEvents, advanceResolvedTs, 0, false)
 	client.subscribedSpans.add(SubscriptionID(2), span2)
-	require.Equal(t, regionlock.LockRangeStatusSuccess,
-		span2.rangeLock.LockRange(context.Background(), []byte{'m'}, []byte{'z'}, 3, 1).Status)
+	span2.resolvedTs.Store(stalledTs2)
+	span2.resolvedTsUpdated.Store(now.Add(-45 * time.Second).Unix())
 
-	report := client.collectUnlockedRangeReport(4, 2)
-	require.Equal(t, 1, report.subscriptionCount)
-	require.Equal(t, 2, report.unlockedRangeCount)
+	res = span2.rangeLock.LockRange(context.Background(), []byte{'m'}, []byte{'z'}, 3, 1)
+	require.Equal(t, regionlock.LockRangeStatusSuccess, res.Status)
+	res.LockedRangeState.ResolvedTs.Store(stalledTs2)
+	res.LockedRangeState.Initialized.Store(false)
+
+	report := client.collectStalledSpanReport(now, 1, 4)
+	require.Equal(t, 2, report.stalledSpanCount)
+	require.Equal(t, 1, report.blockerCounts[regionlock.ResolvedTsBlockerUnlockedRange])
+	require.Equal(t, 1, report.blockerCounts[regionlock.ResolvedTsBlockerInitializedRegion])
+	require.Equal(t, 1, report.blockerCounts[regionlock.ResolvedTsBlockerUninitializedRegion])
+	require.Equal(t, 20*time.Minute, report.maxResolvedTsLag)
+	require.Equal(t, 55*time.Second, report.maxResolvedTsUpdatedAgo)
 	require.Len(t, report.samples, 1)
 	require.Equal(t, uint64(1), report.samples[0].SubscriptionID)
 	require.Equal(t, int64(11), report.samples[0].TableID)
-	require.Equal(t, 2, report.samples[0].HoleCount)
-	require.Len(t, report.samples[0].Holes, 2)
-	require.Contains(t, report.samples[0].Holes[0], "tableID: 11")
+	require.Equal(t, 1, report.samples[0].LockedRegionCount)
+	require.Equal(t, 1, report.samples[0].UnlockedRangeCount)
+	require.Len(t, report.samples[0].BlockedBy, 2)
+	require.Equal(t, SpanResolvedTsBlockerInitializedRegion, report.samples[0].BlockedBy[0].Type)
+	require.Equal(t, SpanResolvedTsBlockerUnlockedRange, report.samples[0].BlockedBy[1].Type)
 }
 
 type mockDynamicStream struct{}

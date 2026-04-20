@@ -31,6 +31,7 @@ import (
 	"github.com/pingcap/ticdc/pkg/security"
 	"github.com/pingcap/ticdc/pkg/spanz"
 	"github.com/pingcap/ticdc/utils/dynstream"
+	"github.com/tikv/client-go/v2/oracle"
 	"github.com/tikv/client-go/v2/tikv"
 	pd "github.com/tikv/pd/client"
 	"go.uber.org/zap"
@@ -54,9 +55,8 @@ const (
 	// resolveLastRunGCThreshold is the size threshold to GC resolveLastRun and drop stale entries.
 	resolveLastRunGCThreshold = 1024
 
-	slowRegionLogSampleLimit     = 8
-	unlockedRangeLogSampleLimit  = 4
-	unlockedRangeSampleSpanLimit = 2
+	stalledSpanThreshold      = 30 * time.Second
+	stalledSpanLogSampleLimit = 8
 )
 
 var (
@@ -390,13 +390,14 @@ func (s *subscriptionClient) updateMetrics(ctx context.Context) error {
 			for _, phase := range regionRuntimePhases {
 				metrics.SubscriptionClientRegionRuntimePhaseCount.WithLabelValues(string(phase)).Set(float64(counts[phase]))
 			}
-			slowRegionCount, slowRegionCountsByPhase := s.regionRuntimeRegistry.slowRegionCounts(s.pdClock.CurrentTime())
-			metrics.SubscriptionClientSlowRegionCount.Set(float64(slowRegionCount))
-			for _, phase := range regionRuntimePhases {
-				metrics.SubscriptionClientSlowRegionCountByPhase.WithLabelValues(string(phase)).Set(float64(slowRegionCountsByPhase[phase]))
+			stalledSpanReport := s.collectStalledSpanReport(s.pdClock.CurrentTime(), 0, -1)
+			metrics.SubscriptionClientStalledSpanCount.Set(float64(stalledSpanReport.stalledSpanCount))
+			for _, blockerType := range resolvedTsBlockerTypes {
+				metrics.SubscriptionClientStalledSpanCountByBlockerType.WithLabelValues(string(blockerType)).
+					Set(float64(stalledSpanReport.blockerCounts[blockerType]))
 			}
-			_, unlockedRangeCount := s.collectUnlockedRangeCounts()
-			metrics.SubscriptionClientUnlockedRangeCount.Set(float64(unlockedRangeCount))
+			metrics.SubscriptionClientStalledSpanMaxResolvedTsLag.Set(stalledSpanReport.maxResolvedTsLag.Seconds())
+			metrics.SubscriptionClientStalledSpanMaxResolvedTsUpdatedAge.Set(stalledSpanReport.maxResolvedTsUpdatedAgo.Seconds())
 
 			metrics.SubscriptionClientSubscribedRegionCount.Set(float64(s.subscribedSpans.requestedRegionCount()))
 		}
@@ -517,7 +518,7 @@ func (s *subscriptionClient) Run(ctx context.Context) error {
 	g.Go(func() error { return s.regionScheduler.handleFailures(ctx) })
 	g.Go(func() error { return s.staleLockResolver.runResolveLockChecker(ctx) })
 	g.Go(func() error { return s.staleLockResolver.handleResolveLockTasks(ctx) })
-	g.Go(func() error { return s.logSlowRegions(ctx) })
+	g.Go(func() error { return s.logStalledSpans(ctx) })
 	g.Go(func() error { return s.regionScheduler.runFailureBuffer(ctx) })
 
 	log.Info("subscription client starts")
@@ -539,23 +540,6 @@ func (s *subscriptionClient) Close(ctx context.Context) error {
 	return nil
 }
 
-func (s *subscriptionClient) setTableStopped(rt *subscribedSpan) {
-	s.subscribedSpans.setTableStopped(rt)
-}
-
-func (s *subscriptionClient) newSubscribedSpan(
-	subID SubscriptionID,
-	span heartbeatpb.TableSpan,
-	startTs uint64,
-	consumeKVEvents func(raw []common.RawKVEntry, wakeCallback func()) bool,
-	advanceResolvedTs func(ts uint64),
-	advanceInterval int64,
-	filterLoop bool,
-) *subscribedSpan {
-	return s.subscribedSpans.newSubscribedSpan(
-		subID, span, startTs, consumeKVEvents, advanceResolvedTs, advanceInterval, filterLoop)
-}
-
 func (s *subscriptionClient) GetResolvedTsLag() float64 {
 	return s.subscribedSpans.getResolvedTsLag()
 }
@@ -568,54 +552,281 @@ func phaseCountsToStrings(counts map[regionPhase]int) map[string]int {
 	return result
 }
 
-func convertSlowRegionSamples(samples []slowRegionSample) []SlowRegionSnapshot {
-	snapshots := make([]SlowRegionSnapshot, 0, len(samples))
+func trackedRegionCount(counts map[regionPhase]int) int {
+	total := 0
+	for _, count := range counts {
+		total += count
+	}
+	return total
+}
+
+var resolvedTsBlockerTypes = []regionlock.ResolvedTsBlockerType{
+	regionlock.ResolvedTsBlockerUnlockedRange,
+	regionlock.ResolvedTsBlockerUninitializedRegion,
+	regionlock.ResolvedTsBlockerInitializedRegion,
+}
+
+func blockerCountsToStrings(counts map[regionlock.ResolvedTsBlockerType]int) map[string]int {
+	result := make(map[string]int, len(resolvedTsBlockerTypes))
+	for _, blockerType := range resolvedTsBlockerTypes {
+		result[string(blockerType)] = counts[blockerType]
+	}
+	return result
+}
+
+type stalledSpanReport struct {
+	stalledSpanCount        int
+	blockerCounts           map[regionlock.ResolvedTsBlockerType]int
+	maxResolvedTsLag        time.Duration
+	maxResolvedTsUpdatedAgo time.Duration
+	samples                 []stalledSpanSample
+}
+
+type stalledSpanSample struct {
+	SubscriptionID       uint64
+	TableID              int64
+	Span                 string
+	Initialized          bool
+	ResolvedTs           uint64
+	ResolvedTsLag        time.Duration
+	ResolvedTsUpdatedAgo time.Duration
+	LockedRegionCount    int
+	UnlockedRangeCount   int
+	BlockedBy            []SpanResolvedTsBlockerSnapshot
+}
+
+func spanStallDurations(
+	now time.Time,
+	span *subscribedSpan,
+) (resolvedTsUpdatedAgo time.Duration, resolvedTsLag time.Duration, stalled bool) {
+	resolvedTsUpdatedUnix := span.resolvedTsUpdated.Load()
+	resolvedTs := span.resolvedTs.Load()
+	if resolvedTsUpdatedUnix == 0 || resolvedTs == 0 {
+		return 0, 0, false
+	}
+
+	resolvedTsUpdatedAgo = normalizeDuration(now.Sub(time.Unix(resolvedTsUpdatedUnix, 0)))
+	resolvedTsLag = normalizeDuration(now.Sub(oracle.GetTimeFromTS(resolvedTs)))
+	return resolvedTsUpdatedAgo, resolvedTsLag,
+		resolvedTsUpdatedAgo >= stalledSpanThreshold && resolvedTsLag >= stalledSpanThreshold
+}
+
+func betterStalledSpanSample(left, right stalledSpanSample) bool {
+	if left.ResolvedTsUpdatedAgo != right.ResolvedTsUpdatedAgo {
+		return left.ResolvedTsUpdatedAgo > right.ResolvedTsUpdatedAgo
+	}
+	if left.ResolvedTsLag != right.ResolvedTsLag {
+		return left.ResolvedTsLag > right.ResolvedTsLag
+	}
+	if left.SubscriptionID != right.SubscriptionID {
+		return left.SubscriptionID < right.SubscriptionID
+	}
+	if left.TableID != right.TableID {
+		return left.TableID < right.TableID
+	}
+	return left.Span < right.Span
+}
+
+func insertStalledSpanSample(
+	samples []stalledSpanSample,
+	sample stalledSpanSample,
+	limit int,
+) []stalledSpanSample {
+	if limit <= 0 {
+		return samples
+	}
+	originalLen := len(samples)
+	if originalLen == limit && !betterStalledSpanSample(sample, samples[originalLen-1]) {
+		return samples
+	}
+
+	index := sort.Search(originalLen, func(i int) bool {
+		return betterStalledSpanSample(sample, samples[i])
+	})
+	if originalLen < limit {
+		samples = append(samples, stalledSpanSample{})
+	} else {
+		if index >= limit {
+			index = limit - 1
+		}
+	}
+	copy(samples[index+1:], samples[index:])
+	samples[index] = sample
+	if len(samples) > limit {
+		samples = samples[:limit]
+	}
+	return samples
+}
+
+func spanResolvedTsBlockerType(
+	blockerType regionlock.ResolvedTsBlockerType,
+) SpanResolvedTsBlockerType {
+	switch blockerType {
+	case regionlock.ResolvedTsBlockerUnlockedRange:
+		return SpanResolvedTsBlockerUnlockedRange
+	case regionlock.ResolvedTsBlockerUninitializedRegion:
+		return SpanResolvedTsBlockerUninitializedRegion
+	case regionlock.ResolvedTsBlockerInitializedRegion:
+		return SpanResolvedTsBlockerInitializedRegion
+	default:
+		return SpanResolvedTsBlockerType(blockerType)
+	}
+}
+
+func durationSinceString(now time.Time, timestamp time.Time) string {
+	if timestamp.IsZero() {
+		return ""
+	}
+	return normalizeDuration(now.Sub(timestamp)).String()
+}
+
+func convertRegionRuntimeBlocker(
+	now time.Time,
+	state regionRuntimeState,
+) RegionRuntimeBlockerSnapshot {
+	phase := state.phase
+	if phase == "" {
+		phase = regionPhaseUnknown
+	}
+	return RegionRuntimeBlockerSnapshot{
+		Phase:        string(phase),
+		PhaseAge:     state.phaseAge(now).String(),
+		LastEventAgo: durationSinceString(now, state.lastEventTime),
+		StoreAddr:    state.storeAddr,
+		WorkerID:     state.workerID,
+		LastError:    state.lastError,
+	}
+}
+
+func (s *subscriptionClient) convertResolvedTsBlocker(
+	now time.Time,
+	subID SubscriptionID,
+	parentSpan heartbeatpb.TableSpan,
+	blocker regionlock.ResolvedTsBlocker,
+) SpanResolvedTsBlockerSnapshot {
+	blockerSpan := blocker.Span
+	blockerSpan.KeyspaceID = parentSpan.KeyspaceID
+	blockerSpan.TableID = parentSpan.TableID
+	snapshot := SpanResolvedTsBlockerSnapshot{
+		Type:       spanResolvedTsBlockerType(blocker.Type),
+		RegionID:   blocker.RegionID,
+		Span:       common.FormatTableSpan(&blockerSpan),
+		ResolvedTs: blocker.ResolvedTs,
+		CreatedAgo: durationSinceString(now, blocker.Created),
+	}
+
+	switch blocker.Type {
+	case regionlock.ResolvedTsBlockerUninitializedRegion,
+		regionlock.ResolvedTsBlockerInitializedRegion:
+		initialized := blocker.Initialized
+		snapshot.Initialized = &initialized
+		if runtimeState, ok := s.regionRuntimeRegistry.getLatest(subID, blocker.RegionID); ok {
+			runtimeSnapshot := convertRegionRuntimeBlocker(now, runtimeState)
+			snapshot.Runtime = &runtimeSnapshot
+		}
+	}
+	return snapshot
+}
+
+func (s *subscriptionClient) makeStalledSpanSample(
+	now time.Time,
+	entry subscribedSpanEntry,
+	resolvedTsUpdatedAgo time.Duration,
+	resolvedTsLag time.Duration,
+	blockerStats regionlock.ResolvedTsBlockerStatistics,
+) stalledSpanSample {
+	blockers := make([]SpanResolvedTsBlockerSnapshot, 0, len(blockerStats.Blockers))
+	for _, blocker := range blockerStats.Blockers {
+		blockers = append(blockers,
+			s.convertResolvedTsBlocker(now, entry.subID, entry.span.span, blocker))
+	}
+
+	span := entry.span.span
+	return stalledSpanSample{
+		SubscriptionID:       uint64(entry.subID),
+		TableID:              span.TableID,
+		Span:                 common.FormatTableSpan(&span),
+		Initialized:          entry.span.initialized.Load(),
+		ResolvedTs:           entry.span.resolvedTs.Load(),
+		ResolvedTsLag:        resolvedTsLag,
+		ResolvedTsUpdatedAgo: resolvedTsUpdatedAgo,
+		LockedRegionCount:    blockerStats.LockedRegionCount,
+		UnlockedRangeCount:   blockerStats.UnlockedRangeCount,
+		BlockedBy:            blockers,
+	}
+}
+
+func convertStalledSpanSamples(samples []stalledSpanSample) []StalledSpanSnapshot {
+	snapshots := make([]StalledSpanSnapshot, 0, len(samples))
 	for _, sample := range samples {
-		snapshots = append(snapshots, SlowRegionSnapshot{
-			SubscriptionID: sample.SubscriptionID,
-			RegionID:       sample.RegionID,
-			Phase:          string(sample.Phase),
-			StuckFor:       sample.StuckFor.String(),
-			StoreAddr:      sample.StoreAddr,
-			WorkerID:       sample.WorkerID,
-			LastError:      sample.LastError,
-			Span:           sample.Span,
+		snapshots = append(snapshots, StalledSpanSnapshot{
+			SubscriptionID:       sample.SubscriptionID,
+			TableID:              sample.TableID,
+			Span:                 sample.Span,
+			Initialized:          sample.Initialized,
+			ResolvedTs:           sample.ResolvedTs,
+			ResolvedTsLag:        sample.ResolvedTsLag.String(),
+			ResolvedTsUpdatedAgo: sample.ResolvedTsUpdatedAgo.String(),
+			LockedRegionCount:    sample.LockedRegionCount,
+			UnlockedRangeCount:   sample.UnlockedRangeCount,
+			BlockedBy:            sample.BlockedBy,
 		})
 	}
 	return snapshots
 }
 
-func convertUnlockedRangeSamples(samples []unlockedRangeSample) []UnlockedRangeSnapshot {
-	snapshots := make([]UnlockedRangeSnapshot, 0, len(samples))
-	for _, sample := range samples {
-		snapshots = append(snapshots, UnlockedRangeSnapshot{
-			SubscriptionID: sample.SubscriptionID,
-			TableID:        sample.TableID,
-			HoleCount:      sample.HoleCount,
-			Holes:          append([]string(nil), sample.Holes...),
-		})
+func (s *subscriptionClient) collectStalledSpanReport(
+	now time.Time,
+	sampleLimit int,
+	blockerLimit int,
+) stalledSpanReport {
+	report := stalledSpanReport{
+		blockerCounts: make(map[regionlock.ResolvedTsBlockerType]int, len(resolvedTsBlockerTypes)),
 	}
-	return snapshots
+	for _, entry := range s.subscribedSpans.snapshot() {
+		if entry.span == nil {
+			continue
+		}
+		resolvedTsUpdatedAgo, resolvedTsLag, stalled := spanStallDurations(now, entry.span)
+		if !stalled {
+			continue
+		}
+
+		blockerStats := entry.span.rangeLock.CollectResolvedTsBlockers(blockerLimit)
+		report.stalledSpanCount++
+		for _, blockerType := range resolvedTsBlockerTypes {
+			if blockerStats.BlockerTypeCounts[blockerType] > 0 {
+				report.blockerCounts[blockerType]++
+			}
+		}
+		if resolvedTsLag > report.maxResolvedTsLag {
+			report.maxResolvedTsLag = resolvedTsLag
+		}
+		if resolvedTsUpdatedAgo > report.maxResolvedTsUpdatedAgo {
+			report.maxResolvedTsUpdatedAgo = resolvedTsUpdatedAgo
+		}
+		if sampleLimit <= 0 {
+			continue
+		}
+
+		report.samples = insertStalledSpanSample(
+			report.samples,
+			s.makeStalledSpanSample(now, entry, resolvedTsUpdatedAgo, resolvedTsLag, blockerStats),
+			sampleLimit,
+		)
+	}
+	return report
 }
 
 func (s *subscriptionClient) runtimeObservability(now time.Time, sampleLimit int) RuntimeObservability {
 	phaseCounts := s.regionRuntimePhaseCounts()
-	trackedRegionCount := 0
-	for _, count := range phaseCounts {
-		trackedRegionCount += count
-	}
-	slowReport := s.regionRuntimeRegistry.collectSlowRegionReport(now, sampleLimit)
-	unlockedReport := s.collectUnlockedRangeReport(sampleLimit, unlockedRangeSampleSpanLimit)
+	stalledSpanReport := s.collectStalledSpanReport(now, sampleLimit, sampleLimit)
 
 	return RuntimeObservability{
-		TrackedRegionCount:            trackedRegionCount,
-		PhaseCounts:                   phaseCountsToStrings(phaseCounts),
-		SlowRegionCount:               slowReport.slowRegionCount,
-		SlowRegionCountsByPhase:       phaseCountsToStrings(slowReport.phaseCounts),
-		SlowRegions:                   convertSlowRegionSamples(slowReport.samples),
-		SubscriptionWithUnlockedRange: unlockedReport.subscriptionCount,
-		UnlockedRangeCount:            unlockedReport.unlockedRangeCount,
-		UnlockedRanges:                convertUnlockedRangeSamples(unlockedReport.samples),
+		TrackedRegionCount: trackedRegionCount(phaseCounts),
+		PhaseCounts:        phaseCountsToStrings(phaseCounts),
+		StalledSpanCount:   stalledSpanReport.stalledSpanCount,
+		StalledSpans:       convertStalledSpanSamples(stalledSpanReport.samples),
 	}
 }
 
@@ -626,118 +837,10 @@ func (s *subscriptionClient) GetObservabilitySnapshot(sampleLimit int) Observabi
 		GeneratedAt: now,
 		Runtime:     s.runtimeObservability(now, sampleLimit),
 		Stores:      s.requestedStores.snapshotStores(),
-		Failures:    s.failureStats.snapshot(),
 	}
 }
 
-func (s *subscriptionClient) scheduleRegionRequest(ctx context.Context, region regionInfo, priority TaskType) {
-	s.regionScheduler.scheduleRegionRequest(ctx, region, priority)
-}
-
-func (s *subscriptionClient) scheduleRangeRequest(
-	ctx context.Context,
-	span heartbeatpb.TableSpan,
-	subscribedSpan *subscribedSpan,
-	filterLoop bool,
-	priority TaskType,
-) {
-	s.regionScheduler.scheduleRangeRequest(ctx, span, subscribedSpan, filterLoop, priority)
-}
-
-func (s *subscriptionClient) submitDirectFailure(failure regionFailureInfo) {
-	s.regionScheduler.submitDirectFailure(failure)
-}
-
-func (s *subscriptionClient) submitOrderedFailure(state *regionFeedState) (regionFailureInfo, bool) {
-	return s.regionScheduler.submitOrderedFailure(state)
-}
-
-func (s *subscriptionClient) submitWorkerSessionFailure(
-	startedRegions map[SubscriptionID]regionFeedStates,
-	pendingRegions []regionInfo,
-	sessionFailure workerSessionFailure,
-) {
-	s.regionScheduler.submitWorkerSessionFailure(startedRegions, pendingRegions, sessionFailure)
-}
-
-func (s *subscriptionClient) handleFailure(ctx context.Context, failure regionFailureInfo) error {
-	return s.regionScheduler.handleFailure(ctx, failure)
-}
-
-type unlockedRangeReport struct {
-	subscriptionCount  int
-	unlockedRangeCount int
-	samples            []unlockedRangeSample
-}
-
-type unlockedRangeSample struct {
-	SubscriptionID uint64
-	TableID        int64
-	HoleCount      int
-	Holes          []string
-}
-
-func (s *subscriptionClient) collectUnlockedRangeCounts() (int, int) {
-	entries := s.subscribedSpans.snapshot()
-	subscriptionCount := 0
-	unlockedRangeCount := 0
-	for _, entry := range entries {
-		attr := entry.span.rangeLock.IterAll(nil)
-		if len(attr.UnLockedRanges) == 0 {
-			continue
-		}
-		subscriptionCount++
-		unlockedRangeCount += len(attr.UnLockedRanges)
-	}
-	return subscriptionCount, unlockedRangeCount
-}
-
-// collectUnlockedRangeReport keeps hole logging bounded as well, so one table
-// with many holes does not explode the periodic logs.
-func (s *subscriptionClient) collectUnlockedRangeReport(
-	sampleLimit int,
-	holeSampleLimit int,
-) unlockedRangeReport {
-	entries := s.subscribedSpans.snapshot()
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].subID < entries[j].subID
-	})
-
-	report := unlockedRangeReport{}
-	for _, entry := range entries {
-		attr := entry.span.rangeLock.IterAll(nil)
-		if len(attr.UnLockedRanges) == 0 {
-			continue
-		}
-
-		report.subscriptionCount++
-		report.unlockedRangeCount += len(attr.UnLockedRanges)
-		if len(report.samples) >= sampleLimit {
-			continue
-		}
-
-		holes := make([]string, 0, holeSampleLimit)
-		for i, hole := range attr.UnLockedRanges {
-			if i >= holeSampleLimit {
-				break
-			}
-			holeSpan := hole.Span
-			holeSpan.TableID = entry.span.span.TableID
-			holeSpan.KeyspaceID = entry.span.span.KeyspaceID
-			holes = append(holes, common.FormatTableSpan(&holeSpan))
-		}
-		report.samples = append(report.samples, unlockedRangeSample{
-			SubscriptionID: uint64(entry.subID),
-			TableID:        entry.span.span.TableID,
-			HoleCount:      len(attr.UnLockedRanges),
-			Holes:          holes,
-		})
-	}
-
-	return report
-}
-
-func (s *subscriptionClient) logSlowRegions(ctx context.Context) error {
+func (s *subscriptionClient) logStalledSpans(ctx context.Context) error {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -748,26 +851,24 @@ func (s *subscriptionClient) logSlowRegions(ctx context.Context) error {
 		}
 
 		now := s.pdClock.CurrentTime()
-		runtimeSnapshot := s.runtimeObservability(now, slowRegionLogSampleLimit)
-		if runtimeSnapshot.SlowRegionCount > 0 {
-			log.Info("subscription client slow region summary",
-				zap.Int("trackedRegionCount", runtimeSnapshot.TrackedRegionCount),
-				zap.Int("slowRegionCount", runtimeSnapshot.SlowRegionCount),
-				zap.Any("phaseCounts", runtimeSnapshot.SlowRegionCountsByPhase),
-				zap.Any("samples", runtimeSnapshot.SlowRegions))
+		report := s.collectStalledSpanReport(
+			now,
+			stalledSpanLogSampleLimit,
+			stalledSpanLogSampleLimit,
+		)
+		if report.stalledSpanCount == 0 {
+			continue
 		}
 
-		if runtimeSnapshot.SubscriptionWithUnlockedRange > 0 {
-			log.Info("subscription client unlocked range summary",
-				zap.Int("subscriptionCount", runtimeSnapshot.SubscriptionWithUnlockedRange),
-				zap.Int("unlockedRangeCount", runtimeSnapshot.UnlockedRangeCount),
-				zap.Any("samples", runtimeSnapshot.UnlockedRanges))
-		}
-		failures := s.failureStats.snapshot()
-		if len(failures) > 0 {
-			log.Info("subscription client failure summary",
-				zap.Int("failureKindCount", len(failures)),
-				zap.Any("failures", failures))
-		}
+		phaseCounts := s.regionRuntimePhaseCounts()
+		log.Info("subscription client stalled span summary",
+			zap.Int("trackedRegionCount", trackedRegionCount(phaseCounts)),
+			zap.Any("phaseCounts", phaseCountsToStrings(phaseCounts)),
+			zap.String("stalledSpanThreshold", stalledSpanThreshold.String()),
+			zap.Int("stalledSpanCount", report.stalledSpanCount),
+			zap.Duration("maxResolvedTsLag", report.maxResolvedTsLag),
+			zap.Duration("maxResolvedTsUpdatedAgo", report.maxResolvedTsUpdatedAgo),
+			zap.Any("blockerCounts", blockerCountsToStrings(report.blockerCounts)),
+			zap.Any("samples", convertStalledSpanSamples(report.samples)))
 	}
 }
