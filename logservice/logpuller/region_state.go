@@ -22,6 +22,13 @@ import (
 	"github.com/tikv/client-go/v2/tikv"
 )
 
+type regionRequestKind uint8
+
+const (
+	regionRequestSubscribe regionRequestKind = iota
+	regionRequestStopSubscription
+)
+
 const (
 	stateNormal  uint32 = 0
 	stateStopped uint32 = 1
@@ -29,6 +36,11 @@ const (
 )
 
 type regionInfo struct {
+	// requestKind distinguishes normal region subscriptions from subscription
+	// stop broadcasts. Stop requests do not have region metadata or range-lock
+	// state, so they must be explicit instead of inferred from nil fields.
+	requestKind regionRequestKind
+
 	// runtimeKey links this region info to a regionRuntimeRegistry entry.
 	// It is assigned by subscriptionClient when scheduling the region.
 	runtimeKey regionRuntimeKey
@@ -53,9 +65,10 @@ type regionInfo struct {
 	filterLoop bool
 }
 
+// isStopped returns true for a subscription-level stop request. The name is
+// kept for compatibility with the surrounding scheduler and worker code.
 func (s *regionInfo) isStopped() bool {
-	// lockedRange only nil when the region's subscribedTable is stopped.
-	return s.lockedRangeState == nil
+	return s.requestKind == regionRequestStopSubscription
 }
 
 func newRegionInfo(
@@ -66,11 +79,20 @@ func newRegionInfo(
 	filterLoop bool,
 ) regionInfo {
 	return regionInfo{
+		requestKind:    regionRequestSubscribe,
 		verID:          verID,
 		span:           span,
 		rpcCtx:         rpcCtx,
 		subscribedSpan: subscribedSpan,
 		filterLoop:     filterLoop,
+	}
+}
+
+func newStopRegionInfo(subscribedSpan *subscribedSpan) regionInfo {
+	return regionInfo{
+		requestKind:    regionRequestStopSubscription,
+		subscribedSpan: subscribedSpan,
+		filterLoop:     subscribedSpan.filterLoop,
 	}
 }
 
@@ -84,6 +106,9 @@ type regionFeedState struct {
 	matcher   *matcher
 	workerID  uint64
 
+	// request points back to the worker-local admission record. It is resolved
+	// when the region sends INITIALIZED, and finished when the region stops
+	// before becoming initialized.
 	request         *regionReq
 	runtimeRegistry *regionRuntimeRegistry
 	takeState       func(SubscriptionID, uint64) *regionFeedState

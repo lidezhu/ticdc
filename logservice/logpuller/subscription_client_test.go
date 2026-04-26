@@ -322,9 +322,7 @@ func TestBroadcastStopRequestBypassesQueueLimit(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	stopRegion := regionInfo{
-		subscribedSpan: &subscribedSpan{subID: SubscriptionID(1)},
-	}
+	stopRegion := newStopRegionInfo(&subscribedSpan{subID: SubscriptionID(1)})
 	err = client.requestedStores.broadcastStopRequest(ctx, stopRegion)
 	require.NoError(t, err)
 	require.Equal(t, 2, worker.requestCache.getPendingCount())
