@@ -236,6 +236,63 @@ func TestRegionRangeLockCollect(t *testing.T) {
 	require.Equal(t, 1, len(attrs.UnLockedRanges))
 }
 
+func TestCollectResolvedTsBlockers(t *testing.T) {
+	t.Parallel()
+
+	l := NewRangeLock(1, []byte("a"), []byte("z"), 100)
+
+	res := l.LockRange(context.Background(), []byte("a"), []byte("b"), 1, 1)
+	require.Equal(t, LockRangeStatusSuccess, res.Status)
+	res.LockedRangeState.ResolvedTs.Store(100)
+	res.LockedRangeState.Initialized.Store(false)
+	res.LockedRangeState.Created = time.Unix(1000, 0)
+
+	res = l.LockRange(context.Background(), []byte("c"), []byte("d"), 2, 1)
+	require.Equal(t, LockRangeStatusSuccess, res.Status)
+	res.LockedRangeState.ResolvedTs.Store(100)
+	res.LockedRangeState.Initialized.Store(true)
+	res.LockedRangeState.Created = time.Unix(1001, 0)
+
+	stats := l.CollectResolvedTsBlockers(4)
+	require.Equal(t, 2, stats.LockedRegionCount)
+	require.Equal(t, 2, stats.UnlockedRangeCount)
+	require.Equal(t, uint64(100), stats.MinResolvedTs)
+	require.Equal(t, 2, stats.BlockerTypeCounts[ResolvedTsBlockerUnlockedRange])
+	require.Equal(t, 1, stats.BlockerTypeCounts[ResolvedTsBlockerUninitializedRegion])
+	require.Equal(t, 1, stats.BlockerTypeCounts[ResolvedTsBlockerInitializedRegion])
+	require.Len(t, stats.Blockers, 4)
+	require.Equal(t, ResolvedTsBlockerUninitializedRegion, stats.Blockers[0].Type)
+	require.Equal(t, uint64(1), stats.Blockers[0].RegionID)
+	require.Equal(t, ResolvedTsBlockerUnlockedRange, stats.Blockers[1].Type)
+	require.Equal(t, heartbeatpb.TableSpan{StartKey: []byte("b"), EndKey: []byte("c")}, stats.Blockers[1].Span)
+	require.Equal(t, ResolvedTsBlockerInitializedRegion, stats.Blockers[2].Type)
+	require.Equal(t, uint64(2), stats.Blockers[2].RegionID)
+	require.Equal(t, ResolvedTsBlockerUnlockedRange, stats.Blockers[3].Type)
+	require.Equal(t, heartbeatpb.TableSpan{StartKey: []byte("d"), EndKey: []byte("z")}, stats.Blockers[3].Span)
+}
+
+func TestCollectResolvedTsBlockersRespectsLimit(t *testing.T) {
+	t.Parallel()
+
+	l := NewRangeLock(1, []byte("a"), []byte("z"), 100)
+
+	res := l.LockRange(context.Background(), []byte("a"), []byte("b"), 1, 1)
+	require.Equal(t, LockRangeStatusSuccess, res.Status)
+	res.LockedRangeState.ResolvedTs.Store(100)
+	res.LockedRangeState.Initialized.Store(false)
+
+	res = l.LockRange(context.Background(), []byte("c"), []byte("d"), 2, 1)
+	require.Equal(t, LockRangeStatusSuccess, res.Status)
+	res.LockedRangeState.ResolvedTs.Store(100)
+	res.LockedRangeState.Initialized.Store(true)
+
+	stats := l.CollectResolvedTsBlockers(2)
+	require.Len(t, stats.Blockers, 2)
+	require.Equal(t, 2, stats.BlockerTypeCounts[ResolvedTsBlockerUnlockedRange])
+	require.Equal(t, 1, stats.BlockerTypeCounts[ResolvedTsBlockerUninitializedRegion])
+	require.Equal(t, 1, stats.BlockerTypeCounts[ResolvedTsBlockerInitializedRegion])
+}
+
 func TestCalculateMinResolvedTs(t *testing.T) {
 	l := NewRangeLock(1, []byte("a"), []byte("z"), 100)
 

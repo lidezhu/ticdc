@@ -20,6 +20,7 @@ import "sync"
 type activeRegionStates struct {
 	mu            sync.RWMutex
 	subscriptions map[SubscriptionID]regionFeedStates
+	count         int
 }
 
 func newActiveRegionStates() activeRegionStates {
@@ -36,6 +37,9 @@ func (s *activeRegionStates) add(subscriptionID SubscriptionID, regionID uint64,
 	if states == nil {
 		states = make(regionFeedStates)
 		s.subscriptions[subscriptionID] = states
+	}
+	if _, exists := states[regionID]; !exists {
+		s.count++
 	}
 	states[regionID] = state
 }
@@ -56,9 +60,12 @@ func (s *activeRegionStates) take(subscriptionID SubscriptionID, regionID uint64
 
 	if statesMap, ok := s.subscriptions[subscriptionID]; ok {
 		state := statesMap[regionID]
-		delete(statesMap, regionID)
-		if len(statesMap) == 0 {
-			delete(s.subscriptions, subscriptionID)
+		if state != nil {
+			delete(statesMap, regionID)
+			s.count--
+			if len(statesMap) == 0 {
+				delete(s.subscriptions, subscriptionID)
+			}
 		}
 		return state
 	}
@@ -70,6 +77,7 @@ func (s *activeRegionStates) takeSubscription(subscriptionID SubscriptionID) reg
 	defer s.mu.Unlock()
 
 	states := s.subscriptions[subscriptionID]
+	s.count -= len(states)
 	delete(s.subscriptions, subscriptionID)
 	return states
 }
@@ -80,5 +88,12 @@ func (s *activeRegionStates) takeAll() map[SubscriptionID]regionFeedStates {
 
 	states := s.subscriptions
 	s.subscriptions = make(map[SubscriptionID]regionFeedStates)
+	s.count = 0
 	return states
+}
+
+func (s *activeRegionStates) countActive() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.count
 }

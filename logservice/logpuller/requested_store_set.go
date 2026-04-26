@@ -15,6 +15,7 @@ package logpuller
 
 import (
 	"context"
+	"sort"
 	"sync"
 
 	"github.com/pingcap/log"
@@ -32,16 +33,29 @@ func newRequestedStoreSet(client *subscriptionClient) *requestedStoreSet {
 	return &requestedStoreSet{client: client}
 }
 
-func (s *requestedStoreSet) pendingRequestCount() int {
-	pendingRegionReqCount := 0
+func (s *requestedStoreSet) requestStats() RequestCacheSnapshot {
+	var totals RequestCacheSnapshot
 	s.stores.Range(func(_, value any) bool {
 		store := value.(*requestedStore)
 		for _, worker := range store.snapshotWorkers() {
-			pendingRegionReqCount += worker.requestCache.getPendingCount()
+			requestCacheSnapshotAdd(&totals, worker.requestCache.snapshot())
 		}
 		return true
 	})
-	return pendingRegionReqCount
+	return totals
+}
+
+func (s *requestedStoreSet) snapshotStores() []StoreObservability {
+	snapshots := make([]StoreObservability, 0)
+	s.stores.Range(func(_, value any) bool {
+		store := value.(*requestedStore)
+		snapshots = append(snapshots, store.snapshot())
+		return true
+	})
+	sort.Slice(snapshots, func(i, j int) bool {
+		return snapshots[i].StoreAddr < snapshots[j].StoreAddr
+	})
+	return snapshots
 }
 
 func (s *requestedStoreSet) clearPendingRequests() {
@@ -80,7 +94,7 @@ func (s *requestedStoreSet) getOrCreateRequestedStore(
 
 	perWorkerQueueSize := s.perWorkerQueueSize()
 	for i := uint(0); i < s.client.config.RegionRequestWorkerPerStore; i++ {
-		store.addWorker(newRegionRequestWorker(ctx, s.client, s.client.credential, eg, store, perWorkerQueueSize))
+		store.addWorker(newRegionRequestWorker(ctx, s.client, eg, store, perWorkerQueueSize))
 	}
 	return store
 }

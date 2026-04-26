@@ -308,6 +308,52 @@ type UnLockRangeStatistic struct {
 	ResolvedTs uint64
 }
 
+type ResolvedTsBlockerType string
+
+const (
+	ResolvedTsBlockerUnlockedRange       ResolvedTsBlockerType = "unlocked_range"
+	ResolvedTsBlockerUninitializedRegion ResolvedTsBlockerType = "uninitialized_region"
+	ResolvedTsBlockerInitializedRegion   ResolvedTsBlockerType = "initialized_region"
+)
+
+type ResolvedTsBlocker struct {
+	Type        ResolvedTsBlockerType
+	RegionID    uint64
+	Span        heartbeatpb.TableSpan
+	ResolvedTs  uint64
+	Initialized bool
+	Created     time.Time
+}
+
+type ResolvedTsBlockerStatistics struct {
+	LockedRegionCount  int
+	UnlockedRangeCount int
+	MinResolvedTs      uint64
+	BlockerTypeCounts  map[ResolvedTsBlockerType]int
+	Blockers           []ResolvedTsBlocker
+}
+
+func (r *ResolvedTsBlockerStatistics) addBlocker(blocker ResolvedTsBlocker, limit int) {
+	if blocker.ResolvedTs < r.MinResolvedTs {
+		r.MinResolvedTs = blocker.ResolvedTs
+		for blockerType := range r.BlockerTypeCounts {
+			delete(r.BlockerTypeCounts, blockerType)
+		}
+		r.Blockers = r.Blockers[:0]
+	}
+	if blocker.ResolvedTs != r.MinResolvedTs {
+		return
+	}
+	if r.BlockerTypeCounts == nil {
+		r.BlockerTypeCounts = make(map[ResolvedTsBlockerType]int)
+	}
+	r.BlockerTypeCounts[blocker.Type]++
+	if limit >= 0 && len(r.Blockers) >= limit {
+		return
+	}
+	r.Blockers = append(r.Blockers, blocker)
+}
+
 // IterAll iterates all locked ranges in the RangeLock and performs the action on each locked range.
 // It also returns some statistics of the RangeLock.
 func (l *RangeLock) IterAll(
@@ -352,6 +398,63 @@ func (l *RangeLock) IterAll(
 		r.UnLockedRanges = append(r.UnLockedRanges, UnLockRangeStatistic{Span: span, ResolvedTs: ts})
 	}
 	return
+}
+
+// CollectResolvedTsBlockers returns the current minimum resolved-ts sources of
+// this range lock. The blocker type is derived only from the range-lock state.
+func (l *RangeLock) CollectResolvedTsBlockers(limit int) (r ResolvedTsBlockerStatistics) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	r.LockedRegionCount = l.lockedRanges.Len()
+	r.MinResolvedTs = math.MaxUint64
+
+	lastEnd := l.totalSpan.StartKey
+	l.lockedRanges.Ascend(func(item *rangeLockEntry) bool {
+		if common.EndCompare(lastEnd, item.startKey) < 0 {
+			span := heartbeatpb.TableSpan{StartKey: lastEnd, EndKey: item.startKey}
+			ts := l.unlockedRanges.getMinTsInRange(lastEnd, item.startKey)
+			r.UnlockedRangeCount++
+			r.addBlocker(ResolvedTsBlocker{
+				Type:       ResolvedTsBlockerUnlockedRange,
+				Span:       span,
+				ResolvedTs: ts,
+			}, limit)
+		}
+
+		resolvedTs := item.lockedRangeState.ResolvedTs.Load()
+		initialized := item.lockedRangeState.Initialized.Load()
+		blockerType := ResolvedTsBlockerUninitializedRegion
+		if initialized {
+			blockerType = ResolvedTsBlockerInitializedRegion
+		}
+		r.addBlocker(ResolvedTsBlocker{
+			Type:        blockerType,
+			RegionID:    item.regionID,
+			Span:        heartbeatpb.TableSpan{StartKey: item.startKey, EndKey: item.endKey},
+			ResolvedTs:  resolvedTs,
+			Initialized: initialized,
+			Created:     item.lockedRangeState.Created,
+		}, limit)
+
+		lastEnd = item.endKey
+		return true
+	})
+	if common.EndCompare(lastEnd, l.totalSpan.EndKey) < 0 {
+		span := heartbeatpb.TableSpan{StartKey: lastEnd, EndKey: l.totalSpan.EndKey}
+		ts := l.unlockedRanges.getMinTsInRange(lastEnd, l.totalSpan.EndKey)
+		r.UnlockedRangeCount++
+		r.addBlocker(ResolvedTsBlocker{
+			Type:       ResolvedTsBlockerUnlockedRange,
+			Span:       span,
+			ResolvedTs: ts,
+		}, limit)
+	}
+
+	if r.MinResolvedTs == math.MaxUint64 {
+		r.MinResolvedTs = 0
+	}
+	return r
 }
 
 // IterForTest iterates all locked ranges in the RangeLock and performs the action on each locked range.

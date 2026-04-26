@@ -56,3 +56,17 @@ func (rs *requestedStore) snapshotWorkers() []*regionRequestWorker {
 	copy(workers, rs.requestWorkers.s)
 	return workers
 }
+
+func (rs *requestedStore) snapshot() StoreObservability {
+	storeSnapshot := StoreObservability{
+		StoreAddr: rs.storeAddr,
+	}
+	for _, worker := range rs.snapshotWorkers() {
+		workerSnapshot := worker.snapshot()
+		storeSnapshot.Workers = append(storeSnapshot.Workers, workerSnapshot)
+		storeSnapshot.WorkerCount++
+		storeSnapshot.ActiveRegionCount += workerSnapshot.ActiveRegionCount
+		requestCacheSnapshotAdd(&storeSnapshot.RequestCache, workerSnapshot.RequestCache)
+	}
+	return storeSnapshot
+}

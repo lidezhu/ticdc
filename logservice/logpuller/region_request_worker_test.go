@@ -16,6 +16,7 @@ package logpuller
 import (
 	"context"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -71,15 +72,19 @@ func newTestRegionRequestWorker(requestCache *requestCache) *regionRequestWorker
 	if requestCache == nil {
 		requestCache = newRequestCache(1)
 	}
+	client := &subscriptionClient{
+		clusterID:             123,
+		regionRuntimeRegistry: newRegionRuntimeRegistry(),
+		ds:                    &mockRegionEventDynamicStream{},
+	}
+	client.ctx, client.cancel = context.WithCancel(context.Background())
+	client.cond = sync.NewCond(&client.mu)
+	client.regionScheduler = newRegionRequestScheduler(client)
 	return &regionRequestWorker{
-		workerID:            1,
-		clusterID:           123,
-		store:               &requestedStore{storeAddr: "store-1"},
-		requestCache:        requestCache,
-		runtimeRegistry:     newRegionRuntimeRegistry(),
-		pushRegionEvent:     func(SubscriptionID, regionEvent) {},
-		credential:          nil,
-		submitDirectFailure: func(regionFailureInfo) {},
+		workerID:     1,
+		client:       client,
+		store:        &requestedStore{storeAddr: "store-1"},
+		requestCache: requestCache,
 	}
 }
 
@@ -89,13 +94,8 @@ func newTestRegionRequestWorkerSession(
 	return newRegionRequestWorkerSession(
 		worker.workerID,
 		worker.store.storeAddr,
-		worker.pd,
-		worker.credential,
-		worker.clusterID,
+		worker.client,
 		worker.requestCache,
-		worker.runtimeRegistry,
-		worker.submitDirectFailure,
-		worker.pushRegionEvent,
 	)
 }
 
@@ -152,7 +152,7 @@ func TestSessionRunReturnsStartupFailureAndKeepsBootstrapRegion(t *testing.T) {
 	require.True(t, ok)
 
 	worker := newTestRegionRequestWorker(requestCache)
-	worker.pd = &mockSessionPDClient{
+	worker.client.pd = &mockSessionPDClient{
 		stores: []*metapb.Store{{Id: 1, Address: "store-1", Version: "0.0.1"}},
 	}
 	session := newTestRegionRequestWorkerSession(worker)
@@ -176,8 +176,10 @@ func TestWorkerAddDuplicateQueuedRequestRefreshesEnqueueTime(t *testing.T) {
 	requestCache := newRequestCache(10)
 	runtimeRegistry := newRegionRuntimeRegistry()
 	worker := &regionRequestWorker{
-		requestCache:    requestCache,
-		runtimeRegistry: runtimeRegistry,
+		requestCache: requestCache,
+		client: &subscriptionClient{
+			regionRuntimeRegistry: runtimeRegistry,
+		},
 	}
 
 	region := prepareRegionForSendTest(createTestRegionInfo(1, 1))
@@ -208,6 +210,7 @@ func TestWorkerAddDuplicateActiveRegionRequestsWarnAndKeepNewest(t *testing.T) {
 	requestCache := newRequestCache(10)
 	worker := &regionRequestWorker{
 		workerID:     1,
+		client:       &subscriptionClient{regionRuntimeRegistry: newRegionRuntimeRegistry()},
 		store:        &requestedStore{storeAddr: "store-1"},
 		requestCache: requestCache,
 	}
@@ -352,8 +355,8 @@ func newDispatchResolvedTsTestSession(regionCount int) (*regionRequestWorkerSess
 		ds: ds,
 	}
 	session := &regionRequestWorkerSession{
-		pushRegionEvent: client.pushRegionEventToDS,
-		activeRegions:   newActiveRegionStates(),
+		client:        client,
+		activeRegions: newActiveRegionStates(),
 	}
 	session.activeRegions.subscriptions = map[SubscriptionID]regionFeedStates{
 		1: make(regionFeedStates, regionCount),
@@ -550,6 +553,7 @@ func TestProcessRegionSendTaskSendFailureCleansSentRequest(t *testing.T) {
 	worker := &regionRequestWorker{
 		requestCache: newRequestCache(10),
 		store:        &requestedStore{storeAddr: "store-1"},
+		client:       &subscriptionClient{regionRuntimeRegistry: newRegionRuntimeRegistry()},
 	}
 
 	ctx := context.Background()

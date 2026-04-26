@@ -55,6 +55,7 @@ func RegisterOpenAPIV2Routes(router *gin.Engine, api OpenAPIV2) {
 	coordinatorMiddleware := middleware.ForwardToCoordinatorMiddleware(api.server)
 	authenticateMiddleware := middleware.AuthenticateMiddleware(api.server)
 	keyspaceCheckerMiddleware := middleware.KeyspaceCheckerMiddleware()
+	v2.GET("debug/logpuller", authenticateMiddleware, api.LogPullerObservability)
 	v2.GET("health", coordinatorMiddleware, api.ServerHealth)
 
 	// changefeed apis

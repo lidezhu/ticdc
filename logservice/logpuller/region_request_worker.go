@@ -15,12 +15,11 @@ package logpuller
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/pingcap/ticdc/pkg/security"
 	"github.com/pingcap/ticdc/pkg/util"
-	pd "github.com/tikv/pd/client"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -32,36 +31,51 @@ var workerIDGen atomic.Uint64
 type regionRequestWorker struct {
 	workerID uint64
 
-	pd                         pd.Client
-	clusterID                  uint64
-	credential                 *security.Credential
-	pushRegionEvent            func(SubscriptionID, regionEvent)
-	runtimeRegistry            *regionRuntimeRegistry
-	submitDirectFailure        func(regionFailureInfo)
-	submitWorkerSessionFailure func(map[SubscriptionID]regionFeedStates, []regionInfo, workerSessionFailure)
+	client *subscriptionClient
 
 	store *requestedStore
 
 	// request cache with flow control
 	requestCache *requestCache
-}
 
-func (s *regionRequestWorker) markRegionEnqueued(region regionInfo, now time.Time) {
-	if !region.runtimeKey.isValid() {
-		return
-	}
-	s.runtimeRegistry.markRequestEnqueued(region.runtimeKey, now)
+	sessionMu      sync.RWMutex
+	currentSession *regionRequestWorkerSession
 }
 
 func (s *regionRequestWorker) handleSessionFailure(session *regionRequestWorkerSession, sessionFailure workerSessionFailure) {
 	// runNextSession only returns after the session loops exit, so the started and
 	// not-started sets are already quiescent here.
 	snapshot := session.takeFailureSnapshot()
-	s.submitWorkerSessionFailure(
+	s.client.regionScheduler.submitWorkerSessionFailure(
 		snapshot.startedRegions,
 		snapshot.pendingRegions,
 		sessionFailure,
 	)
+}
+
+func (s *regionRequestWorker) setCurrentSession(session *regionRequestWorkerSession) {
+	s.sessionMu.Lock()
+	s.currentSession = session
+	s.sessionMu.Unlock()
+}
+
+func (s *regionRequestWorker) snapshot() WorkerObservability {
+	workerSnapshot := WorkerObservability{
+		WorkerID:     s.workerID,
+		RequestCache: s.requestCache.snapshot(),
+		SessionState: WorkerSessionStateDisconnected,
+	}
+
+	s.sessionMu.RLock()
+	session := s.currentSession
+	s.sessionMu.RUnlock()
+	if session == nil {
+		return workerSnapshot
+	}
+
+	workerSnapshot.SessionState = session.sessionState()
+	workerSnapshot.ActiveRegionCount = session.activeRegions.countActive()
+	return workerSnapshot
 }
 
 func (s *regionRequestWorker) runNextSession(
@@ -70,14 +84,12 @@ func (s *regionRequestWorker) runNextSession(
 	session := newRegionRequestWorkerSession(
 		s.workerID,
 		s.store.storeAddr,
-		s.pd,
-		s.credential,
-		s.clusterID,
+		s.client,
 		s.requestCache,
-		s.runtimeRegistry,
-		s.submitDirectFailure,
-		s.pushRegionEvent,
 	)
+	session.setStage(WorkerSessionStateWaitingBootstrap)
+	s.setCurrentSession(session)
+	defer s.setCurrentSession(nil)
 	result, err := session.run(ctx)
 	if err != nil {
 		return nil, workerSessionFailure{}, false, err
@@ -110,22 +122,15 @@ func (s *regionRequestWorker) runSessionLoop(
 func newRegionRequestWorker(
 	ctx context.Context,
 	client *subscriptionClient,
-	credential *security.Credential,
 	g *errgroup.Group,
 	store *requestedStore,
 	requestCacheSize int,
 ) *regionRequestWorker {
 	worker := &regionRequestWorker{
-		workerID:                   workerIDGen.Add(1),
-		pd:                         client.pd,
-		clusterID:                  client.clusterID,
-		credential:                 credential,
-		pushRegionEvent:            client.pushRegionEventToDS,
-		runtimeRegistry:            client.regionRuntimeRegistry,
-		submitDirectFailure:        client.submitDirectFailure,
-		submitWorkerSessionFailure: client.submitWorkerSessionFailure,
-		store:                      store,
-		requestCache:               newRequestCache(requestCacheSize),
+		workerID:     workerIDGen.Add(1),
+		client:       client,
+		store:        store,
+		requestCache: newRequestCache(requestCacheSize),
 	}
 
 	g.Go(func() error {
@@ -142,7 +147,7 @@ func (s *regionRequestWorker) add(ctx context.Context, region regionInfo, force 
 		return false, err
 	}
 	if ok {
-		s.markRegionEnqueued(region, time.Now())
+		s.client.regionRuntimeRegistry.markRegionWorkerEnqueued(region, time.Now())
 	}
 	return ok, err
 }

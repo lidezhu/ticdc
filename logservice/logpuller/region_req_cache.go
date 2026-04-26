@@ -51,7 +51,7 @@ type regionReqKey struct {
 
 func newRegionReqKey(region regionInfo) regionReqKey {
 	key := regionReqKey{subID: region.subscribedSpan.subID}
-	if region.isStopped() {
+	if region.isStopRequest() {
 		key.stop = true
 		return key
 	}
@@ -139,6 +139,8 @@ type requestCache struct {
 	readyAvailable chan struct{}
 	// spaceAvailable wakes add() when pop()/finish()/resolve() releases capacity.
 	spaceAvailable chan struct{}
+
+	counts RequestCacheSnapshot
 }
 
 func newRequestCache(maxPendingCount int) *requestCache {
@@ -219,6 +221,8 @@ func (c *requestCache) tryAdd(region regionInfo, force bool) (bool, error) {
 	c.requests[req] = struct{}{}
 	c.current[req.key] = req
 	c.ready = append(c.ready, req)
+	c.counts.Total++
+	c.counts.Queued++
 	shouldNotifyReady = true
 	return true, nil
 }
@@ -255,6 +259,8 @@ func (c *requestCache) tryPop() *regionReq {
 		}
 
 		req.stage = regionReqStageProcessing
+		c.counts.Queued--
+		c.counts.Processing++
 		c.compactReadyLocked()
 		return req
 	}
@@ -276,6 +282,8 @@ func (c *requestCache) markSent(req *regionReq) {
 			}
 		}
 		req.stage = regionReqStageSent
+		c.counts.Processing--
+		c.counts.Sent++
 	}
 	c.mu.Unlock()
 
@@ -358,6 +366,7 @@ func (c *requestCache) clear() []regionInfo {
 		req.stage = regionReqStageFinished
 	}
 	removed := len(regions)
+	c.counts = RequestCacheSnapshot{}
 	c.current = make(map[regionReqKey]*regionReq)
 	c.ready = c.ready[:0]
 	c.readyIdx = 0
@@ -374,7 +383,13 @@ func (c *requestCache) clear() []regionInfo {
 func (c *requestCache) getPendingCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return len(c.requests)
+	return c.counts.Total
+}
+
+func (c *requestCache) snapshot() RequestCacheSnapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.counts
 }
 
 func (c *requestCache) removeLocked(req *regionReq) bool {
@@ -387,6 +402,8 @@ func (c *requestCache) removeLocked(req *regionReq) bool {
 
 	stage := req.stage
 	delete(c.requests, req)
+	c.counts.Total--
+	c.decrementStageCountLocked(stage)
 	req.stage = regionReqStageFinished
 	if c.current[req.key] == req {
 		delete(c.current, req.key)
@@ -395,6 +412,17 @@ func (c *requestCache) removeLocked(req *regionReq) bool {
 		c.compactReadyLocked()
 	}
 	return true
+}
+
+func (c *requestCache) decrementStageCountLocked(stage regionReqStage) {
+	switch stage {
+	case regionReqStageQueued:
+		c.counts.Queued--
+	case regionReqStageProcessing:
+		c.counts.Processing--
+	case regionReqStageSent:
+		c.counts.Sent--
+	}
 }
 
 func (c *requestCache) findSentLocked(key regionReqKey, except *regionReq) *regionReq {

@@ -117,7 +117,9 @@ func (pq *PriorityQueue) Len() int {
 	return pq.heap.Len()
 }
 
-// Close closes the signal channel
+// Close drains queued tasks. The queue lifetime is still controlled by the
+// caller's context; this method does not close the signal channel because
+// producers may still race with shutdown.
 func (pq *PriorityQueue) Close() {
 	// pop all tasks
 	for pq.Len() > 0 {

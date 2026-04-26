@@ -94,6 +94,10 @@ func (s *mockSubscriptionClient) Unsubscribe(subID logpuller.SubscriptionID) {
 	delete(s.subscriptions, subID)
 }
 
+func (s *mockSubscriptionClient) GetObservabilitySnapshot(sampleLimit int) logpuller.ObservabilitySnapshot {
+	return logpuller.ObservabilitySnapshot{}
+}
+
 func newEventStoreForTest(path string) (logpuller.SubscriptionClient, EventStore) {
 	mockPDClock := pdutil.NewClock4Test()
 	appcontext.SetService(appcontext.DefaultPDClock, mockPDClock)

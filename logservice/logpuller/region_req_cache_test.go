@@ -258,6 +258,36 @@ func TestRequestCacheKeepsDuplicateStopRequest(t *testing.T) {
 	require.Equal(t, 0, cache.getPendingCount())
 }
 
+func TestRequestCacheSnapshotTracksStages(t *testing.T) {
+	cache := newRequestCache(10)
+	ctx := context.Background()
+	region := createTestRegionInfo(1, 1)
+
+	ok, err := cache.add(ctx, region, false)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, RequestCacheSnapshot{
+		Total:  1,
+		Queued: 1,
+	}, cache.snapshot())
+
+	req, err := cache.pop(ctx)
+	require.NoError(t, err)
+	require.Equal(t, RequestCacheSnapshot{
+		Total:      1,
+		Processing: 1,
+	}, cache.snapshot())
+
+	req.markSent()
+	require.Equal(t, RequestCacheSnapshot{
+		Total: 1,
+		Sent:  1,
+	}, cache.snapshot())
+
+	req.resolve()
+	require.Equal(t, RequestCacheSnapshot{}, cache.snapshot())
+}
+
 func TestRequestCacheTakeUnsentRegionsKeepsSentRequests(t *testing.T) {
 	cache := newRequestCache(10)
 	ctx := context.Background()
