@@ -24,9 +24,7 @@ import (
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/log"
 	cerror "github.com/pingcap/ticdc/pkg/errors"
-	"github.com/pingcap/ticdc/pkg/security"
 	"github.com/pingcap/ticdc/pkg/version"
-	pd "github.com/tikv/pd/client"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 	grpcstatus "google.golang.org/grpc/status"
@@ -75,15 +73,10 @@ var errWorkerSessionReconnect = errors.New("worker session reconnect")
 // until either loop exits. Session failure recovery separates regions that were
 // already active in TiKV from requests that were still local to the worker.
 type regionRequestWorkerSession struct {
-	workerID            uint64
-	storeAddr           string
-	pd                  pd.Client
-	credential          *security.Credential
-	clusterID           uint64
-	requestCache        *requestCache
-	runtimeRegistry     *regionRuntimeRegistry
-	submitDirectFailure func(regionFailureInfo)
-	pushRegionEvent     func(SubscriptionID, regionEvent)
+	workerID     uint64
+	storeAddr    string
+	client       *subscriptionClient
+	requestCache *requestCache
 
 	conn            *ConnAndClient
 	bootstrapRegion *regionReq
@@ -94,25 +87,15 @@ type regionRequestWorkerSession struct {
 func newRegionRequestWorkerSession(
 	workerID uint64,
 	storeAddr string,
-	pd pd.Client,
-	credential *security.Credential,
-	clusterID uint64,
+	client *subscriptionClient,
 	requestCache *requestCache,
-	runtimeRegistry *regionRuntimeRegistry,
-	submitDirectFailure func(regionFailureInfo),
-	pushRegionEvent func(SubscriptionID, regionEvent),
 ) *regionRequestWorkerSession {
 	return &regionRequestWorkerSession{
-		workerID:            workerID,
-		storeAddr:           storeAddr,
-		pd:                  pd,
-		credential:          credential,
-		clusterID:           clusterID,
-		requestCache:        requestCache,
-		runtimeRegistry:     runtimeRegistry,
-		submitDirectFailure: submitDirectFailure,
-		pushRegionEvent:     pushRegionEvent,
-		activeRegions:       newActiveRegionStates(),
+		workerID:      workerID,
+		storeAddr:     storeAddr,
+		client:        client,
+		requestCache:  requestCache,
+		activeRegions: newActiveRegionStates(),
 	}
 }
 
@@ -350,7 +333,7 @@ func (s *regionRequestWorkerSession) checkStoreVersionFailure(err error) workerS
 }
 
 func (s *regionRequestWorkerSession) checkStoreVersion(ctx context.Context) error {
-	if err := version.CheckStoreVersion(ctx, s.pd); err != nil {
+	if err := version.CheckStoreVersion(ctx, s.client.pd); err != nil {
 		if isCanceledByContext(ctx, err) {
 			return err
 		}
@@ -370,7 +353,7 @@ func (s *regionRequestWorkerSession) connectStore(
 		zap.Uint64("workerID", s.workerID),
 		zap.String("addr", s.storeAddr))
 
-	conn, err := Connect(ctx, s.credential, s.storeAddr)
+	conn, err := Connect(ctx, s.client.credential, s.storeAddr)
 	if err != nil {
 		log.Warn("region request worker create grpc stream failed",
 			zap.Uint64("workerID", s.workerID),
@@ -427,7 +410,7 @@ func (s *regionRequestWorkerSession) handleStopTask(request *regionReq) error {
 }
 
 func (s *regionRequestWorkerSession) handleStoppedSubscription(request *regionReq) {
-	s.submitDirectFailure(newSubscriptionStoppedFailure(request.regionInfo))
+	s.client.regionScheduler.submitDirectFailure(newSubscriptionStoppedFailure(request.regionInfo))
 	request.finish()
 }
 
@@ -441,7 +424,7 @@ func (s *regionRequestWorkerSession) handleActiveRegionRequest(request *regionRe
 	// Mark the request as sent before sending it to keep active-state tracking
 	// and request lifecycle tracking visible in the same order.
 	request.markSent()
-	s.markRegionSent(region, time.Now())
+	s.client.regionRuntimeRegistry.markRegionRequestSent(region, s.workerID, time.Now())
 	if err := s.sendRequest(s.createRegionRequest(region)); err != nil {
 		state.markStopped(newSendRequestToStoreFailure(region, regionFailureSourceWorkerSend, err))
 		return err
@@ -663,19 +646,12 @@ func (s *regionRequestWorkerSession) dispatchResolvedTsEvent(resolvedTsEvent *cd
 }
 
 func (s *regionRequestWorkerSession) emitRegionEvent(subID SubscriptionID, event regionEvent) {
-	s.pushRegionEvent(subID, event)
-}
-
-func (s *regionRequestWorkerSession) markRegionSent(region regionInfo, now time.Time) {
-	if !region.runtimeKey.isValid() {
-		return
-	}
-	s.runtimeRegistry.markRequestSent(region.runtimeKey, s.workerID, now)
+	s.client.pushRegionEventToDS(subID, event)
 }
 
 func (s *regionRequestWorkerSession) requestHeader() *cdcpb.Header {
 	return &cdcpb.Header{
-		ClusterId:    s.clusterID,
+		ClusterId:    s.client.clusterID,
 		TicdcVersion: version.ReleaseSemver(),
 	}
 }
@@ -687,7 +663,7 @@ func (s *regionRequestWorkerSession) newState(request *regionReq) *regionFeedSta
 		uint64(region.subscribedSpan.subID),
 		s.workerID,
 		request,
-		s.runtimeRegistry,
+		s.client.regionRuntimeRegistry,
 		s.activeRegions.take,
 	)
 }

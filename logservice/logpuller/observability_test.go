@@ -52,10 +52,10 @@ func TestSubscriptionClientGetObservabilitySnapshot(t *testing.T) {
 
 	store := newRequestedStore(storeRegion.rpcCtx.Addr)
 	worker := &regionRequestWorker{
-		workerID:        7,
-		store:           store,
-		requestCache:    newRequestCache(10),
-		runtimeRegistry: client.regionRuntimeRegistry,
+		workerID:     7,
+		client:       client,
+		store:        store,
+		requestCache: newRequestCache(10),
 	}
 	ok, err := worker.add(context.Background(), createTestRegionInfo(1, 202), false)
 	require.NoError(t, err)
@@ -64,13 +64,8 @@ func TestSubscriptionClientGetObservabilitySnapshot(t *testing.T) {
 	session := newRegionRequestWorkerSession(
 		worker.workerID,
 		store.storeAddr,
-		nil,
-		nil,
-		0,
+		client,
 		worker.requestCache,
-		client.regionRuntimeRegistry,
-		nil,
-		nil,
 	)
 	session.setStage(WorkerSessionStateRunning)
 	session.activeRegions.add(storeRegion.subscribedSpan.subID, storeRegion.verID.GetID(), &regionFeedState{})

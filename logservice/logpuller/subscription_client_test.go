@@ -234,7 +234,9 @@ func TestCollectStalledSpanReport(t *testing.T) {
 	}, stalledTs2, consumeKVEvents, advanceResolvedTs, 0, false)
 	client.subscribedSpans.add(SubscriptionID(2), span2)
 	span2.resolvedTs.Store(stalledTs2)
-	span2.resolvedTsUpdated.Store(now.Add(-45 * time.Second).Unix())
+	// A fresh update timestamp should not hide a span whose resolved-ts is still
+	// far behind PD time.
+	span2.resolvedTsUpdated.Store(now.Add(-5 * time.Second).Unix())
 
 	res = span2.rangeLock.LockRange(context.Background(), []byte{'m'}, []byte{'z'}, 3, 1)
 	require.Equal(t, regionlock.LockRangeStatusSuccess, res.Status)
@@ -249,13 +251,14 @@ func TestCollectStalledSpanReport(t *testing.T) {
 	require.Equal(t, 20*time.Minute, report.maxResolvedTsLag)
 	require.Equal(t, 55*time.Second, report.maxResolvedTsUpdatedAgo)
 	require.Len(t, report.samples, 1)
-	require.Equal(t, uint64(1), report.samples[0].SubscriptionID)
-	require.Equal(t, int64(11), report.samples[0].TableID)
+	require.Equal(t, uint64(2), report.samples[0].SubscriptionID)
+	require.Equal(t, int64(22), report.samples[0].TableID)
+	require.Equal(t, 20*time.Minute, report.samples[0].ResolvedTsLag)
+	require.Equal(t, 5*time.Second, report.samples[0].ResolvedTsUpdatedAgo)
 	require.Equal(t, 1, report.samples[0].LockedRegionCount)
-	require.Equal(t, 1, report.samples[0].UnlockedRangeCount)
-	require.Len(t, report.samples[0].BlockedBy, 2)
-	require.Equal(t, SpanResolvedTsBlockerInitializedRegion, report.samples[0].BlockedBy[0].Type)
-	require.Equal(t, SpanResolvedTsBlockerUnlockedRange, report.samples[0].BlockedBy[1].Type)
+	require.Equal(t, 0, report.samples[0].UnlockedRangeCount)
+	require.Len(t, report.samples[0].BlockedBy, 1)
+	require.Equal(t, SpanResolvedTsBlockerUninitializedRegion, report.samples[0].BlockedBy[0].Type)
 }
 
 type mockDynamicStream struct{}
@@ -322,6 +325,7 @@ func TestBroadcastStopRequestBypassesQueueLimit(t *testing.T) {
 
 	worker := &regionRequestWorker{
 		requestCache: newRequestCache(1),
+		client:       client,
 	}
 	store := newRequestedStore("store-1")
 	store.requestWorkers.s = []*regionRequestWorker{worker}

@@ -94,7 +94,7 @@ func (s *requestedStoreSet) getOrCreateRequestedStore(
 
 	perWorkerQueueSize := s.perWorkerQueueSize()
 	for i := uint(0); i < s.client.config.RegionRequestWorkerPerStore; i++ {
-		store.addWorker(newRegionRequestWorker(ctx, s.client, s.client.credential, eg, store, perWorkerQueueSize))
+		store.addWorker(newRegionRequestWorker(ctx, s.client, eg, store, perWorkerQueueSize))
 	}
 	return store
 }

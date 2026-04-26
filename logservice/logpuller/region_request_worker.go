@@ -19,9 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/pingcap/ticdc/pkg/security"
 	"github.com/pingcap/ticdc/pkg/util"
-	pd "github.com/tikv/pd/client"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -33,13 +31,7 @@ var workerIDGen atomic.Uint64
 type regionRequestWorker struct {
 	workerID uint64
 
-	pd                         pd.Client
-	clusterID                  uint64
-	credential                 *security.Credential
-	pushRegionEvent            func(SubscriptionID, regionEvent)
-	runtimeRegistry            *regionRuntimeRegistry
-	submitDirectFailure        func(regionFailureInfo)
-	submitWorkerSessionFailure func(map[SubscriptionID]regionFeedStates, []regionInfo, workerSessionFailure)
+	client *subscriptionClient
 
 	store *requestedStore
 
@@ -50,18 +42,11 @@ type regionRequestWorker struct {
 	currentSession *regionRequestWorkerSession
 }
 
-func (s *regionRequestWorker) markRegionEnqueued(region regionInfo, now time.Time) {
-	if !region.runtimeKey.isValid() {
-		return
-	}
-	s.runtimeRegistry.markRequestEnqueued(region.runtimeKey, now)
-}
-
 func (s *regionRequestWorker) handleSessionFailure(session *regionRequestWorkerSession, sessionFailure workerSessionFailure) {
 	// runNextSession only returns after the session loops exit, so the started and
 	// not-started sets are already quiescent here.
 	snapshot := session.takeFailureSnapshot()
-	s.submitWorkerSessionFailure(
+	s.client.regionScheduler.submitWorkerSessionFailure(
 		snapshot.startedRegions,
 		snapshot.pendingRegions,
 		sessionFailure,
@@ -99,13 +84,8 @@ func (s *regionRequestWorker) runNextSession(
 	session := newRegionRequestWorkerSession(
 		s.workerID,
 		s.store.storeAddr,
-		s.pd,
-		s.credential,
-		s.clusterID,
+		s.client,
 		s.requestCache,
-		s.runtimeRegistry,
-		s.submitDirectFailure,
-		s.pushRegionEvent,
 	)
 	session.setStage(WorkerSessionStateWaitingBootstrap)
 	s.setCurrentSession(session)
@@ -142,22 +122,15 @@ func (s *regionRequestWorker) runSessionLoop(
 func newRegionRequestWorker(
 	ctx context.Context,
 	client *subscriptionClient,
-	credential *security.Credential,
 	g *errgroup.Group,
 	store *requestedStore,
 	requestCacheSize int,
 ) *regionRequestWorker {
 	worker := &regionRequestWorker{
-		workerID:                   workerIDGen.Add(1),
-		pd:                         client.pd,
-		clusterID:                  client.clusterID,
-		credential:                 credential,
-		pushRegionEvent:            client.pushRegionEventToDS,
-		runtimeRegistry:            client.regionRuntimeRegistry,
-		submitDirectFailure:        client.regionScheduler.submitDirectFailure,
-		submitWorkerSessionFailure: client.regionScheduler.submitWorkerSessionFailure,
-		store:                      store,
-		requestCache:               newRequestCache(requestCacheSize),
+		workerID:     workerIDGen.Add(1),
+		client:       client,
+		store:        store,
+		requestCache: newRequestCache(requestCacheSize),
 	}
 
 	g.Go(func() error {
@@ -174,7 +147,7 @@ func (s *regionRequestWorker) add(ctx context.Context, region regionInfo, force 
 		return false, err
 	}
 	if ok {
-		s.markRegionEnqueued(region, time.Now())
+		s.client.regionRuntimeRegistry.markRegionWorkerEnqueued(region, time.Now())
 	}
 	return ok, err
 }

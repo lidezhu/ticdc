@@ -133,7 +133,6 @@ func (s *regionRequestScheduler) handleRegions(ctx context.Context, eg *errgroup
 		if !ok {
 			continue
 		}
-		s.client.regionRuntimeRegistry.updateRegion(region)
 		s.client.regionRuntimeRegistry.markRegionRPCReady(region, time.Now())
 
 		store := s.client.requestedStores.getOrCreateRequestedStore(ctx, eg, region.rpcCtx.Addr)

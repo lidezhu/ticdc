@@ -106,7 +106,7 @@ func TestHandleResolvedTsUpdatesRuntimeRegistry(t *testing.T) {
 	client := &subscriptionClient{
 		regionRuntimeRegistry: newRegionRuntimeRegistry(),
 	}
-	worker := &regionRequestWorker{runtimeRegistry: client.regionRuntimeRegistry}
+	worker := &regionRequestWorker{workerID: 1, client: client}
 
 	rawSpan := heartbeatpb.TableSpan{
 		TableID:  1,

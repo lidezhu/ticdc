@@ -18,10 +18,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/heartbeatpb"
 	"github.com/pingcap/ticdc/pkg/common"
 	"github.com/tikv/client-go/v2/oracle"
 	"github.com/tikv/client-go/v2/tikv"
+	"go.uber.org/zap"
 )
 
 type regionPhase string
@@ -121,6 +123,7 @@ type slowRegionReport struct {
 type slowRegionSample struct {
 	SubscriptionID uint64
 	RegionID       uint64
+	generation     uint64
 	Phase          regionPhase
 	// StuckFor is phase age for pending phases and resolved-ts lag for
 	// replicating phases.
@@ -129,11 +132,6 @@ type slowRegionSample struct {
 	WorkerID  uint64
 	LastError string
 	Span      string
-}
-
-type slowRegionCandidate struct {
-	state    *regionRuntimeState
-	stuckFor time.Duration
 }
 
 func (s regionRuntimeState) clone() regionRuntimeState {
@@ -377,62 +375,108 @@ func (r *regionRuntimeRegistry) markRemoved(
 	})
 }
 
-func (r *regionRuntimeRegistry) discoverRegion(region *regionInfo, now time.Time) {
-	if region.verID.GetID() == 0 || region.runtimeKey.isValid() {
-		return
+func (r *regionRuntimeRegistry) discoverRegion(region *regionInfo, now time.Time) bool {
+	if region == nil || region.isStopRequest() {
+		return false
+	}
+	if region.runtimeKey.isValid() {
+		return true
+	}
+	if region.verID.GetID() == 0 || region.subscribedSpan == nil {
+		log.Warn("skip region runtime discovery without region identity",
+			zap.Uint64("regionID", region.verID.GetID()))
+		return false
 	}
 	region.runtimeKey = r.allocKey(region.subscribedSpan.subID, region.verID.GetID())
 	r.markDiscovered(region.runtimeKey, *region, now)
+	return true
 }
 
-func (r *regionRuntimeRegistry) updateRegion(region regionInfo) {
-	if !region.runtimeKey.isValid() {
-		return
+func (r *regionRuntimeRegistry) runtimeKeyForRegion(
+	region regionInfo,
+	action string,
+) (regionRuntimeKey, bool) {
+	if region.runtimeKey.isValid() {
+		return region.runtimeKey, true
 	}
-	r.updateRegionInfo(region.runtimeKey, region)
+	if region.isStopRequest() {
+		return regionRuntimeKey{}, false
+	}
+	fields := []zap.Field{
+		zap.String("action", action),
+		zap.Uint64("regionID", region.verID.GetID()),
+	}
+	if region.subscribedSpan != nil {
+		fields = append(fields, zap.Uint64("subscriptionID", uint64(region.subscribedSpan.subID)))
+	}
+	log.Warn("skip region runtime update without key", fields...)
+	return regionRuntimeKey{}, false
 }
 
 func (r *regionRuntimeRegistry) markRegionRangeLockWait(region regionInfo, now time.Time) {
-	if !region.runtimeKey.isValid() {
+	key, ok := r.runtimeKeyForRegion(region, "range lock wait")
+	if !ok {
 		return
 	}
-	r.markRangeLockWait(region.runtimeKey, now)
+	r.markRangeLockWait(key, now)
 }
 
 func (r *regionRuntimeRegistry) markRegionRetryPending(region regionInfo, err error, now time.Time) {
-	if !region.runtimeKey.isValid() {
+	key, ok := r.runtimeKeyForRegion(region, "retry pending")
+	if !ok {
 		return
 	}
-	r.markRetryPending(region.runtimeKey, err, now)
+	r.markRetryPending(key, err, now)
 }
 
 func (r *regionRuntimeRegistry) markRegionRPCReady(region regionInfo, now time.Time) {
-	if !region.runtimeKey.isValid() {
+	key, ok := r.runtimeKeyForRegion(region, "rpc ready")
+	if !ok {
 		return
 	}
-	r.markRPCReady(region.runtimeKey, now)
+	r.updateRegionInfo(key, region)
+	r.markRPCReady(key, now)
 }
 
 func (r *regionRuntimeRegistry) markRegionQueued(region regionInfo, acquiredTime, queuedTime time.Time) {
-	if !region.runtimeKey.isValid() {
+	key, ok := r.runtimeKeyForRegion(region, "queued")
+	if !ok {
 		return
 	}
-	r.markQueued(region.runtimeKey, acquiredTime, queuedTime, region.resolvedTs())
+	r.markQueued(key, acquiredTime, queuedTime, region.resolvedTs())
+}
+
+func (r *regionRuntimeRegistry) markRegionWorkerEnqueued(region regionInfo, now time.Time) {
+	key, ok := r.runtimeKeyForRegion(region, "worker enqueued")
+	if !ok {
+		return
+	}
+	r.markRequestEnqueued(key, now)
+}
+
+func (r *regionRuntimeRegistry) markRegionRequestSent(region regionInfo, workerID uint64, now time.Time) {
+	key, ok := r.runtimeKeyForRegion(region, "request sent")
+	if !ok {
+		return
+	}
+	r.markRequestSent(key, workerID, now)
 }
 
 func (r *regionRuntimeRegistry) recordRegionError(region regionInfo, err error, now time.Time) {
-	if !region.runtimeKey.isValid() {
+	key, ok := r.runtimeKeyForRegion(region, "record error")
+	if !ok {
 		return
 	}
-	r.recordError(region.runtimeKey, err, now)
+	r.recordError(key, err, now)
 }
 
 func (r *regionRuntimeRegistry) removeRegion(region regionInfo, now time.Time) {
-	if !region.runtimeKey.isValid() {
+	key, ok := r.runtimeKeyForRegion(region, "remove")
+	if !ok {
 		return
 	}
-	r.markRemoved(region.runtimeKey, now)
-	r.remove(region.runtimeKey)
+	r.markRemoved(key, now)
+	r.remove(key)
 }
 
 func (r *regionRuntimeRegistry) get(key regionRuntimeKey) (regionRuntimeState, bool) {
@@ -572,58 +616,67 @@ func (s regionRuntimeState) slowDuration(now time.Time) time.Duration {
 	return s.phaseAge(now)
 }
 
-func betterSlowRegionCandidate(left, right slowRegionCandidate) bool {
-	if left.stuckFor != right.stuckFor {
-		return left.stuckFor > right.stuckFor
-	}
-	if left.state.key.subID != right.state.key.subID {
-		return left.state.key.subID < right.state.key.subID
-	}
-	if left.state.key.regionID != right.state.key.regionID {
-		return left.state.key.regionID < right.state.key.regionID
-	}
-	return left.state.key.generation < right.state.key.generation
-}
-
-func insertSlowRegionCandidate(
-	candidates []slowRegionCandidate,
-	candidate slowRegionCandidate,
-	limit int,
-) []slowRegionCandidate {
-	if limit <= 0 {
-		return candidates
-	}
-
-	originalLen := len(candidates)
-	if originalLen == limit && !betterSlowRegionCandidate(candidate, candidates[originalLen-1]) {
-		return candidates
-	}
-
-	insertAt := sort.Search(originalLen, func(i int) bool {
-		return betterSlowRegionCandidate(candidate, candidates[i])
-	})
-	if originalLen < limit {
-		candidates = append(candidates, slowRegionCandidate{})
-		copy(candidates[insertAt+1:], candidates[insertAt:originalLen])
-		candidates[insertAt] = candidate
-		return candidates
-	}
-
-	copy(candidates[insertAt+1:], candidates[insertAt:originalLen-1])
-	candidates[insertAt] = candidate
-	return candidates
-}
-
-func makeSlowRegionSample(candidate slowRegionCandidate) slowRegionSample {
+func (s regionRuntimeState) slowSample(stuckFor time.Duration) slowRegionSample {
 	return slowRegionSample{
-		SubscriptionID: uint64(candidate.state.key.subID),
-		RegionID:       candidate.state.key.regionID,
-		Phase:          candidate.state.phase,
-		StuckFor:       candidate.stuckFor,
-		StoreAddr:      candidate.state.storeAddr,
-		WorkerID:       candidate.state.workerID,
-		LastError:      candidate.state.lastError,
-		Span:           common.FormatTableSpan(&candidate.state.span),
+		SubscriptionID: uint64(s.key.subID),
+		RegionID:       s.key.regionID,
+		generation:     s.key.generation,
+		Phase:          s.phase,
+		StuckFor:       stuckFor,
+		StoreAddr:      s.storeAddr,
+		WorkerID:       s.workerID,
+		LastError:      s.lastError,
+		Span:           common.FormatTableSpan(&s.span),
+	}
+}
+
+func (s slowRegionSample) shouldAppearBefore(other slowRegionSample) bool {
+	if s.StuckFor != other.StuckFor {
+		return s.StuckFor > other.StuckFor
+	}
+	if s.SubscriptionID != other.SubscriptionID {
+		return s.SubscriptionID < other.SubscriptionID
+	}
+	if s.RegionID != other.RegionID {
+		return s.RegionID < other.RegionID
+	}
+	return s.generation < other.generation
+}
+
+func (r *slowRegionReport) recordSlowRegion(
+	state regionRuntimeState,
+	stuckFor time.Duration,
+	sampleLimit int,
+) {
+	r.slowRegionCount++
+	r.phaseCounts[state.phase]++
+	if sampleLimit == 0 {
+		return
+	}
+
+	sample := state.slowSample(stuckFor)
+	if sampleLimit < 0 {
+		r.samples = append(r.samples, sample)
+		return
+	}
+
+	insertAt := len(r.samples)
+	for i, existingSample := range r.samples {
+		if sample.shouldAppearBefore(existingSample) {
+			insertAt = i
+			break
+		}
+	}
+	if insertAt == len(r.samples) && len(r.samples) >= sampleLimit {
+		return
+	}
+	if len(r.samples) < sampleLimit {
+		r.samples = append(r.samples, slowRegionSample{})
+	}
+	copy(r.samples[insertAt+1:], r.samples[insertAt:])
+	r.samples[insertAt] = sample
+	if len(r.samples) > sampleLimit {
+		r.samples = r.samples[:sampleLimit]
 	}
 }
 
@@ -660,39 +713,9 @@ func (r *regionRuntimeRegistry) collectSlowRegionReport(
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	if sampleLimit < 0 {
-		candidates := make([]slowRegionCandidate, 0)
-		for _, state := range r.states {
-			report.totalRegionCount++
-
-			threshold, ok := state.slowThreshold()
-			if !ok {
-				continue
-			}
-			stuckFor := state.slowDuration(now)
-			if stuckFor <= threshold {
-				continue
-			}
-
-			report.slowRegionCount++
-			report.phaseCounts[state.phase]++
-			candidates = append(candidates, slowRegionCandidate{
-				state:    state,
-				stuckFor: stuckFor,
-			})
-		}
-
-		sort.Slice(candidates, func(i, j int) bool {
-			return betterSlowRegionCandidate(candidates[i], candidates[j])
-		})
-		report.samples = make([]slowRegionSample, 0, len(candidates))
-		for _, candidate := range candidates {
-			report.samples = append(report.samples, makeSlowRegionSample(candidate))
-		}
-		return report
+	if sampleLimit > 0 {
+		report.samples = make([]slowRegionSample, 0, sampleLimit)
 	}
-
-	candidates := make([]slowRegionCandidate, 0, sampleLimit)
 	for _, state := range r.states {
 		report.totalRegionCount++
 
@@ -705,17 +728,13 @@ func (r *regionRuntimeRegistry) collectSlowRegionReport(
 			continue
 		}
 
-		report.slowRegionCount++
-		report.phaseCounts[state.phase]++
-		candidates = insertSlowRegionCandidate(candidates, slowRegionCandidate{
-			state:    state,
-			stuckFor: stuckFor,
-		}, sampleLimit)
+		report.recordSlowRegion(state.clone(), stuckFor, sampleLimit)
 	}
 
-	report.samples = make([]slowRegionSample, 0, len(candidates))
-	for _, candidate := range candidates {
-		report.samples = append(report.samples, makeSlowRegionSample(candidate))
+	if sampleLimit < 0 {
+		sort.Slice(report.samples, func(i, j int) bool {
+			return report.samples[i].shouldAppearBefore(report.samples[j])
+		})
 	}
 	return report
 }
