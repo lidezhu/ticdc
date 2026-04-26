@@ -29,6 +29,27 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+const (
+	// Maximum total sleep time(in ms), 20 seconds.
+	tikvRequestMaxBackoff = 20000
+
+	// TiCDC always interacts with region leader, every time something goes wrong,
+	// failed region will be reloaded via `BatchLoadRegionsWithKeyRange` API. So we
+	// don't need to force reload region anymore.
+	regionScheduleReload = false
+
+	loadRegionRetryInterval time.Duration = 100 * time.Millisecond
+)
+
+// rangeTask represents a table range that still needs to be resolved into TiKV
+// region requests. It can cover a whole table span, a sub span, or a retry range.
+type rangeTask struct {
+	span           heartbeatpb.TableSpan
+	subscribedSpan *subscribedSpan
+	filterLoop     bool
+	priority       TaskType
+}
+
 // regionRequestScheduler converts subscribed table spans into region-level
 // requests and admits those requests into store-local workers.
 type regionRequestScheduler struct {
@@ -51,8 +72,11 @@ func (s *regionRequestScheduler) close() {
 	s.regionTaskQueue.Close()
 }
 
-func (s *regionRequestScheduler) runFailureBuffer(ctx context.Context) error {
-	return s.failureBuffer.run(ctx)
+func (s *regionRequestScheduler) run(ctx context.Context, g *errgroup.Group) {
+	g.Go(func() error { return s.handleRangeTasks(ctx) })
+	g.Go(func() error { return s.handleRegions(ctx, g) })
+	g.Go(func() error { return s.handleFailures(ctx) })
+	g.Go(func() error { return s.failureBuffer.run(ctx) })
 }
 
 func (s *regionRequestScheduler) scheduleStopRegion(span *subscribedSpan) {
@@ -98,7 +122,7 @@ func (s *regionRequestScheduler) handleRegions(ctx context.Context, eg *errgroup
 		}
 
 		region := regionTask.GetRegionInfo()
-		if region.isStopped() {
+		if region.isStopRequest() {
 			if err := s.client.requestedStores.broadcastStopRequest(ctx, region); err != nil {
 				return err
 			}
@@ -109,8 +133,8 @@ func (s *regionRequestScheduler) handleRegions(ctx context.Context, eg *errgroup
 		if !ok {
 			continue
 		}
-		s.client.updateRegionRuntimeInfo(region)
-		s.client.markRegionRPCReady(region, time.Now())
+		s.client.regionRuntimeRegistry.updateRegion(region)
+		s.client.regionRuntimeRegistry.markRegionRPCReady(region, time.Now())
 
 		store := s.client.requestedStores.getOrCreateRequestedStore(ctx, eg, region.rpcCtx.Addr)
 		worker := store.getRequestWorker()
@@ -243,27 +267,27 @@ func (s *regionRequestScheduler) divideSpanAndScheduleRegionRequests(
 }
 
 func (s *regionRequestScheduler) scheduleRegionRequest(ctx context.Context, region regionInfo, priority TaskType) {
-	s.client.markRegionDiscovered(&region, time.Now())
+	s.client.regionRuntimeRegistry.discoverRegion(&region, time.Now())
 	lockRangeResult := region.subscribedSpan.rangeLock.LockRange(
 		ctx, region.span.StartKey, region.span.EndKey, region.verID.GetID(), region.verID.GetVer())
 
 	if lockRangeResult.Status == regionlock.LockRangeStatusWait {
-		s.client.markRegionRangeLockWait(region, time.Now())
+		s.client.regionRuntimeRegistry.markRegionRangeLockWait(region, time.Now())
 		lockRangeResult = lockRangeResult.WaitFn()
 	}
 
 	switch lockRangeResult.Status {
 	case regionlock.LockRangeStatusSuccess:
 		region.lockedRangeState = lockRangeResult.LockedRangeState
-		s.client.markRegionQueued(region, lockRangeResult.LockedRangeState.Created, time.Now())
+		s.client.regionRuntimeRegistry.markRegionQueued(region, lockRangeResult.LockedRangeState.Created, time.Now())
 		s.regionTaskQueue.Push(NewRegionPriorityTask(priority, region, s.client.pdClock.CurrentTS()))
 	case regionlock.LockRangeStatusStale:
-		s.client.removeRegionRuntime(region, time.Now())
+		s.client.regionRuntimeRegistry.removeRegion(region, time.Now())
 		for _, retryRange := range lockRangeResult.RetryRanges {
 			s.scheduleRangeRequest(ctx, retryRange, region.subscribedSpan, region.filterLoop, priority)
 		}
 	case regionlock.LockRangeStatusCancel:
-		s.client.removeRegionRuntime(region, time.Now())
+		s.client.regionRuntimeRegistry.removeRegion(region, time.Now())
 	default:
 		return
 	}

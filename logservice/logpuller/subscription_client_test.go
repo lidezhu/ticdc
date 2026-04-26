@@ -21,6 +21,7 @@ import (
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/cdcpb"
+	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/ticdc/heartbeatpb"
 	"github.com/pingcap/ticdc/logservice/logpuller/regionlock"
 	"github.com/pingcap/ticdc/pkg/common"
@@ -28,6 +29,7 @@ import (
 	"github.com/pingcap/ticdc/pkg/metrics"
 	"github.com/pingcap/ticdc/pkg/pdutil"
 	"github.com/pingcap/ticdc/pkg/security"
+	"github.com/pingcap/ticdc/pkg/txnutil/gc"
 	"github.com/pingcap/ticdc/utils/dynstream"
 	"github.com/pingcap/tidb/pkg/store/mockstore/mockcopr"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -35,13 +37,38 @@ import (
 	"github.com/tikv/client-go/v2/oracle"
 	"github.com/tikv/client-go/v2/testutils"
 	"github.com/tikv/client-go/v2/tikv"
+	pdopt "github.com/tikv/pd/client/opt"
 )
 
-func TestGenerateResolveLockTask(t *testing.T) {
-	client := &subscriptionClient{}
-	client.ensureHelpers()
-	client.staleLockResolver.resolveLockTaskCh = make(chan resolveLockTask, 10)
+func newTestSubscriptionClient(t *testing.T) *subscriptionClient {
+	t.Helper()
+
+	client := &subscriptionClient{
+		pd: &gc.MockPDClient{
+			ClusterID: 1,
+			GetAllStoresFunc: func(context.Context, ...pdopt.GetStoreOption) ([]*metapb.Store, error) {
+				return nil, nil
+			},
+		},
+		pdClock:               pdutil.NewClock4Test(),
+		regionRuntimeRegistry: newRegionRuntimeRegistry(),
+		failureStats:          newFailureStats(),
+	}
 	client.ctx, client.cancel = context.WithCancel(context.Background())
+	t.Cleanup(client.cancel)
+
+	client.requestedStores = newRequestedStoreSet(client)
+	client.regionScheduler = newRegionRequestScheduler(client)
+	client.subscribedSpans = newSubscribedSpanSet(client)
+	client.staleLockResolver = newStaleLockResolver(client)
+	client.observability = newObservabilityReporter(client)
+	client.cond = sync.NewCond(&client.mu)
+	return client
+}
+
+func TestGenerateResolveLockTask(t *testing.T) {
+	client := newTestSubscriptionClient(t)
+	client.staleLockResolver.resolveLockTaskCh = make(chan resolveLockTask, 10)
 	rawSpan := heartbeatpb.TableSpan{
 		TableID:  1,
 		StartKey: []byte{'a'},
@@ -101,11 +128,8 @@ func TestGenerateResolveLockTask(t *testing.T) {
 }
 
 func TestResolveLockTaskDroppedWhenChannelFull(t *testing.T) {
-	client := &subscriptionClient{}
-	client.ensureHelpers()
+	client := newTestSubscriptionClient(t)
 	client.staleLockResolver.resolveLockTaskCh = make(chan resolveLockTask, 1)
-	client.ctx, client.cancel = context.WithCancel(context.Background())
-	defer client.cancel()
 
 	rawSpan := heartbeatpb.TableSpan{
 		TableID:  1,
@@ -147,12 +171,9 @@ func TestResolveLockTaskDroppedWhenChannelFull(t *testing.T) {
 }
 
 func TestStopTaskUsesSubscribedSpanFilterLoop(t *testing.T) {
-	client := &subscriptionClient{}
-	client.ensureHelpers()
+	client := newTestSubscriptionClient(t)
 	client.staleLockResolver.resolveLockTaskCh = make(chan resolveLockTask, 1)
 	client.regionScheduler.regionTaskQueue = NewPriorityQueue()
-	client.ctx, client.cancel = context.WithCancel(context.Background())
-	defer client.cancel()
 	client.pdClock = pdutil.NewClock4Test()
 
 	rawSpan := heartbeatpb.TableSpan{
@@ -174,7 +195,7 @@ func TestStopTaskUsesSubscribedSpanFilterLoop(t *testing.T) {
 	task, err := client.regionScheduler.regionTaskQueue.Pop(ctx)
 	require.NoError(t, err)
 	region := task.GetRegionInfo()
-	require.True(t, region.isStopped())
+	require.True(t, region.isStopRequest())
 	require.True(t, region.filterLoop)
 }
 
@@ -183,11 +204,8 @@ func TestCollectStalledSpanReport(t *testing.T) {
 	now := time.Unix(1700003600, 0)
 	clock.SetTS(oracle.GoTimeToTS(now))
 
-	client := &subscriptionClient{
-		pdClock:               clock,
-		regionRuntimeRegistry: newRegionRuntimeRegistry(),
-	}
-	client.ensureHelpers()
+	client := newTestSubscriptionClient(t)
+	client.pdClock = clock
 
 	consumeKVEvents := func(_ []common.RawKVEntry, _ func()) bool { return false }
 	advanceResolvedTs := func(uint64) {}
@@ -223,7 +241,7 @@ func TestCollectStalledSpanReport(t *testing.T) {
 	res.LockedRangeState.ResolvedTs.Store(stalledTs2)
 	res.LockedRangeState.Initialized.Store(false)
 
-	report := client.collectStalledSpanReport(now, 1, 4)
+	report := client.observability.collectStalledSpanReport(now, 1, 4)
 	require.Equal(t, 2, report.stalledSpanCount)
 	require.Equal(t, 1, report.blockerCounts[regionlock.ResolvedTsBlockerUnlockedRange])
 	require.Equal(t, 1, report.blockerCounts[regionlock.ResolvedTsBlockerInitializedRegion])
@@ -271,13 +289,9 @@ func (s *mockDynamicStream) GetMetrics() dynstream.Metrics[int, SubscriptionID] 
 }
 
 func TestPushRegionEventToDSUnblocksOnClose(t *testing.T) {
-	client := &subscriptionClient{
-		ds: &mockDynamicStream{},
-	}
-	client.ensureHelpers()
+	client := newTestSubscriptionClient(t)
+	client.ds = &mockDynamicStream{}
 	client.regionScheduler.regionTaskQueue = NewPriorityQueue()
-	client.ctx, client.cancel = context.WithCancel(context.Background())
-	client.cond = sync.NewCond(&client.mu)
 
 	client.paused.Store(true)
 
@@ -304,8 +318,7 @@ func TestPushRegionEventToDSUnblocksOnClose(t *testing.T) {
 
 func TestBroadcastStopRequestBypassesQueueLimit(t *testing.T) {
 	ctx := context.Background()
-	client := &subscriptionClient{}
-	client.ensureHelpers()
+	client := newTestSubscriptionClient(t)
 
 	worker := &regionRequestWorker{
 		requestCache: newRequestCache(1),

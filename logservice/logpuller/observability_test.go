@@ -34,11 +34,8 @@ func TestSubscriptionClientGetObservabilitySnapshot(t *testing.T) {
 	now := time.Unix(1700003600, 0)
 	clock.SetTS(oracle.GoTimeToTS(now))
 
-	client := &subscriptionClient{
-		pdClock:               clock,
-		regionRuntimeRegistry: newRegionRuntimeRegistry(),
-	}
-	client.ensureHelpers()
+	client := newTestSubscriptionClient(t)
+	client.pdClock = clock
 
 	storeRegion := createTestRegionInfo(1, 101)
 	storeRegion.rpcCtx = createRPCContext("tikv-1:20160", 11, 22)

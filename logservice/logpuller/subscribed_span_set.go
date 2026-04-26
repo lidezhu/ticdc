@@ -15,6 +15,7 @@ package logpuller
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pingcap/log"
@@ -26,6 +27,53 @@ import (
 	"github.com/tikv/client-go/v2/oracle"
 	"go.uber.org/zap"
 )
+
+const kvEventsCacheMaxSize = 32
+
+// subscribedSpan is the per-subscription state shared by region scheduling,
+// region event handling and resolved-ts tracking.
+type subscribedSpan struct {
+	subID   SubscriptionID
+	startTs uint64
+	// Whether to filter out the value written by TiCDC itself.
+	// It should be `true` in BDR mode.
+	filterLoop bool
+
+	// The target span.
+	span heartbeatpb.TableSpan
+	// The range lock of the span. It prevents duplicate requests to the same
+	// region range and calculates this subscription's resolved-ts.
+	rangeLock *regionlock.RangeLock
+
+	consumeKVEvents func(events []common.RawKVEntry, wakeCallback func()) bool
+
+	advanceResolvedTs func(ts uint64)
+
+	advanceInterval int64
+
+	kvEventsCache []common.RawKVEntry
+
+	// To handle span removing.
+	stopped atomic.Bool
+
+	// To handle stale lock resolvings.
+	tryResolveLock     func(regionID uint64, state *regionlock.LockedRangeState)
+	staleLocksTargetTs atomic.Uint64
+
+	lastAdvanceTime atomic.Int64
+
+	initialized       atomic.Bool
+	resolvedTsUpdated atomic.Int64
+	resolvedTs        atomic.Uint64
+}
+
+func (span *subscribedSpan) clearKVEventsCache() {
+	if cap(span.kvEventsCache) > kvEventsCacheMaxSize {
+		span.kvEventsCache = nil
+	} else {
+		span.kvEventsCache = span.kvEventsCache[:0]
+	}
+}
 
 type subscribedSpanSet struct {
 	client  *subscriptionClient
@@ -121,7 +169,6 @@ func (s *subscribedSpanSet) newSubscribedSpan(
 				regionID:   regionID,
 				targetTs:   targetTs,
 				state:      state,
-				create:     time.Now(),
 			}
 			if !s.client.staleLockResolver.tryEnqueue(task) {
 				metrics.SubscriptionClientResolveLockTaskDropCounter.Inc()
@@ -149,7 +196,7 @@ func (s *subscribedSpanSet) onTableDrained(rt *subscribedSpan) {
 	log.Info("subscription client stop span is finished",
 		zap.Uint64("subscriptionID", uint64(rt.subID)))
 
-	s.client.removeSubscriptionRuntime(rt.subID)
+	s.client.regionRuntimeRegistry.removeBySubscription(rt.subID)
 
 	err := s.client.ds.RemovePath(rt.subID)
 	if err != nil {

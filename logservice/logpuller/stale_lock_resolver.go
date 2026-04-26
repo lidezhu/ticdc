@@ -21,7 +21,24 @@ import (
 	"github.com/pingcap/ticdc/logservice/logpuller/regionlock"
 	"github.com/tikv/client-go/v2/oracle"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 )
+
+const (
+	resolveLockMinInterval  time.Duration = 10 * time.Second
+	resolveLockTickInterval time.Duration = 2 * time.Second
+	resolveLockFence        time.Duration = 4 * time.Second
+
+	// resolveLastRunGCThreshold is the size threshold to GC resolveLastRun and drop stale entries.
+	resolveLastRunGCThreshold = 1024
+)
+
+type resolveLockTask struct {
+	keyspaceID uint32
+	regionID   uint64
+	targetTs   uint64
+	state      *regionlock.LockedRangeState
+}
 
 type staleLockResolver struct {
 	client            *subscriptionClient
@@ -33,6 +50,11 @@ func newStaleLockResolver(client *subscriptionClient) *staleLockResolver {
 		client:            client,
 		resolveLockTaskCh: make(chan resolveLockTask, 1024),
 	}
+}
+
+func (s *staleLockResolver) run(ctx context.Context, g *errgroup.Group) {
+	g.Go(func() error { return s.runResolveLockChecker(ctx) })
+	g.Go(func() error { return s.handleResolveLockTasks(ctx) })
 }
 
 func (s *staleLockResolver) tryEnqueue(task resolveLockTask) bool {

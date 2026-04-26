@@ -377,6 +377,64 @@ func (r *regionRuntimeRegistry) markRemoved(
 	})
 }
 
+func (r *regionRuntimeRegistry) discoverRegion(region *regionInfo, now time.Time) {
+	if region.verID.GetID() == 0 || region.runtimeKey.isValid() {
+		return
+	}
+	region.runtimeKey = r.allocKey(region.subscribedSpan.subID, region.verID.GetID())
+	r.markDiscovered(region.runtimeKey, *region, now)
+}
+
+func (r *regionRuntimeRegistry) updateRegion(region regionInfo) {
+	if !region.runtimeKey.isValid() {
+		return
+	}
+	r.updateRegionInfo(region.runtimeKey, region)
+}
+
+func (r *regionRuntimeRegistry) markRegionRangeLockWait(region regionInfo, now time.Time) {
+	if !region.runtimeKey.isValid() {
+		return
+	}
+	r.markRangeLockWait(region.runtimeKey, now)
+}
+
+func (r *regionRuntimeRegistry) markRegionRetryPending(region regionInfo, err error, now time.Time) {
+	if !region.runtimeKey.isValid() {
+		return
+	}
+	r.markRetryPending(region.runtimeKey, err, now)
+}
+
+func (r *regionRuntimeRegistry) markRegionRPCReady(region regionInfo, now time.Time) {
+	if !region.runtimeKey.isValid() {
+		return
+	}
+	r.markRPCReady(region.runtimeKey, now)
+}
+
+func (r *regionRuntimeRegistry) markRegionQueued(region regionInfo, acquiredTime, queuedTime time.Time) {
+	if !region.runtimeKey.isValid() {
+		return
+	}
+	r.markQueued(region.runtimeKey, acquiredTime, queuedTime, region.resolvedTs())
+}
+
+func (r *regionRuntimeRegistry) recordRegionError(region regionInfo, err error, now time.Time) {
+	if !region.runtimeKey.isValid() {
+		return
+	}
+	r.recordError(region.runtimeKey, err, now)
+}
+
+func (r *regionRuntimeRegistry) removeRegion(region regionInfo, now time.Time) {
+	if !region.runtimeKey.isValid() {
+		return
+	}
+	r.markRemoved(region.runtimeKey, now)
+	r.remove(region.runtimeKey)
+}
+
 func (r *regionRuntimeRegistry) get(key regionRuntimeKey) (regionRuntimeState, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

@@ -86,7 +86,7 @@ func (b *failureBuffer) run(ctx context.Context) error {
 
 func (s *regionRequestScheduler) submitDirectFailure(failure regionFailureInfo) {
 	now := time.Now()
-	s.client.recordRegionRuntimeError(failure.regionInfo, failure.err, now)
+	s.client.regionRuntimeRegistry.recordRegionError(failure.regionInfo, failure.err, now)
 	s.client.failureStats.record(failure, now)
 	metrics.SubscriptionClientFailureCounter.WithLabelValues(
 		failure.scope.String(),
@@ -126,7 +126,7 @@ func (s *regionRequestScheduler) submitWorkerSessionFailure(
 	}
 
 	for _, region := range pendingRegions {
-		if region.isStopped() {
+		if region.isStopRequest() {
 			continue
 		}
 		s.submitDirectFailure(normalizeWorkerSessionFailure(region, sessionFailure))
@@ -148,12 +148,12 @@ func (s *regionRequestScheduler) handleFailures(ctx context.Context) error {
 }
 
 func (s *regionRequestScheduler) retryRegion(ctx context.Context, failure regionFailureInfo, priority TaskType) {
-	s.client.markRegionRetryPending(failure.regionInfo, failure.err, time.Now())
+	s.client.regionRuntimeRegistry.markRegionRetryPending(failure.regionInfo, failure.err, time.Now())
 	s.scheduleRegionRequest(ctx, failure.regionInfo, priority)
 }
 
 func (s *regionRequestScheduler) reloadRegionRange(ctx context.Context, failure regionFailureInfo) {
-	s.client.removeRegionRuntime(failure.regionInfo, time.Now())
+	s.client.regionRuntimeRegistry.removeRegion(failure.regionInfo, time.Now())
 	s.scheduleRangeRequest(ctx, failure.span, failure.subscribedSpan, failure.filterLoop, TaskHighPrior)
 }
 
@@ -246,7 +246,7 @@ func (s *regionRequestScheduler) handleStoreSessionFailure(ctx context.Context, 
 func (s *regionRequestScheduler) handleSubscriptionFailure(failure regionFailureInfo) error {
 	switch failure.kind {
 	case regionFailureKindRequestCancelled, regionFailureKindSubscriptionStopped:
-		s.client.removeRegionRuntime(failure.regionInfo, time.Now())
+		s.client.regionRuntimeRegistry.removeRegion(failure.regionInfo, time.Now())
 		return nil
 	default:
 		return errors.New("unexpected subscription failure kind")

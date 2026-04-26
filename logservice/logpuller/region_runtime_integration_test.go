@@ -24,17 +24,12 @@ import (
 	"github.com/pingcap/ticdc/heartbeatpb"
 	"github.com/pingcap/ticdc/logservice/logpuller/regionlock"
 	"github.com/pingcap/ticdc/pkg/common"
-	"github.com/pingcap/ticdc/pkg/pdutil"
 	"github.com/stretchr/testify/require"
 	"github.com/tikv/client-go/v2/tikv"
 )
 
 func TestScheduleRegionRequestUpdatesRuntimeRegistry(t *testing.T) {
-	client := &subscriptionClient{
-		regionRuntimeRegistry: newRegionRuntimeRegistry(),
-		pdClock:               pdutil.NewClock4Test(),
-	}
-	client.ensureHelpers()
+	client := newTestSubscriptionClient(t)
 	client.regionScheduler.regionTaskQueue = NewPriorityQueue()
 	client.regionScheduler.failureBuffer = newFailureBuffer()
 
@@ -73,13 +68,8 @@ func TestScheduleRegionRequestUpdatesRuntimeRegistry(t *testing.T) {
 }
 
 func TestOnRegionFailUpdatesRuntimeRegistry(t *testing.T) {
-	client := &subscriptionClient{
-		regionRuntimeRegistry: newRegionRuntimeRegistry(),
-	}
-	client.ensureHelpers()
+	client := newTestSubscriptionClient(t)
 	client.regionScheduler.failureBuffer = newFailureBuffer()
-	client.ctx, client.cancel = context.WithCancel(context.Background())
-	defer client.cancel()
 
 	rawSpan := heartbeatpb.TableSpan{
 		TableID:  1,
@@ -100,7 +90,7 @@ func TestOnRegionFailUpdatesRuntimeRegistry(t *testing.T) {
 	}, nil, subSpan, false)
 	region.lockedRangeState = lockRes.LockedRangeState
 
-	client.markRegionDiscovered(&region, time.Now())
+	client.regionRuntimeRegistry.discoverRegion(&region, time.Now())
 	require.True(t, region.runtimeKey.isValid())
 
 	client.regionScheduler.submitDirectFailure(newSendRequestToStoreFailure(region, regionFailureSourceWorkerSession, nil))
@@ -163,11 +153,7 @@ func TestHandleResolvedTsUpdatesRuntimeRegistry(t *testing.T) {
 }
 
 func TestDoHandleFailureMarksRetryPendingForRetryableRegionError(t *testing.T) {
-	client := &subscriptionClient{
-		regionRuntimeRegistry: newRegionRuntimeRegistry(),
-		pdClock:               pdutil.NewClock4Test(),
-	}
-	client.ensureHelpers()
+	client := newTestSubscriptionClient(t)
 	client.regionScheduler.regionTaskQueue = NewPriorityQueue()
 	client.regionScheduler.failureBuffer = newFailureBuffer()
 
@@ -181,7 +167,7 @@ func TestDoHandleFailureMarksRetryPendingForRetryableRegionError(t *testing.T) {
 	subSpan := client.subscribedSpans.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
 
 	region := newRegionInfo(tikv.NewRegionVerID(10, 1, 1), rawSpan, nil, subSpan, false)
-	client.markRegionDiscovered(&region, time.Now())
+	client.regionRuntimeRegistry.discoverRegion(&region, time.Now())
 
 	err := client.regionScheduler.handleFailure(
 		context.Background(),
@@ -197,10 +183,7 @@ func TestDoHandleFailureMarksRetryPendingForRetryableRegionError(t *testing.T) {
 }
 
 func TestDoHandleFailureRemovesRuntimeForRangeReload(t *testing.T) {
-	client := &subscriptionClient{
-		regionRuntimeRegistry: newRegionRuntimeRegistry(),
-	}
-	client.ensureHelpers()
+	client := newTestSubscriptionClient(t)
 	client.regionScheduler.rangeTaskCh = make(chan rangeTask, 1)
 	client.regionScheduler.failureBuffer = newFailureBuffer()
 
@@ -214,7 +197,7 @@ func TestDoHandleFailureRemovesRuntimeForRangeReload(t *testing.T) {
 	subSpan := client.subscribedSpans.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
 
 	region := newRegionInfo(tikv.NewRegionVerID(10, 1, 1), rawSpan, nil, subSpan, false)
-	client.markRegionDiscovered(&region, time.Now())
+	client.regionRuntimeRegistry.discoverRegion(&region, time.Now())
 
 	err := client.regionScheduler.handleFailure(context.Background(), newRPCCtxUnavailableFailure(region))
 	require.NoError(t, err)
@@ -232,10 +215,7 @@ func TestDoHandleFailureRemovesRuntimeForRangeReload(t *testing.T) {
 }
 
 func TestDoHandleFailureRemovesRuntimeForCancelledRequest(t *testing.T) {
-	client := &subscriptionClient{
-		regionRuntimeRegistry: newRegionRuntimeRegistry(),
-	}
-	client.ensureHelpers()
+	client := newTestSubscriptionClient(t)
 	client.regionScheduler.failureBuffer = newFailureBuffer()
 
 	rawSpan := heartbeatpb.TableSpan{
@@ -248,7 +228,7 @@ func TestDoHandleFailureRemovesRuntimeForCancelledRequest(t *testing.T) {
 	subSpan := client.subscribedSpans.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
 
 	region := newRegionInfo(tikv.NewRegionVerID(10, 1, 1), rawSpan, nil, subSpan, false)
-	client.markRegionDiscovered(&region, time.Now())
+	client.regionRuntimeRegistry.discoverRegion(&region, time.Now())
 
 	err := client.regionScheduler.handleFailure(
 		context.Background(),
@@ -261,10 +241,7 @@ func TestDoHandleFailureRemovesRuntimeForCancelledRequest(t *testing.T) {
 }
 
 func TestDoHandleFailureRemovesRuntimeForStoppedSubscription(t *testing.T) {
-	client := &subscriptionClient{
-		regionRuntimeRegistry: newRegionRuntimeRegistry(),
-	}
-	client.ensureHelpers()
+	client := newTestSubscriptionClient(t)
 	client.regionScheduler.failureBuffer = newFailureBuffer()
 
 	rawSpan := heartbeatpb.TableSpan{
@@ -277,7 +254,7 @@ func TestDoHandleFailureRemovesRuntimeForStoppedSubscription(t *testing.T) {
 	subSpan := client.subscribedSpans.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
 
 	region := newRegionInfo(tikv.NewRegionVerID(10, 1, 1), rawSpan, nil, subSpan, false)
-	client.markRegionDiscovered(&region, time.Now())
+	client.regionRuntimeRegistry.discoverRegion(&region, time.Now())
 
 	err := client.regionScheduler.handleFailure(context.Background(), newSubscriptionStoppedFailure(region))
 	require.NoError(t, err)

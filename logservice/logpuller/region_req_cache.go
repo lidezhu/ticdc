@@ -51,7 +51,7 @@ type regionReqKey struct {
 
 func newRegionReqKey(region regionInfo) regionReqKey {
 	key := regionReqKey{subID: region.subscribedSpan.subID}
-	if region.isStopped() {
+	if region.isStopRequest() {
 		key.stop = true
 		return key
 	}

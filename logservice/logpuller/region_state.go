@@ -65,9 +65,7 @@ type regionInfo struct {
 	filterLoop bool
 }
 
-// isStopped returns true for a subscription-level stop request. The name is
-// kept for compatibility with the surrounding scheduler and worker code.
-func (s *regionInfo) isStopped() bool {
+func (s *regionInfo) isStopRequest() bool {
 	return s.requestKind == regionRequestStopSubscription
 }
 
