@@ -14,6 +14,7 @@
 package eventstore
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math"
@@ -512,8 +513,8 @@ func (e *eventStore) RegisterDispatcher(
 		if subStats, ok := e.dispatcherMeta.tableStats[dispatcherSpan.TableID]; ok {
 			for _, subStat := range subStats {
 				// Check if this subStat's span contains the dispatcherSpan
-				if common.StartCompare(subStat.tableSpan.StartKey, dispatcherSpan.StartKey) <= 0 &&
-					common.EndCompare(dispatcherSpan.EndKey, subStat.tableSpan.EndKey) <= 0 {
+				if bytes.Compare(subStat.tableSpan.StartKey, dispatcherSpan.StartKey) <= 0 &&
+					bytes.Compare(dispatcherSpan.EndKey, subStat.tableSpan.EndKey) <= 0 {
 
 					// For onlyReuse register request, we only consider initialized subStats
 					if onlyReuse && !subStat.initialized.Load() {
@@ -546,8 +547,8 @@ func (e *eventStore) RegisterDispatcher(
 					// for example, if we have a dispatcher with span [b, c),
 					// it is hard to determine whether [a, d) or [b, h) is bestMatch without some statistics.
 					if bestMatch == nil ||
-						(common.StartCompare(subStat.tableSpan.StartKey, bestMatch.tableSpan.StartKey) >= 0 &&
-							common.EndCompare(subStat.tableSpan.EndKey, bestMatch.tableSpan.EndKey) <= 0) {
+						(bytes.Compare(subStat.tableSpan.StartKey, bestMatch.tableSpan.StartKey) >= 0 &&
+							bytes.Compare(subStat.tableSpan.EndKey, bestMatch.tableSpan.EndKey) <= 0) {
 						bestMatch = subStat
 					}
 				}
@@ -1503,8 +1504,8 @@ func (iter *eventStoreIter) Next() (*common.RawKVEntry, bool) {
 			break
 		}
 		comparableKey := common.ToComparableKey(rawKV.Key)
-		if common.StartCompare(comparableKey, iter.tableSpan.StartKey) >= 0 &&
-			common.EndCompare(comparableKey, iter.tableSpan.EndKey) < 0 {
+		if bytes.Compare(comparableKey, iter.tableSpan.StartKey) >= 0 &&
+			bytes.Compare(comparableKey, iter.tableSpan.EndKey) < 0 {
 			break
 		}
 		log.Debug("event store iter skip kv not in table span",
