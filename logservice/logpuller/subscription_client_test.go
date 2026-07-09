@@ -29,9 +29,7 @@ import (
 	"github.com/pingcap/ticdc/pkg/metrics"
 	"github.com/pingcap/ticdc/pkg/pdutil"
 	"github.com/pingcap/ticdc/pkg/security"
-	"github.com/pingcap/ticdc/utils/chann"
 	"github.com/pingcap/ticdc/utils/dynstream"
-	"github.com/pingcap/ticdc/utils/priorityqueue"
 	"github.com/pingcap/tidb/pkg/store/mockstore/mockcopr"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
@@ -519,33 +517,9 @@ func TestEnqueueDeregisterToAllStoresUsesControlQueue(t *testing.T) {
 	require.Equal(t, 1, worker.requestCache.pendingCount())
 }
 
-func TestRequestedStoreDeferredTasksPriority(t *testing.T) {
-	store := &requestedStore{storeAddr: "store-1", pendingTasks: priorityqueue.New[*regionPriorityTask]()}
-	currentTs := oracle.GoTimeToTS(time.Now())
-	span := &subscribedSpan{subID: SubscriptionID(1)}
-	span.resolvedTs.Store(currentTs)
-	region := regionInfo{subscribedSpan: span}
-
-	lowTask := newRegionPriorityTask(TaskLowPrior, region, currentTs, 1)
-	highTask := newRegionPriorityTask(TaskHighPrior, region, currentTs, 2)
-
-	store.pendingTasks.Push(lowTask)
-	store.pendingTasks.Push(highTask)
-
-	task, ok := store.pendingTasks.TryPop()
-	require.True(t, ok)
-	require.Same(t, highTask, task)
-	task, ok = store.pendingTasks.TryPop()
-	require.True(t, ok)
-	require.Same(t, lowTask, task)
-	_, ok = store.pendingTasks.TryPop()
-	require.False(t, ok)
-}
-
-func TestRequestedStoreQuotaReleaseNotifiesSchedulerOnce(t *testing.T) {
+func TestRequestedStoreQuotaReleaseNotifiesScheduler(t *testing.T) {
 	scheduler := &regionRequestScheduler{
 		schedulerNotify: make(chan struct{}, 1),
-		storeAvailable:  chann.NewUnlimitedChannelDefault[*requestedStore](),
 	}
 	store := &requestedStore{scheduler: scheduler, storeAddr: "store-1"}
 	store.quota = newStoreQuota(1, store.NotifyAvailable)
@@ -557,23 +531,20 @@ func TestRequestedStoreQuotaReleaseNotifiesSchedulerOnce(t *testing.T) {
 
 	quota.Release()
 	quota.Release()
-	require.Equal(t, 1, scheduler.storeAvailable.Len())
 	select {
 	case <-scheduler.schedulerNotify:
 	default:
 		require.Fail(t, "quota release should notify scheduler")
 	}
 
-	readyStore, ok, err := scheduler.storeAvailable.GetWithContext(context.Background())
-	require.NoError(t, err)
-	require.True(t, ok)
-	require.Same(t, store, readyStore)
-	readyStore.MarkAvailableDequeued()
-
 	quota, ok = store.quota.TryAcquire()
 	require.True(t, ok)
 	quota.Release()
-	require.Equal(t, 1, scheduler.storeAvailable.Len())
+	select {
+	case <-scheduler.schedulerNotify:
+	default:
+		require.Fail(t, "quota release should notify scheduler again")
+	}
 }
 
 func TestSubscriptionWithFailedTiKV(t *testing.T) {

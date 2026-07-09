@@ -94,13 +94,6 @@ var (
 			Name:      "worker_pending_region_count",
 			Help:      "The number of pending region requests in each worker",
 		}, []string{"store", "worker"})
-	SubscriptionClientStoreDeferredRegionCount = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: "ticdc",
-			Subsystem: "subscription_client",
-			Name:      "store_deferred_region_count",
-			Help:      "The number of deferred region requests for each store",
-		}, []string{"store"})
 	SubscriptionClientStoreQuotaGauge = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: "ticdc",
@@ -115,13 +108,6 @@ var (
 			Name:      "region_request_send_count",
 			Help:      "The number of region requests sent to TiKV",
 		}, []string{"store", "worker"})
-	SubscriptionClientRegionRequestDeferCounter = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: "ticdc",
-			Subsystem: "subscription_client",
-			Name:      "region_request_defer_count",
-			Help:      "The number of region requests deferred by the scheduler",
-		}, []string{"store", "reason"})
 	SubscriptionClientRegionRequestAdmitDuration = prometheus.NewHistogram(
 		prometheus.HistogramOpts{
 			Namespace: "ticdc",
@@ -217,10 +203,8 @@ func initLogPullerMetrics(registry *prometheus.Registry) {
 	registry.MustRegister(LogPullerMemoryQuota)
 	registry.MustRegister(SubscriptionClientRequestedRegionCount)
 	registry.MustRegister(SubscriptionClientWorkerPendingRegionCount)
-	registry.MustRegister(SubscriptionClientStoreDeferredRegionCount)
 	registry.MustRegister(SubscriptionClientStoreQuotaGauge)
 	registry.MustRegister(SubscriptionClientRegionRequestSendCounter)
-	registry.MustRegister(SubscriptionClientRegionRequestDeferCounter)
 	registry.MustRegister(SubscriptionClientRegionRequestAdmitDuration)
 	registry.MustRegister(SubscriptionClientAddRegionRequestDuration)
 	registry.MustRegister(RegionRequestFinishScanDuration)

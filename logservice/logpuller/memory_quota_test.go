@@ -73,7 +73,7 @@ func TestMemoryQuotaAdmissionLevels(t *testing.T) {
 	lease, ok, reason = controller.acquireScan(newTestQuotaRegion(warmingSpan), currentTs)
 	require.False(t, ok)
 	require.Nil(t, lease)
-	require.Equal(t, deferReasonMemoryWarming, reason)
+	require.Equal(t, blockReasonMemoryWarming, reason)
 	lease, ok, reason = controller.acquireScan(newTestQuotaRegion(normalSpan), normalCurrentTs)
 	require.True(t, ok)
 	require.Empty(t, reason)
@@ -84,7 +84,7 @@ func TestMemoryQuotaAdmissionLevels(t *testing.T) {
 	lease, ok, reason = controller.acquireScan(newTestQuotaRegion(normalSpan), normalCurrentTs)
 	require.False(t, ok)
 	require.Nil(t, lease)
-	require.Equal(t, deferReasonMemoryFreeze, reason)
+	require.Equal(t, blockReasonMemoryFreeze, reason)
 
 	hardLease.Release()
 	_, _, level := controller.Snapshot()
@@ -108,7 +108,7 @@ func TestHighLagScanBlockedByMemoryGate(t *testing.T) {
 	scanLease, ok, reason := controller.acquireScan(region, currentTs)
 	require.False(t, ok)
 	require.Nil(t, scanLease)
-	require.Equal(t, deferReasonMemoryWarming, reason)
+	require.Equal(t, blockReasonMemoryWarming, reason)
 }
 
 func TestRemoveSubscriptionReleasesOnlyItsOutstandingMemory(t *testing.T) {
@@ -141,7 +141,6 @@ func TestRemoveSubscriptionReleasesOnlyItsOutstandingMemory(t *testing.T) {
 
 func TestTrackEventBlocksAtHardLimit(t *testing.T) {
 	controller := newMemoryQuotaController(100, 0)
-	controller.hardLimitRatio = 2
 	span := newTestQuotaSpan(1, common.NewChangeFeedIDWithName("cf", common.DefaultKeyspaceName))
 	controller.addSubscription(span)
 
@@ -188,7 +187,7 @@ func TestWarmingScanBudgetLimitsOutstandingScans(t *testing.T) {
 	lease3, ok, reason := controller.acquireScan(newTestQuotaRegion(warmingSpan), currentTs)
 	require.False(t, ok)
 	require.Nil(t, lease3)
-	require.Equal(t, deferReasonMemoryWarming, reason)
+	require.Equal(t, blockReasonMemoryWarming, reason)
 
 	lease1.Release()
 	lease3, ok, reason = controller.acquireScan(newTestQuotaRegion(warmingSpan), currentTs)
@@ -215,13 +214,13 @@ func TestInitializedSubscriptionBypassesWarmingScanBudget(t *testing.T) {
 	scanLease, ok, reason := controller.acquireScan(newTestQuotaRegion(warmingSpan), warmingCurrentTs)
 	require.False(t, ok)
 	require.Nil(t, scanLease)
-	require.Equal(t, deferReasonMemoryWarming, reason)
+	require.Equal(t, blockReasonMemoryWarming, reason)
 
 	scanLease, ok, reason = controller.acquireScan(newTestQuotaRegion(normalSpan), normalCurrentTs)
 	require.True(t, ok)
 	require.Empty(t, reason)
 	require.NotNil(t, scanLease)
-	scanUsed, warmingScanUsed, _, _, _ := controller.ScanSnapshot()
+	scanUsed, warmingScanUsed, _, _ := controller.ScanSnapshot()
 	require.Equal(t, controller.estimateScanSizeLocked(newTestQuotaRegion(normalSpan), normalCurrentTs), scanUsed)
 	require.Equal(t, uint64(0), warmingScanUsed)
 	scanLease.Release()
@@ -241,7 +240,7 @@ func TestLowLagUninitializedSubscriptionBypassesWarmingGate(t *testing.T) {
 	require.True(t, ok)
 	require.Empty(t, reason)
 	require.NotNil(t, scanLease)
-	scanUsed, warmingScanUsed, _, _, _ := controller.ScanSnapshot()
+	scanUsed, warmingScanUsed, _, _ := controller.ScanSnapshot()
 	require.Greater(t, scanUsed, uint64(0))
 	require.Equal(t, uint64(0), warmingScanUsed)
 	scanLease.Release()
@@ -259,7 +258,7 @@ func TestInitializedSubscriptionBlockedByMemoryFreeze(t *testing.T) {
 	scanLease, ok, reason := controller.acquireScan(newTestQuotaRegion(normalSpan), 0)
 	require.False(t, ok)
 	require.Nil(t, scanLease)
-	require.Equal(t, deferReasonMemoryFreeze, reason)
+	require.Equal(t, blockReasonMemoryFreeze, reason)
 }
 
 func TestWarmingScanBudgetKeepsAdmissionWideEnough(t *testing.T) {
@@ -268,8 +267,8 @@ func TestWarmingScanBudgetKeepsAdmissionWideEnough(t *testing.T) {
 	controller.addSubscription(warmingSpan)
 	currentTs := setTestQuotaSpanLag(warmingSpan, defaultWarmingScanLagThreshold+time.Minute)
 	region := newTestQuotaRegion(warmingSpan)
-	_, _, warmingScanBudget, scanEstimate, _ := controller.ScanSnapshot()
-	require.Equal(t, defaultScanBaseSize, scanEstimate)
+	_, _, warmingScanBudget, _ := controller.ScanSnapshot()
+	require.Equal(t, defaultScanBaseSize, controller.scanEstimate)
 	scanSize := controller.estimateScanSizeLocked(region, currentTs)
 	allowedScans := int(warmingScanBudget / scanSize)
 	require.GreaterOrEqual(t, allowedScans, 17)
@@ -284,7 +283,7 @@ func TestWarmingScanBudgetKeepsAdmissionWideEnough(t *testing.T) {
 	lease, ok, reason := controller.acquireScan(region, currentTs)
 	require.False(t, ok)
 	require.Nil(t, lease)
-	require.Equal(t, deferReasonMemoryWarming, reason)
+	require.Equal(t, blockReasonMemoryWarming, reason)
 
 	for _, lease := range leases {
 		lease.Release()

@@ -22,7 +22,6 @@ import (
 
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/pkg/metrics"
-	"github.com/pingcap/ticdc/utils/chann"
 	"github.com/pingcap/ticdc/utils/priorityqueue"
 	kvclientv2 "github.com/tikv/client-go/v2/kv"
 	"github.com/tikv/client-go/v2/tikv"
@@ -31,11 +30,8 @@ import (
 )
 
 const (
-	deferReasonStorePending  = "store_pending"
-	deferReasonStoreQuota    = "store_quota"
-	deferReasonWorkerCache   = "worker_cache"
-	deferReasonMemoryWarming = "memory_warming"
-	deferReasonMemoryFreeze  = "memory_freeze"
+	blockReasonMemoryWarming = "memory_warming"
+	blockReasonMemoryFreeze  = "memory_freeze"
 )
 
 // regionRequestScheduler owns region request admission from the global
@@ -54,12 +50,8 @@ type regionRequestScheduler struct {
 	// multiple tasks have the same priority.
 	seq atomic.Uint64
 
-	// schedulerNotify wakes Run to re-check queue or storeAvailable.
+	// schedulerNotify wakes Run to re-check the current task or queue.
 	schedulerNotify chan struct{}
-	// storeAvailable is an unbounded ready-store queue. A store is pushed here
-	// when its quota is released, so deferred tasks for that store can be
-	// retried without scanning all stores or dropping notifications.
-	storeAvailable *chann.UnlimitedChannel[*requestedStore, any]
 
 	// stores maps TiKV store address to its scheduler-local state.
 	stores sync.Map
@@ -74,12 +66,10 @@ func newRegionRequestScheduler(client *subscriptionClient) *regionRequestSchedul
 		memoryQuota:     client.memoryQuota,
 		queue:           priorityqueue.New[*regionPriorityTask](),
 		schedulerNotify: make(chan struct{}, 1),
-		storeAvailable:  chann.NewUnlimitedChannelDefault[*requestedStore](),
 	}
 }
 
-// Run admits region tasks from two sources: new tasks from the global priority
-// queue, and deferred tasks from stores whose quota has become available.
+// Run admits region tasks from the global priority queue.
 func (s *regionRequestScheduler) Run(ctx context.Context, eg *errgroup.Group) error {
 	// Store creation is serialized by the single scheduler loop.
 	getStore := func(storeAddr string) *requestedStore {
@@ -100,20 +90,6 @@ func (s *regionRequestScheduler) Run(ctx context.Context, eg *errgroup.Group) er
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-		}
-
-		// Run is the only consumer of storeAvailable, so Len > 0 means this
-		// GetWithContext will not block.
-		if s.storeAvailable.Len() > 0 {
-			store, ok, err := s.storeAvailable.GetWithContext(context.Background())
-			if err != nil || !ok {
-				continue
-			}
-			store.MarkAvailableDequeued()
-			if err := s.handleDeferredTasks(ctx, store); err != nil {
-				return err
-			}
-			continue
 		}
 
 		regionTask, ok := s.queue.TryPop()
@@ -157,8 +133,6 @@ func (s *regionRequestScheduler) UpdateMetrics() {
 	s.stores.Range(func(_, value any) bool {
 		store := value.(*requestedStore)
 		quotaUsed, quotaCapacity := store.quota.Snapshot()
-		metrics.SubscriptionClientStoreDeferredRegionCount.WithLabelValues(store.storeAddr).
-			Set(float64(store.PendingTaskCount()))
 		metrics.SubscriptionClientStoreQuotaGauge.WithLabelValues(store.storeAddr, "used").
 			Set(float64(quotaUsed))
 		metrics.SubscriptionClientStoreQuotaGauge.WithLabelValues(store.storeAddr, "capacity").
@@ -188,10 +162,6 @@ func (s *regionRequestScheduler) Close() {
 }
 
 func (s *regionRequestScheduler) NotifyAvailable() {
-	s.stores.Range(func(_, value any) bool {
-		value.(*requestedStore).NotifyAvailable()
-		return true
-	})
 	s.notifyScheduler()
 }
 
@@ -221,80 +191,30 @@ func (s *regionRequestScheduler) attachRPCContextForRegion(ctx context.Context, 
 
 type getRequestedStoreFunc func(storeAddr string) *requestedStore
 
-func (s *regionRequestScheduler) handleDeferredTasks(ctx context.Context, store *requestedStore) error {
-	for {
-		task, ok := store.TryPopPendingTask()
-		if !ok {
-			return nil
-		}
-
-		region, ok := s.attachRPCContextForRegion(ctx, task.GetRegionInfo())
-		if !ok {
-			continue
-		}
-		task.regionInfo = region
-
-		if region.rpcCtx.Addr != store.storeAddr {
-			s.failureHandler.Report(newRegionErrorInfo(region, &rpcCtxChangedError{
-				verID: region.verID,
-				from:  store.storeAddr,
-				to:    region.rpcCtx.Addr,
-			}))
-			continue
-		}
-
-		ok, reason, err := s.tryAdmitTask(ctx, store, task, region)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			s.observeDeferredTask(store, reason)
-			if reason == deferReasonMemoryWarming || reason == deferReasonMemoryFreeze {
-				if s.queue.Push(task) {
-					s.notifyScheduler()
-				}
-				return nil
-			}
-			store.PushPendingTask(task)
-			return nil
-		}
-	}
-}
-
 func (s *regionRequestScheduler) handleNewTask(
 	ctx context.Context,
 	getStore getRequestedStoreFunc,
 	task *regionPriorityTask,
 ) error {
-	region, ok := s.attachRPCContextForRegion(ctx, task.GetRegionInfo())
-	if !ok {
-		return nil
-	}
-	task.regionInfo = region
-
-	store := getStore(region.rpcCtx.Addr)
-	if store.PendingTaskCount() > 0 {
-		store.PushPendingTask(task)
-		store.NotifyAvailable()
-		s.observeDeferredTask(store, deferReasonStorePending)
-		return nil
-	}
-
-	ok, reason, err := s.tryAdmitTask(ctx, store, task, region)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		s.observeDeferredTask(store, reason)
-		if reason == deferReasonMemoryWarming || reason == deferReasonMemoryFreeze {
-			if s.queue.Push(task) {
-				s.notifyScheduler()
-			}
+	for {
+		region, ok := s.attachRPCContextForRegion(ctx, task.GetRegionInfo())
+		if !ok {
 			return nil
 		}
-		store.PushPendingTask(task)
+		task.regionInfo = region
+
+		store := getStore(region.rpcCtx.Addr)
+		ok, err := s.tryAdmitTask(ctx, store, task, region)
+		if err != nil {
+			return err
+		}
+		if ok {
+			return nil
+		}
+		if err := s.waitAvailable(ctx); err != nil {
+			return err
+		}
 	}
-	return nil
 }
 
 func (s *regionRequestScheduler) tryAdmitTask(
@@ -302,13 +222,13 @@ func (s *regionRequestScheduler) tryAdmitTask(
 	store *requestedStore,
 	task *regionPriorityTask,
 	region regionInfo,
-) (bool, string, error) {
+) (bool, error) {
 	force := task.Priority() <= forcedPriorityBase
 	var scanQuota *memoryQuotaLease
 	currentTs := s.upstream.pdClock.CurrentTS()
-	quota, ok, reason := s.memoryQuota.acquireScan(region, currentTs)
+	quota, ok, _ := s.memoryQuota.acquireScan(region, currentTs)
 	if !ok {
-		return false, reason, nil
+		return false, nil
 	}
 	scanQuota = quota
 	acquiredQuota, ok := store.quota.TryAcquire()
@@ -316,7 +236,7 @@ func (s *regionRequestScheduler) tryAdmitTask(
 		if scanQuota != nil {
 			scanQuota.Release()
 		}
-		return false, deferReasonStoreQuota, nil
+		return false, nil
 	}
 	ok, worker, err := store.AddRegion(ctx, region, force, acquiredQuota, scanQuota)
 	if err != nil {
@@ -328,14 +248,14 @@ func (s *regionRequestScheduler) tryAdmitTask(
 			zap.Uint64("subscriptionID", uint64(region.subscribedSpan.subID)),
 			zap.Uint64("regionID", region.verID.GetID()),
 			zap.Error(err))
-		return false, "", err
+		return false, err
 	}
 	if !ok {
 		acquiredQuota.Release()
 		if scanQuota != nil {
 			scanQuota.Release()
 		}
-		return false, deferReasonWorkerCache, nil
+		return false, nil
 	}
 
 	metrics.SubscriptionClientRegionRequestAdmitDuration.Observe(time.Since(task.createTime).Seconds())
@@ -344,12 +264,14 @@ func (s *regionRequestScheduler) tryAdmitTask(
 		zap.Uint64("subscriptionID", uint64(region.subscribedSpan.subID)),
 		zap.Uint64("regionID", region.verID.GetID()),
 		zap.String("addr", store.storeAddr))
-	return true, "", nil
+	return true, nil
 }
 
-func (s *regionRequestScheduler) observeDeferredTask(store *requestedStore, reason string) {
-	if reason == "" {
-		return
+func (s *regionRequestScheduler) waitAvailable(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.schedulerNotify:
+		return nil
 	}
-	metrics.SubscriptionClientRegionRequestDeferCounter.WithLabelValues(store.storeAddr, reason).Inc()
 }

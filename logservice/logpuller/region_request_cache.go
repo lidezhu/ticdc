@@ -96,8 +96,7 @@ type requestCache struct {
 	// spaceAvailable wakes add() when a live request leaves requests.
 	spaceAvailable chan struct{}
 
-	// onSpaceAvailable lets the store-level deferred scheduler retry a task when
-	// this worker frees request capacity.
+	// onSpaceAvailable wakes the scheduler when this worker frees request capacity.
 	onSpaceAvailable func()
 }
 

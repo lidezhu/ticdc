@@ -31,7 +31,7 @@ const (
 	defaultResumeWarmingRatio = 0.1
 	defaultFreezeAllRatio     = 0.9
 	defaultResumeAllRatio     = 0.7
-	defaultHardLimitRatio     = 5.0
+	defaultHardLimitRatio     = 2.0
 
 	defaultScanBaseSize            uint64 = 8 * 1024 * 1024
 	defaultWarmingScanLagThreshold        = 30 * time.Minute
@@ -175,12 +175,11 @@ func (c *memoryQuotaController) ScanSnapshot() (
 	scanUsed uint64,
 	warmingScanUsed uint64,
 	warmingScanBudget uint64,
-	scanEstimate uint64,
 	hardLimit uint64,
 ) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.scanUsed, c.warmingScanUsed, c.warmingScanBudgetLocked(), c.scanEstimate, c.hardLimitLocked()
+	return c.scanUsed, c.warmingScanUsed, c.warmingScanBudgetLocked(), c.hardLimitLocked()
 }
 
 func (c *memoryQuotaController) addSubscription(span *subscribedSpan) {
@@ -229,13 +228,13 @@ func (c *memoryQuotaController) acquireScan(region regionInfo, currentTs uint64)
 	c.refreshLevelLocked()
 	if c.level == admissionFreezeAllNewScans {
 		c.mu.Unlock()
-		return nil, false, deferReasonMemoryFreeze
+		return nil, false, blockReasonMemoryFreeze
 	}
 	bytes := c.estimateScanSizeLocked(region, currentTs)
 	warming := isWarmingScan(region, currentTs)
 	if c.isWarmingScanBlockedLocked(warming, bytes) {
 		c.mu.Unlock()
-		return nil, false, deferReasonMemoryWarming
+		return nil, false, blockReasonMemoryWarming
 	}
 
 	state := c.getSubscriptionStateLocked(span)
