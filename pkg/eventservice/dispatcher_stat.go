@@ -272,6 +272,7 @@ func (a *dispatcherStat) getCurrentScanLimitInBytes() int64 {
 		}
 		a.currentScanLimitInBytes.Store(newLimit)
 		a.lastUpdateScanLimitTime.Store(time.Now())
+		return newLimit
 	}
 	return res
 }

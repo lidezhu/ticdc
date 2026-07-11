@@ -119,6 +119,58 @@ func TestGetOrSetChangefeedStatusInitializesFilter(t *testing.T) {
 	require.Same(t, status.filter, reused.filter)
 }
 
+func TestAdmitScanChecksDispatcherQuotaBeforeReservingChangefeedQuota(t *testing.T) {
+	broker, _, _, _ := newEventBrokerForTest()
+	broker.close()
+
+	info := newMockDispatcherInfoForTest(t)
+	status := broker.getOrSetChangefeedStatus(info)
+	dispatcher := newDispatcherStat(info, 1, 1, nil, status)
+	remoteID := node.ID(info.GetServerID())
+	changefeedQuota := atomic.NewUint64(minScanLimitInBytes)
+	status.availableMemoryQuota.Store(remoteID, changefeedQuota)
+	dispatcher.availableMemoryQuota.Store(minScanLimitInBytes - 1)
+
+	_, admitted := broker.admitScan(dispatcher, remoteID)
+	require.False(t, admitted)
+	require.Equal(t, uint64(minScanLimitInBytes), changefeedQuota.Load())
+}
+
+func TestScanAdmissionReleasesOnlyUnusedQuota(t *testing.T) {
+	quota := atomic.NewUint64(1024)
+	admission := scanAdmission{quota: quota, reserved: 1024}
+
+	admission.releaseUnused(-1)
+	require.Equal(t, uint64(2048), quota.Load())
+
+	quota.Store(1024)
+	admission.releaseUnused(256)
+	require.Equal(t, uint64(1792), quota.Load())
+
+	quota.Store(1024)
+	admission.releaseUnused(1024)
+	require.Equal(t, uint64(1024), quota.Load())
+
+	quota.Store(1024)
+	admission.releaseUnused(2048)
+	require.Equal(t, uint64(1024), quota.Load())
+
+	quota.Store(1024)
+	admission.releaseAll()
+	require.Equal(t, uint64(2048), quota.Load())
+}
+
+func TestGetCurrentScanLimitInBytesReturnsUpdatedLimit(t *testing.T) {
+	broker, _, _, _ := newEventBrokerForTest()
+	defer broker.close()
+
+	info := newMockDispatcherInfoForTest(t)
+	dispatcher := newDispatcherStat(info, 1, 1, nil, broker.getOrSetChangefeedStatus(info))
+	dispatcher.lastUpdateScanLimitTime.Store(time.Now().Add(-updateScanLimitInterval - time.Millisecond))
+
+	require.Equal(t, int64(minScanLimitInBytes*2), dispatcher.getCurrentScanLimitInBytes())
+}
+
 func TestOnNotify(t *testing.T) {
 	broker, _, ss, _ := newEventBrokerForTest()
 	// Close the broker, so we can catch all message in the test.
