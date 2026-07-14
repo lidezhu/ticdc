@@ -19,6 +19,7 @@ import (
 
 	"github.com/pingcap/ticdc/pkg/common"
 	"github.com/pingcap/ticdc/pkg/errors"
+	"go.uber.org/multierr"
 )
 
 type largeTxnScanPhase int
@@ -41,9 +42,13 @@ type largeTxnScanState struct {
 	hasFollowingTxn   bool
 	followingCommitTs uint64
 
-	spill   *largeTxnInsertSpill
-	reader  *largeTxnInsertSpillReader
-	cleaned bool
+	spill  *largeTxnInsertSpill
+	reader *largeTxnInsertSpillReader
+	// drainedInsertCount is the number of insert rows returned by completed
+	// drain scans. It lets an errored drain reopen the reader and retry only the
+	// rows from the current scan attempt.
+	drainedInsertCount int
+	cleaned            bool
 }
 
 func (a *dispatcherStat) getOrCreateLargeTxnState(
@@ -59,7 +64,7 @@ func (a *dispatcherStat) getOrCreateLargeTxnState(
 	if a.largeTxnState != nil {
 		state := a.largeTxnState
 		if state.startTs != startTs || state.commitTs != commitTs || state.tableID != tableID {
-			return nil, errors.Errorf(
+			return nil, errors.ErrSpillFileOp.GenWithStackByArgs(
 				"large txn spill state mismatch, existing start-ts: %d, commit-ts: %d, table-id: %d, new start-ts: %d, commit-ts: %d, table-id: %d",
 				state.startTs, state.commitTs, state.tableID, startTs, commitTs, tableID)
 		}
@@ -125,10 +130,10 @@ func (s *largeTxnScanState) appendInsert(entry *common.RawKVEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.cleaned {
-		return errors.New("large txn state has been cleaned up")
+		return errors.ErrSpillFileOp.GenWithStackByArgs("large txn state has been cleaned up")
 	}
 	if s.phase != largeTxnScanPhaseOriginal {
-		return errors.New("large txn spill is no longer accepting original txn rows")
+		return errors.ErrSpillFileOp.GenWithStackByArgs("large txn spill is no longer accepting original txn rows")
 	}
 	return s.spill.Append(entry)
 }
@@ -137,12 +142,19 @@ func (s *largeTxnScanState) nextInsert() (*common.RawKVEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.cleaned {
-		return nil, errors.New("large txn state has been cleaned up")
+		return nil, errors.ErrSpillFileOp.GenWithStackByArgs("large txn state has been cleaned up")
 	}
 	if s.reader == nil {
 		reader, err := s.spill.NewReader()
 		if err != nil {
 			return nil, err
+		}
+		for range s.drainedInsertCount {
+			if _, err := reader.Next(); err != nil {
+				_ = reader.Close()
+				return nil, errors.WrapError(
+					errors.ErrSpillFileOp, err, "seek committed spill rows")
+			}
 		}
 		s.reader = reader
 	}
@@ -155,6 +167,23 @@ func (s *largeTxnScanState) nextInsert() (*common.RawKVEntry, error) {
 		return nil, err
 	}
 	return entry, nil
+}
+
+func (s *largeTxnScanState) commitDrainedInserts(count int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.drainedInsertCount += count
+}
+
+func (s *largeTxnScanState) rollbackDrain() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reader == nil {
+		return nil
+	}
+	err := s.reader.Close()
+	s.reader = nil
+	return err
 }
 
 func (s *largeTxnScanState) markDrainInserts(hasFollowingTxn bool, followingCommitTs uint64) {
@@ -193,8 +222,11 @@ func (s *largeTxnScanState) cleanup() error {
 		s.reader = nil
 	}
 	cleanupErr := s.spill.Cleanup()
-	if closeErr != nil {
+	if closeErr == nil {
+		return cleanupErr
+	}
+	if cleanupErr == nil {
 		return closeErr
 	}
-	return cleanupErr
+	return multierr.Append(closeErr, cleanupErr)
 }

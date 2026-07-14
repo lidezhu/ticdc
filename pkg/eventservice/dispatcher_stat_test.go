@@ -21,8 +21,6 @@ import (
 	"github.com/pingcap/ticdc/eventpb"
 	"github.com/pingcap/ticdc/pkg/common"
 	pevent "github.com/pingcap/ticdc/pkg/common/event"
-	"github.com/pingcap/ticdc/pkg/metrics"
-	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 	"github.com/tikv/client-go/v2/oracle"
 )
@@ -79,46 +77,6 @@ func TestDispatcherStatResolvedTs(t *testing.T) {
 	require.False(t, updated)
 }
 
-func TestDispatcherStatBigTxnMetricsCountSplitTxnOnce(t *testing.T) {
-	beforeHistogramCount, beforeHistogramSum := readBigTxnSizeMetric(t)
-	beforeCounter := readBigTxnCountMetric(t)
-
-	stat := &dispatcherStat{}
-	stat.addBigTxnMetricFragment(100, 200, 70, 50)
-
-	histogramCount, histogramSum := readBigTxnSizeMetric(t)
-	require.Equal(t, beforeHistogramCount, histogramCount)
-	require.Equal(t, beforeHistogramSum, histogramSum)
-	require.Equal(t, beforeCounter, readBigTxnCountMetric(t))
-
-	stat.finishBigTxnMetric(100, 200, 30, 50)
-
-	histogramCount, histogramSum = readBigTxnSizeMetric(t)
-	require.Equal(t, beforeHistogramCount+1, histogramCount)
-	require.Equal(t, beforeHistogramSum+100, histogramSum)
-	require.Equal(t, beforeCounter+1, readBigTxnCountMetric(t))
-}
-
-func readBigTxnSizeMetric(t *testing.T) (uint64, float64) {
-	t.Helper()
-
-	metric := &dto.Metric{}
-	require.NoError(t, metrics.EventServiceBigTxnSize.Write(metric))
-	histogram := metric.GetHistogram()
-	require.NotNil(t, histogram)
-	return histogram.GetSampleCount(), histogram.GetSampleSum()
-}
-
-func readBigTxnCountMetric(t *testing.T) float64 {
-	t.Helper()
-
-	metric := &dto.Metric{}
-	require.NoError(t, metrics.EventServiceBigTxnCount.Write(metric))
-	counter := metric.GetCounter()
-	require.NotNil(t, counter)
-	return counter.GetValue()
-}
-
 func TestDispatcherStatGetDataRange(t *testing.T) {
 	t.Parallel()
 
@@ -171,6 +129,28 @@ func TestDispatcherStatGetDataRange(t *testing.T) {
 	stat.updateSentResolvedTs(300)
 	r, ok = stat.getDataRange()
 	require.False(t, ok)
+}
+
+func TestDispatcherStatScanProgressIsImmutable(t *testing.T) {
+	t.Parallel()
+
+	info := newMockDispatcherInfo(t, 100, common.NewDispatcherID(), 1, eventpb.ActionType_ACTION_TYPE_REGISTER)
+	status := newChangefeedStatusForTest(t, info)
+	stat := newDispatcherStat(info, 1, 1, nil, status)
+	stat.onResolvedTs(200)
+
+	position := common.ScanPosition{1, 2, 3}
+	stat.updateScanRangeWithPosition(150, 140, position)
+	position[0] = 9
+
+	dataRange, ok := stat.getDataRange()
+	require.True(t, ok)
+	require.Equal(t, common.ScanPosition{1, 2, 3}, dataRange.RowLevelScanPosition)
+	dataRange.RowLevelScanPosition[1] = 9
+
+	dataRange, ok = stat.getDataRange()
+	require.True(t, ok)
+	require.Equal(t, common.ScanPosition{1, 2, 3}, dataRange.RowLevelScanPosition)
 }
 
 func TestDispatcherStatUpdateWatermark(t *testing.T) {

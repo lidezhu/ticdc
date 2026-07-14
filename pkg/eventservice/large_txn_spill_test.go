@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	"github.com/pingcap/ticdc/pkg/common"
+	"github.com/pingcap/ticdc/pkg/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -66,7 +67,7 @@ func TestLargeTxnInsertSpillCreatesDir(t *testing.T) {
 	}()
 
 	require.DirExists(t, dir)
-	require.Equal(t, dir, filepath.Dir(spill.path))
+	require.Equal(t, dir, filepath.Dir(spill.file.Path()))
 }
 
 func TestLargeTxnInsertSpillCleanup(t *testing.T) {
@@ -74,7 +75,7 @@ func TestLargeTxnInsertSpillCleanup(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, spill.Append(newTestSpillRawKVEntry(1)))
 
-	path := spill.path
+	path := spill.file.Path()
 	require.NoError(t, spill.Cleanup())
 	require.NoError(t, spill.Cleanup())
 
@@ -102,6 +103,40 @@ func TestLargeTxnInsertSpillEmpty(t *testing.T) {
 	entry, err := reader.Next()
 	require.ErrorIs(t, err, io.EOF)
 	require.Nil(t, entry)
+}
+
+func TestLargeTxnInsertSpillValidationErrors(t *testing.T) {
+	spill, err := newLargeTxnInsertSpill("")
+	require.True(t, errors.ErrSpillFileOp.Equal(err))
+	require.Nil(t, spill)
+
+	spill, err = newLargeTxnInsertSpill(t.TempDir())
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, spill.Cleanup())
+	}()
+	require.True(t, errors.ErrSpillFileOp.Equal(spill.Append(nil)))
+}
+
+func TestCleanupLargeTxnInsertSpillFiles(t *testing.T) {
+	dir := t.TempDir()
+	orphanPaths := []string{
+		filepath.Join(dir, "eventservice-large-txn-insert-1.spill"),
+		filepath.Join(dir, "eventservice-large-txn-insert-2.spill"),
+	}
+	for _, path := range orphanPaths {
+		require.NoError(t, os.WriteFile(path, []byte("orphan"), 0o600))
+	}
+	keepPath := filepath.Join(dir, "unrelated.spill")
+	require.NoError(t, os.WriteFile(keepPath, []byte("keep"), 0o600))
+
+	removed, err := cleanupLargeTxnInsertSpillFiles(dir)
+	require.NoError(t, err)
+	require.Equal(t, len(orphanPaths), removed)
+	for _, path := range orphanPaths {
+		require.NoFileExists(t, path)
+	}
+	require.FileExists(t, keepPath)
 }
 
 func newTestSpillRawKVEntry(index int) *common.RawKVEntry {

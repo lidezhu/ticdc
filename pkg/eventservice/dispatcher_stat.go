@@ -104,17 +104,14 @@ type dispatcherStat struct {
 	// Note: Please don't changed this value directly, use updateSentResolvedTs instead.
 	sentResolvedTs atomic.Uint64
 
-	// The last scanned DML event start-ts.
-	// These two values are used to construct the scan range for the next scan task.
-	lastScannedCommitTs atomic.Uint64
-	lastScannedStartTs  atomic.Uint64
-	lastScannedPosition atomic.Value
+	// scanProgress is replaced atomically so getDataRange never observes a
+	// commit-ts, start-ts, and row position from different scan fragments.
+	scanProgress atomic.Pointer[dispatcherScanProgress]
 
 	largeTxnStateMu sync.Mutex
 	largeTxnState   *largeTxnScanState
 
-	// bigTxnMetricState is updated only by the serialized scan task of this dispatcher.
-	bigTxnMetricState *bigTxnMetricState
+	txnSizeMetrics txnSizeMetricRecorder
 
 	// isRemoved is used to indicate whether the dispatcher is removed.
 	// it is set to true in the following two cases:
@@ -174,8 +171,7 @@ func newDispatcherStat(
 
 	dispStat.sentResolvedTs.Store(startTs)
 
-	dispStat.lastScannedCommitTs.Store(startTs)
-	dispStat.lastScannedStartTs.Store(0)
+	dispStat.scanProgress.Store(&dispatcherScanProgress{commitTs: startTs})
 	dispStat.lastReadySendTime.Store(0)
 	dispStat.readyInterval.Store(1)
 	dispStat.resetScanLimit()
@@ -226,97 +222,40 @@ func (a *dispatcherStat) updateScanRangeWithPosition(
 	txnStartTs uint64,
 	position common.ScanPosition,
 ) {
-	a.lastScannedCommitTs.Store(txnCommitTs)
-	a.lastScannedStartTs.Store(txnStartTs)
-	a.storeLastScannedPosition(position)
+	a.scanProgress.Store(newDispatcherScanProgress(txnCommitTs, txnStartTs, position))
 }
 
-func (a *dispatcherStat) storeLastScannedPosition(position common.ScanPosition) {
-	if len(position) == 0 {
-		a.lastScannedPosition.Store(common.ScanPosition{})
-		return
-	}
-	// ScanPosition is produced as an immutable snapshot by the scanner path.
-	a.lastScannedPosition.Store(position)
+type dispatcherScanProgress struct {
+	commitTs uint64
+	startTs  uint64
+	position common.ScanPosition
 }
 
-func (a *dispatcherStat) getLastScannedPosition() common.ScanPosition {
-	value := a.lastScannedPosition.Load()
-	if value == nil {
-		return nil
-	}
-	position := value.(common.ScanPosition)
-	if len(position) == 0 {
-		return nil
-	}
-	return position
-}
-
-type bigTxnMetricState struct {
-	startTs                  uint64
-	commitTs                 uint64
-	rawKVBytes               int64
-	largeTxnThresholdInBytes int64
-}
-
-func (a *dispatcherStat) addBigTxnMetricFragment(
-	startTs uint64,
+func newDispatcherScanProgress(
 	commitTs uint64,
-	rawKVBytes int64,
-	largeTxnThresholdInBytes int64,
-) {
-	if rawKVBytes <= largeTxnThresholdInBytes {
-		return
-	}
-	if a.bigTxnMetricState == nil ||
-		a.bigTxnMetricState.startTs != startTs ||
-		a.bigTxnMetricState.commitTs != commitTs {
-		a.bigTxnMetricState = &bigTxnMetricState{
-			startTs:                  startTs,
-			commitTs:                 commitTs,
-			largeTxnThresholdInBytes: largeTxnThresholdInBytes,
-		}
-	}
-	a.bigTxnMetricState.rawKVBytes += rawKVBytes
-}
-
-func (a *dispatcherStat) finishBigTxnMetric(
 	startTs uint64,
-	commitTs uint64,
-	rawKVBytes int64,
-	largeTxnThresholdInBytes int64,
-) {
-	totalRawKVBytes := rawKVBytes
-	if a.bigTxnMetricState != nil {
-		if a.bigTxnMetricState.startTs == startTs && a.bigTxnMetricState.commitTs == commitTs {
-			totalRawKVBytes += a.bigTxnMetricState.rawKVBytes
-		} else if a.bigTxnMetricState.rawKVBytes > a.bigTxnMetricState.largeTxnThresholdInBytes {
-			updateMetricEventServiceBigTxn(a.bigTxnMetricState.rawKVBytes)
-		}
-		a.bigTxnMetricState = nil
+	position common.ScanPosition,
+) *dispatcherScanProgress {
+	progress := &dispatcherScanProgress{
+		commitTs: commitTs,
+		startTs:  startTs,
 	}
-	if totalRawKVBytes > largeTxnThresholdInBytes {
-		updateMetricEventServiceBigTxn(totalRawKVBytes)
+	if len(position) != 0 {
+		progress.position = append(common.ScanPosition(nil), position...)
 	}
+	return progress
 }
 
-func (a *dispatcherStat) finishPendingBigTxnMetric() {
-	if a.bigTxnMetricState == nil {
-		return
+func (a *dispatcherStat) getScanProgress() dispatcherScanProgress {
+	progress := a.scanProgress.Load()
+	if progress == nil {
+		return dispatcherScanProgress{}
 	}
-	state := a.bigTxnMetricState
-	a.bigTxnMetricState = nil
-	if state.rawKVBytes > state.largeTxnThresholdInBytes {
-		updateMetricEventServiceBigTxn(state.rawKVBytes)
+	return dispatcherScanProgress{
+		commitTs: progress.commitTs,
+		startTs:  progress.startTs,
+		position: append(common.ScanPosition(nil), progress.position...),
 	}
-}
-
-func (a *dispatcherStat) finishPendingBigTxnMetricBefore(startTs uint64, commitTs uint64) {
-	if a.bigTxnMetricState == nil ||
-		(a.bigTxnMetricState.startTs == startTs && a.bigTxnMetricState.commitTs == commitTs) {
-		return
-	}
-	a.finishPendingBigTxnMetric()
 }
 
 // onResolvedTs try to update the resolved ts of the dispatcher.
@@ -341,28 +280,26 @@ func (a *dispatcherStat) onLatestCommitTs(latestCommitTs uint64) bool {
 
 // getDataRange returns the data range that the dispatcher needs to scan.
 func (a *dispatcherStat) getDataRange() (common.DataRange, bool) {
-	lastTxnCommitTs := a.lastScannedCommitTs.Load()
-	lastTxnStartTs := a.lastScannedStartTs.Load()
-	lastPosition := a.getLastScannedPosition()
+	progress := a.getScanProgress()
 	hasPendingLargeTxn := a.hasPendingLargeTxnState()
 
 	// the data not received by the event store yet, so just skip it.
 	resolvedTs := a.receivedResolvedTs.Load()
-	if lastTxnCommitTs > resolvedTs {
+	if progress.commitTs > resolvedTs {
 		return common.DataRange{}, false
 	}
-	if lastTxnCommitTs == resolvedTs && lastTxnStartTs == 0 &&
-		len(lastPosition) == 0 && !hasPendingLargeTxn {
+	if progress.commitTs == resolvedTs && progress.startTs == 0 &&
+		len(progress.position) == 0 && !hasPendingLargeTxn {
 		return common.DataRange{}, false
 	}
 	// Range: (CommitTsStart-lastScannedStartTs, CommitTsEnd],
 	// since the CommitTsStart(and the data before startTs) is already sent to the dispatcher.
 	r := common.DataRange{
 		Span:                  a.info.GetTableSpan(),
-		CommitTsStart:         lastTxnCommitTs,
+		CommitTsStart:         progress.commitTs,
 		CommitTsEnd:           resolvedTs,
-		RowLevelScanPosition:  lastPosition,
-		LastScannedTxnStartTs: lastTxnStartTs,
+		RowLevelScanPosition:  progress.position,
+		LastScannedTxnStartTs: progress.startTs,
 	}
 	return r, true
 }

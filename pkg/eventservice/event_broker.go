@@ -278,9 +278,9 @@ func (c *eventBroker) refreshMinSentResolvedTs(ctx context.Context) error {
 }
 
 func (c *eventBroker) sendSignalResolvedTs(d *dispatcherStat) {
-	// Can't send resolvedTs if there was a interrupted scan task happened before.
-	// d.lastScannedStartTs.Load() != 0 indicates that there was a interrupted scan task happened before.
-	if time.Since(d.lastSentResolvedTsTime.Load()) < defaultSendResolvedTsInterval || d.lastScannedStartTs.Load() != 0 {
+	// A non-zero scan start-ts indicates that an interrupted scan task still has
+	// transaction data to send before resolved-ts can advance.
+	if time.Since(d.lastSentResolvedTsTime.Load()) < defaultSendResolvedTsInterval || d.getScanProgress().startTs != 0 {
 		return
 	}
 	watermark := d.sentResolvedTs.Load()
@@ -787,7 +787,6 @@ func (c *eventBroker) doScan(ctx context.Context, task scanTask) {
 			progress.rowLevelScanPosition,
 		)
 	}
-	task.info.GetMode()
 	// Update metrics
 	metricEventBrokerScanTaskCount.Inc()
 }

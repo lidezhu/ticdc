@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/pingcap/errors"
+	cerror "github.com/pingcap/ticdc/pkg/errors"
 )
 
 // DebugConfig represents config for ticdc unexposed feature configurations
@@ -48,6 +49,9 @@ func (c *DebugConfig) ValidateAndAdjust() error {
 	}
 	if err := c.Scheduler.ValidateAndAdjust(); err != nil {
 		return errors.Trace(err)
+	}
+	if err := c.EventService.Validate(); err != nil {
+		return err
 	}
 
 	return nil
@@ -134,6 +138,21 @@ type EventServiceConfig struct {
 	// TODO: Remove this config after we find a proper way to fix the OOM issue.
 	// Ref: https://github.com/pingcap/ticdc/issues/1784
 	EnableRemoteEventService bool `toml:"enable-remote-event-service" json:"enable_remote_event_service"`
+}
+
+func (c *EventServiceConfig) Validate() error {
+	if c == nil {
+		return cerror.ErrInvalidServerOption.GenWithStackByArgs("event-service config is required")
+	}
+	if c.LargeTxnThresholdInBytes <= 0 {
+		return cerror.ErrInvalidServerOption.GenWithStackByArgs(
+			"large-txn-threshold-in-bytes must be greater than 0")
+	}
+	if c.ScanLimitInBytes > 0 && c.LargeTxnThresholdInBytes > int64(c.ScanLimitInBytes) {
+		return cerror.ErrInvalidServerOption.GenWithStackByArgs(
+			"large-txn-threshold-in-bytes must not exceed scan-limit-in-bytes")
+	}
+	return nil
 }
 
 // NewDefaultEventServiceConfig return the default event service configuration
