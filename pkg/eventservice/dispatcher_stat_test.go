@@ -99,6 +99,26 @@ func TestDispatcherStatBigTxnMetricsCountSplitTxnOnce(t *testing.T) {
 	require.Equal(t, beforeCounter+1, readBigTxnCountMetric(t))
 }
 
+func TestDispatcherStatBigTxnMetricsFlushPreviousTxn(t *testing.T) {
+	beforeHistogramCount, beforeHistogramSum := readBigTxnSizeMetric(t)
+	beforeCounter := readBigTxnCountMetric(t)
+
+	stat := &dispatcherStat{}
+	stat.addBigTxnMetricFragment(100, 200, 70, 50)
+	stat.addBigTxnMetricFragment(101, 201, 80, 50)
+
+	histogramCount, histogramSum := readBigTxnSizeMetric(t)
+	require.Equal(t, beforeHistogramCount+1, histogramCount)
+	require.Equal(t, beforeHistogramSum+70, histogramSum)
+	require.Equal(t, beforeCounter+1, readBigTxnCountMetric(t))
+	require.Equal(t, &bigTxnMetricState{
+		startTs:                  101,
+		commitTs:                 201,
+		rawKVBytes:               80,
+		largeTxnThresholdInBytes: 50,
+	}, stat.bigTxnMetricState)
+}
+
 func readBigTxnSizeMetric(t *testing.T) (uint64, float64) {
 	t.Helper()
 
@@ -171,6 +191,28 @@ func TestDispatcherStatGetDataRange(t *testing.T) {
 	stat.updateSentResolvedTs(300)
 	r, ok = stat.getDataRange()
 	require.False(t, ok)
+}
+
+func TestDispatcherStatScanProgressIsImmutable(t *testing.T) {
+	t.Parallel()
+
+	info := newMockDispatcherInfo(t, 100, common.NewDispatcherID(), 1, eventpb.ActionType_ACTION_TYPE_REGISTER)
+	status := newChangefeedStatusForTest(t, info)
+	stat := newDispatcherStat(info, 1, 1, nil, status)
+	stat.onResolvedTs(200)
+
+	position := common.ScanPosition{1, 2, 3}
+	stat.updateScanRangeWithPosition(150, 140, position)
+	position[0] = 9
+
+	dataRange, ok := stat.getDataRange()
+	require.True(t, ok)
+	require.Equal(t, common.ScanPosition{1, 2, 3}, dataRange.RowLevelScanPosition)
+	dataRange.RowLevelScanPosition[1] = 9
+
+	dataRange, ok = stat.getDataRange()
+	require.True(t, ok)
+	require.Equal(t, common.ScanPosition{1, 2, 3}, dataRange.RowLevelScanPosition)
 }
 
 func TestDispatcherStatUpdateWatermark(t *testing.T) {

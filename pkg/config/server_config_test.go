@@ -149,6 +149,19 @@ func TestServerConfigValidateAndAdjust(t *testing.T) {
 	require.EqualValues(t, GetDefaultServerConfig().Debug.Messages.ServerWorkerPoolSize, conf.Debug.Messages.ServerWorkerPoolSize)
 }
 
+func TestEventServiceConfigValidate(t *testing.T) {
+	t.Parallel()
+
+	conf := NewDefaultEventServiceConfig()
+	require.NoError(t, conf.Validate())
+
+	conf.LargeTxnThresholdInBytes = 0
+	require.Error(t, conf.Validate())
+
+	conf.LargeTxnThresholdInBytes = int64(conf.ScanLimitInBytes) + 1
+	require.Error(t, conf.Validate())
+}
+
 func TestDBConfigValidateAndAdjust(t *testing.T) {
 	t.Parallel()
 	conf := GetDefaultServerConfig().Clone().Debug.DB
