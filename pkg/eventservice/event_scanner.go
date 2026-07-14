@@ -357,26 +357,16 @@ func (s *eventScanner) commitTxn(
 	processor *dmlProcessor,
 	eventCommitTs, tableInfoUpdateTs uint64,
 ) error {
-	var (
-		startTs                  uint64
-		commitTs                 uint64
-		rawKVBytes               int64
-		largeTxnThresholdInBytes int64
-		hasCurrentTxn            bool
-	)
+	var txnSize *txnSizeSample
 	if processor.currentTxn != nil {
-		currentTxn := processor.currentTxn
-		startTs = currentTxn.CurrentDMLEvent.GetStartTs()
-		commitTs = currentTxn.CurrentDMLEvent.GetCommitTs()
-		rawKVBytes = currentTxn.rawKVBytes
-		largeTxnThresholdInBytes = currentTxn.largeTxnThresholdInBytes
-		hasCurrentTxn = true
+		sample := txnSizeSampleFromTxn(processor.currentTxn)
+		txnSize = &sample
 	}
 	if err := processor.commitTxn(); err != nil {
 		return err
 	}
-	if hasCurrentTxn {
-		session.dispatcherStat.finishBigTxnMetric(startTs, commitTs, rawKVBytes, largeTxnThresholdInBytes)
+	if txnSize != nil {
+		session.dispatcherStat.txnSizeMetrics.complete(*txnSize)
 	}
 	currentBatchDML := processor.getCurrentBatchDML()
 
@@ -406,26 +396,16 @@ func finalizeScan(
 	sess *scanSession,
 	endTs uint64,
 ) error {
-	var (
-		startTs                  uint64
-		commitTs                 uint64
-		rawKVBytes               int64
-		largeTxnThresholdInBytes int64
-		hasCurrentTxn            bool
-	)
+	var txnSize *txnSizeSample
 	if processor.currentTxn != nil {
-		currentTxn := processor.currentTxn
-		startTs = currentTxn.CurrentDMLEvent.GetStartTs()
-		commitTs = currentTxn.CurrentDMLEvent.GetCommitTs()
-		rawKVBytes = currentTxn.rawKVBytes
-		largeTxnThresholdInBytes = currentTxn.largeTxnThresholdInBytes
-		hasCurrentTxn = true
+		sample := txnSizeSampleFromTxn(processor.currentTxn)
+		txnSize = &sample
 	}
 	if err := processor.commitTxn(); err != nil {
 		return err
 	}
-	if hasCurrentTxn {
-		sess.dispatcherStat.finishBigTxnMetric(startTs, commitTs, rawKVBytes, largeTxnThresholdInBytes)
+	if txnSize != nil {
+		sess.dispatcherStat.txnSizeMetrics.complete(*txnSize)
 	}
 
 	resolvedBatch := processor.getCurrentBatchDML()

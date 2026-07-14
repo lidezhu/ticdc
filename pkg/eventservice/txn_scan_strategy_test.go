@@ -39,6 +39,13 @@ func TestNewTxnScanStrategy(t *testing.T) {
 }
 
 func TestSplitTxnScanStrategyOwnsPendingMetricLifecycle(t *testing.T) {
+	addPendingMetric := func(dispatcher *dispatcherStat) {
+		dispatcher.txnSizeMetrics.addFragment(txnSizeSample{
+			txn:       txnIdentity{startTs: 100, commitTs: 200},
+			rawBytes:  70,
+			threshold: 50,
+		})
+	}
 	newStrategyAndContext := func() (*splitTxnScanStrategy, *txnScanContext, *dispatcherStat) {
 		info := newMockDispatcherInfoForTest(t)
 		status := newChangefeedStatusForTest(t, info)
@@ -54,43 +61,43 @@ func TestSplitTxnScanStrategyOwnsPendingMetricLifecycle(t *testing.T) {
 
 	t.Run("flush when iterator has no more rows", func(t *testing.T) {
 		strategy, ctx, dispatcher := newStrategyAndContext()
-		dispatcher.addBigTxnMetricFragment(100, 200, 70, 50)
+		addPendingMetric(dispatcher)
 
 		interrupted, err := strategy.onNoMoreRows(ctx)
 		require.NoError(t, err)
 		require.False(t, interrupted)
-		require.Nil(t, dispatcher.bigTxnMetricState)
+		require.Nil(t, dispatcher.txnSizeMetrics.pending)
 	})
 
 	t.Run("keep pending metric while current transaction is active", func(t *testing.T) {
 		strategy, ctx, dispatcher := newStrategyAndContext()
-		dispatcher.addBigTxnMetricFragment(100, 200, 70, 50)
+		addPendingMetric(dispatcher)
 		ctx.processor.currentTxn = &TxnEvent{}
 
 		interrupted, err := strategy.beforeRow(ctx, &common.RawKVEntry{StartTs: 101, CRTs: 201})
 		require.NoError(t, err)
 		require.False(t, interrupted)
-		require.NotNil(t, dispatcher.bigTxnMetricState)
+		require.NotNil(t, dispatcher.txnSizeMetrics.pending)
 
 		ctx.processor.currentTxn = nil
 		interrupted, err = strategy.beforeRow(ctx, &common.RawKVEntry{StartTs: 101, CRTs: 201})
 		require.NoError(t, err)
 		require.False(t, interrupted)
-		require.Nil(t, dispatcher.bigTxnMetricState)
+		require.Nil(t, dispatcher.txnSizeMetrics.pending)
 	})
 
 	t.Run("flush when the remaining transaction is deleted", func(t *testing.T) {
 		strategy, ctx, dispatcher := newStrategyAndContext()
-		dispatcher.addBigTxnMetricFragment(100, 200, 70, 50)
+		addPendingMetric(dispatcher)
 
 		interrupted, err := strategy.beforeRow(ctx, &common.RawKVEntry{StartTs: 100, CRTs: 200})
 		require.NoError(t, err)
 		require.False(t, interrupted)
-		require.NotNil(t, dispatcher.bigTxnMetricState)
+		require.NotNil(t, dispatcher.txnSizeMetrics.pending)
 
 		interrupted, err = strategy.finishTxn(ctx, 200, 0, true)
 		require.NoError(t, err)
 		require.False(t, interrupted)
-		require.Nil(t, dispatcher.bigTxnMetricState)
+		require.Nil(t, dispatcher.txnSizeMetrics.pending)
 	})
 }

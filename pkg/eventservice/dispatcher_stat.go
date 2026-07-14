@@ -111,8 +111,7 @@ type dispatcherStat struct {
 	largeTxnStateMu sync.Mutex
 	largeTxnState   *largeTxnScanState
 
-	// bigTxnMetricState is updated only by the serialized scan task of this dispatcher.
-	bigTxnMetricState *bigTxnMetricState
+	txnSizeMetrics txnSizeMetricRecorder
 
 	// isRemoved is used to indicate whether the dispatcher is removed.
 	// it is set to true in the following two cases:
@@ -257,74 +256,6 @@ func (a *dispatcherStat) getScanProgress() dispatcherScanProgress {
 		startTs:  progress.startTs,
 		position: append(common.ScanPosition(nil), progress.position...),
 	}
-}
-
-type bigTxnMetricState struct {
-	startTs                  uint64
-	commitTs                 uint64
-	rawKVBytes               int64
-	largeTxnThresholdInBytes int64
-}
-
-func (a *dispatcherStat) addBigTxnMetricFragment(
-	startTs uint64,
-	commitTs uint64,
-	rawKVBytes int64,
-	largeTxnThresholdInBytes int64,
-) {
-	if rawKVBytes <= largeTxnThresholdInBytes {
-		return
-	}
-	if a.bigTxnMetricState == nil ||
-		a.bigTxnMetricState.startTs != startTs ||
-		a.bigTxnMetricState.commitTs != commitTs {
-		a.finishPendingBigTxnMetricBefore(startTs, commitTs)
-		a.bigTxnMetricState = &bigTxnMetricState{
-			startTs:                  startTs,
-			commitTs:                 commitTs,
-			largeTxnThresholdInBytes: largeTxnThresholdInBytes,
-		}
-	}
-	a.bigTxnMetricState.rawKVBytes += rawKVBytes
-}
-
-func (a *dispatcherStat) finishBigTxnMetric(
-	startTs uint64,
-	commitTs uint64,
-	rawKVBytes int64,
-	largeTxnThresholdInBytes int64,
-) {
-	totalRawKVBytes := rawKVBytes
-	if a.bigTxnMetricState != nil {
-		if a.bigTxnMetricState.startTs == startTs && a.bigTxnMetricState.commitTs == commitTs {
-			totalRawKVBytes += a.bigTxnMetricState.rawKVBytes
-		} else if a.bigTxnMetricState.rawKVBytes > a.bigTxnMetricState.largeTxnThresholdInBytes {
-			updateMetricEventServiceBigTxn(a.bigTxnMetricState.rawKVBytes)
-		}
-		a.bigTxnMetricState = nil
-	}
-	if totalRawKVBytes > largeTxnThresholdInBytes {
-		updateMetricEventServiceBigTxn(totalRawKVBytes)
-	}
-}
-
-func (a *dispatcherStat) finishPendingBigTxnMetric() {
-	if a.bigTxnMetricState == nil {
-		return
-	}
-	state := a.bigTxnMetricState
-	a.bigTxnMetricState = nil
-	if state.rawKVBytes > state.largeTxnThresholdInBytes {
-		updateMetricEventServiceBigTxn(state.rawKVBytes)
-	}
-}
-
-func (a *dispatcherStat) finishPendingBigTxnMetricBefore(startTs uint64, commitTs uint64) {
-	if a.bigTxnMetricState == nil ||
-		(a.bigTxnMetricState.startTs == startTs && a.bigTxnMetricState.commitTs == commitTs) {
-		return
-	}
-	a.finishPendingBigTxnMetric()
 }
 
 // onResolvedTs try to update the resolved ts of the dispatcher.

@@ -49,7 +49,7 @@ func (s *splitTxnScanStrategy) onNoMoreRows(
 	if ctx.processor.currentTxn != nil {
 		return false, nil
 	}
-	s.dispatcher.finishPendingBigTxnMetric()
+	s.dispatcher.txnSizeMetrics.flush()
 	state := s.dispatcher.getLargeTxnState()
 	if state == nil || state.getPhase() != largeTxnScanPhaseOriginal {
 		return false, nil
@@ -67,7 +67,10 @@ func (s *splitTxnScanStrategy) beforeRow(
 	if ctx.processor.currentTxn != nil {
 		return false, nil
 	}
-	s.dispatcher.finishPendingBigTxnMetricBefore(rawEvent.StartTs, rawEvent.CRTs)
+	s.dispatcher.txnSizeMetrics.advanceTo(txnIdentity{
+		startTs:  rawEvent.StartTs,
+		commitTs: rawEvent.CRTs,
+	})
 	state := s.dispatcher.getLargeTxnState()
 	if state == nil || state.getPhase() != largeTxnScanPhaseOriginal ||
 		(rawEvent.StartTs == state.startTs && rawEvent.CRTs == state.commitTs) {
@@ -109,7 +112,7 @@ func (s *splitTxnScanStrategy) finishTxn(
 	processor := ctx.processor
 	if processor.currentTxn == nil {
 		if nextTableDeleted {
-			s.dispatcher.finishPendingBigTxnMetric()
+			s.dispatcher.txnSizeMetrics.flush()
 		}
 		return false, nil
 	}
@@ -208,12 +211,7 @@ func interruptCurrentTxn(
 ) {
 	if processor.currentTxn != nil {
 		currentTxn := processor.currentTxn
-		currentDML := currentTxn.CurrentDMLEvent
-		session.dispatcherStat.addBigTxnMetricFragment(
-			currentDML.GetStartTs(),
-			currentDML.GetCommitTs(),
-			currentTxn.rawKVBytes,
-			currentTxn.largeTxnThresholdInBytes)
+		session.dispatcherStat.txnSizeMetrics.addFragment(txnSizeSampleFromTxn(currentTxn))
 	}
 	events := merger.mergeWithPrecedingDDLs(processor.getCurrentBatchDML())
 	session.appendEvents(events)
