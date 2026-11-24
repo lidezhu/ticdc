@@ -834,7 +834,6 @@ func (c *changefeedStatus) refreshMinSentResolvedTs() {
 		lastHeartbeatTime := dispatcher.lastReceivedHeartbeatTime.Load()
 		if lastHeartbeatTime > 0 &&
 			now.Sub(time.Unix(lastHeartbeatTime, 0)) > scanWindowStaleDispatcherHeartbeatThreshold {
-			log.Info("dispatcher is stale, skip it's sent resolved ts", zap.Stringer("changefeedID", c.changefeedID), zap.Stringer("dispatcherID", dispatcher.id))
 			return true
 		}
 
