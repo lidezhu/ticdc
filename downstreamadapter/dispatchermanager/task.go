@@ -490,7 +490,6 @@ func GetRemoveDispatcherTaskScheduler() threadpool.ThreadPool {
 type RemoveDispatcherTask struct {
 	manager        *DispatcherManager
 	dispatcherItem dispatcher.Dispatcher
-	retryCount     int
 }
 
 func (t *RemoveDispatcherTask) Execute() time.Time {
@@ -509,20 +508,7 @@ func (t *RemoveDispatcherTask) Execute() time.Time {
 	if ok {
 		// Successfully closed, execute Remove
 		t.dispatcherItem.Remove()
-		log.Info("dispatcher removed successfully",
-			zap.Stringer("dispatcherID", t.dispatcherItem.GetId()),
-			zap.Int("retryCount", t.retryCount))
 		return time.Time{} // Task completed
-	}
-
-	// Not successfully closed, retry
-	t.retryCount++
-
-	// Log periodically
-	if t.retryCount%50 == 0 {
-		log.Info("still retrying dispatcher close",
-			zap.Stringer("dispatcherID", t.dispatcherItem.GetId()),
-			zap.Int("retryCount", t.retryCount))
 	}
 
 	// Retry after 10ms, never give up

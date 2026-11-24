@@ -1351,37 +1351,13 @@ func (d *BasicDispatcher) TryClose() (w heartbeatpb.Watermark, ok bool) {
 		if d.IsTableTriggerDispatcher() && d.tableSchemaStore != nil {
 			d.tableSchemaStore.Clear()
 		}
-		log.Info("dispatcher component has stopped and is ready for cleanup",
-			zap.Stringer("changefeedID", d.sharedInfo.changefeedID),
-			zap.Stringer("dispatcherID", d.id),
-			zap.Int64("mode", d.mode),
-			zap.Uint64("checkpointTs", d.GetCheckpointTs()),
-			zap.Uint64("resolvedTs", d.GetResolvedTs()),
-		)
 		return w, true
 	}
-	addTableCheckpointBlockerLen := 0
-	if d.addTableCheckpointBlocker != nil {
-		addTableCheckpointBlockerLen = d.addTableCheckpointBlocker.len()
-	}
-	log.Info("dispatcher is not ready to close",
-		zap.Stringer("changefeedID", d.sharedInfo.changefeedID),
-		zap.Stringer("dispatcherID", d.id),
-		zap.Int64("mode", d.mode),
-		zap.Bool("sinkIsNormal", d.sink.IsNormal()),
-		zap.Bool("tableProgressEmpty", d.tableProgress.Empty()),
-		zap.Int("addTableCheckpointBlockerLen", addTableCheckpointBlockerLen),
-		zap.Int("tableProgressLen", d.tableProgress.Len()),
-		zap.Uint64("tableProgressMaxCommitTs", d.tableProgress.MaxCommitTs())) // check whether continue receive new events.
 	return w, false
 }
 
 // It removes the dispatcher from status dynamic stream to stop receiving status info from maintainer.
 func (d *BasicDispatcher) removeDispatcher() {
-	log.Info("remove dispatcher",
-		zap.Stringer("changefeedID", d.sharedInfo.changefeedID),
-		zap.Stringer("dispatcherID", d.id),
-		zap.Int64("mode", d.mode))
 	dispatcherStatusDS := GetDispatcherStatusDynamicStream()
 	err := dispatcherStatusDS.RemovePath(d.id)
 	if err != nil {

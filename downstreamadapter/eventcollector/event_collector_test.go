@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/golang/mock/gomock"
+	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/downstreamadapter/dispatcher"
 	"github.com/pingcap/ticdc/eventpb"
 	"github.com/pingcap/ticdc/heartbeatpb"
@@ -38,6 +39,9 @@ import (
 	"github.com/pingcap/ticdc/utils/chann"
 	"github.com/pingcap/ticdc/utils/dynstream"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 var _ dispatcher.DispatcherService = (*mockEventDispatcher)(nil)
@@ -234,6 +238,10 @@ func TestProcessMessage(t *testing.T) {
 }
 
 func TestRemoveLastDispatcher(t *testing.T) {
+	core, observedLogs := observer.New(zapcore.InfoLevel)
+	restore := log.ReplaceGlobals(zap.New(core), nil)
+	t.Cleanup(restore)
+
 	ctx := context.Background()
 	nodeInfo := node.NewInfo("127.0.0.1:18300", "")
 	mc := messaging.NewMessageCenter(ctx, nodeInfo.ID, config.NewDefaultMessageCenterConfig(nodeInfo.AdvertiseAddr), nil)
@@ -266,6 +274,7 @@ func TestRemoveLastDispatcher(t *testing.T) {
 	c.RemoveDispatcher(d1)
 	_, ok = c.changefeedMap.Load(cfID1.ID())
 	require.True(t, ok, "changefeedStat for cfID1 should still exist after removing one dispatcher")
+	require.Empty(t, observedLogs.FilterMessage("event collector removed all dispatchers").All())
 
 	// Remove the last dispatcher from cfID1, stat should be removed
 	c.RemoveDispatcher(d2)
@@ -273,6 +282,9 @@ func TestRemoveLastDispatcher(t *testing.T) {
 	require.False(t, ok, "changefeedStat for cfID1 should be removed after removing the last dispatcher")
 	_, ok = c.changefeedMap.Load(cfID2.ID())
 	require.True(t, ok, "changefeedStat for cfID2 should not be affected")
+	summaryLogs := observedLogs.FilterMessage("event collector removed all dispatchers").All()
+	require.Len(t, summaryLogs, 1)
+	require.EqualValues(t, 2, summaryLogs[0].ContextMap()["removedDispatcherCount"])
 }
 
 func TestGroupHeartbeatUsesEpochAndClamp(t *testing.T) {

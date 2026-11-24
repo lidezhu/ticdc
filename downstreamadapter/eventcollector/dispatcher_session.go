@@ -482,10 +482,6 @@ func (s *dispatcherSession) remove() {
 // represent either terminal removal of the dispatcher session or best-effort
 // cleanup of a stale registration on another event service.
 func (s *dispatcherSession) removeFromLocked(serverID node.ID) {
-	log.Info("send remove dispatcher request to event service",
-		zap.Stringer("changefeedID", s.target.GetChangefeedID()),
-		zap.Stringer("dispatcherID", s.target.GetId()),
-		zap.Stringer("eventServiceID", serverID))
 	msg := messaging.NewSingleTargetMessage(
 		serverID,
 		messaging.EventServiceTopic,

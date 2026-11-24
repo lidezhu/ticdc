@@ -1276,10 +1276,6 @@ func (e *DispatcherManager) cleanEventDispatcher(id common.DispatcherID, schemaI
 	} else {
 		e.metricEventDispatcherCount.Dec()
 	}
-	log.Info("event dispatcher completely stopped, and delete it from event dispatcher manager",
-		zap.Stringer("changefeedID", e.changefeedID),
-		zap.Stringer("dispatcherID", id),
-	)
 }
 
 func (e *DispatcherManager) cleanMetrics() {

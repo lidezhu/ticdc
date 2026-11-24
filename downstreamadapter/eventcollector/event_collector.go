@@ -84,6 +84,7 @@ type changefeedStat struct {
 	metricMemoryUsageMaxRedo  prometheus.Gauge
 	metricMemoryUsageUsedRedo prometheus.Gauge
 	dispatcherCount           atomic.Int32
+	removedDispatcherCount    atomic.Uint64
 	memoryReleaseCount        atomic.Uint32
 }
 
@@ -306,12 +307,6 @@ func (c *EventCollector) CommitAddDispatcher(target dispatcher.DispatcherService
 
 func (c *EventCollector) RemoveDispatcher(target dispatcher.DispatcherService) {
 	changefeedID := target.GetChangefeedID()
-	log.Info("remove dispatcher", zap.Stringer("changefeedID", changefeedID), zap.Stringer("dispatcherID", target.GetId()))
-	defer func() {
-		log.Info("remove dispatcher done",
-			zap.Stringer("changefeedID", changefeedID), zap.Stringer("dispatcherID", target.GetId()),
-			zap.Int64("tableID", target.GetTableSpan().GetTableID()))
-	}()
 	value, ok := c.dispatcherMap.Load(target.GetId())
 	if !ok {
 		return
@@ -332,15 +327,15 @@ func (c *EventCollector) RemoveDispatcher(target dispatcher.DispatcherService) {
 		return
 	}
 	cfStat := v.(*changefeedStat)
+	removed := cfStat.removedDispatcherCount.Add(1)
 	remaining := cfStat.dispatcherCount.Add(-1)
-	log.Info("remove dispatcher from changefeed stat",
-		zap.Stringer("changefeedID", changefeedID),
-		zap.Int32("remaining", remaining))
 	if remaining == 0 {
 		if _, ok := c.changefeedMap.LoadAndDelete(changefeedID.ID()); ok {
 			stat := v.(*changefeedStat)
 			stat.removeMetrics()
-			log.Info("last dispatcher removed, clean up changefeed stat", zap.Stringer("changefeedID", target.GetChangefeedID()))
+			log.Info("event collector removed all dispatchers",
+				zap.Stringer("changefeedID", changefeedID),
+				zap.Uint64("removedDispatcherCount", removed))
 		}
 	}
 }

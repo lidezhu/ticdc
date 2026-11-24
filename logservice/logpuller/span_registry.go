@@ -33,7 +33,11 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-const kvEventsCacheMaxSize = 32
+const (
+	kvEventsCacheMaxSize    = 32
+	slowRegionLogInterval   = 30 * time.Second
+	slowRegionLogSampleSize = 10
+)
 
 // subscribedSpan represents a span to subscribe.
 // It contains a sub span of a table(or the total span of a table),
@@ -330,8 +334,122 @@ func (r *spanRegistry) runResolveLockChecker(ctx context.Context) error {
 	}
 }
 
+type slowRegionGroupLogStats struct {
+	count                 int
+	maxDuration           time.Duration
+	sampleSubscriptionIDs []uint64
+	sampleTableIDs        []int64
+	sampleRegionIDs       []uint64
+	sampleResolvedTs      []uint64
+}
+
+func (s *slowRegionGroupLogStats) add(
+	subscriptionID SubscriptionID,
+	tableID int64,
+	region regionlock.LockedRangeStatistic,
+	duration time.Duration,
+) {
+	s.count++
+	s.maxDuration = max(s.maxDuration, duration)
+	if len(s.sampleRegionIDs) >= slowRegionLogSampleSize {
+		return
+	}
+	s.sampleSubscriptionIDs = append(s.sampleSubscriptionIDs, uint64(subscriptionID))
+	s.sampleTableIDs = append(s.sampleTableIDs, tableID)
+	s.sampleRegionIDs = append(s.sampleRegionIDs, region.RegionID)
+	s.sampleResolvedTs = append(s.sampleResolvedTs, region.ResolvedTs)
+}
+
+type holeLogStats struct {
+	subscriptionCount     int
+	holeCount             int
+	maxHoleCount          int
+	sampleSubscriptionIDs []uint64
+	sampleTableIDs        []int64
+	sampleHoleCounts      []int
+}
+
+func (s *holeLogStats) add(subscriptionID SubscriptionID, tableID int64, holeCount int) {
+	s.subscriptionCount++
+	s.holeCount += holeCount
+	s.maxHoleCount = max(s.maxHoleCount, holeCount)
+	if len(s.sampleSubscriptionIDs) >= slowRegionLogSampleSize {
+		return
+	}
+	s.sampleSubscriptionIDs = append(s.sampleSubscriptionIDs, uint64(subscriptionID))
+	s.sampleTableIDs = append(s.sampleTableIDs, tableID)
+	s.sampleHoleCounts = append(s.sampleHoleCounts, holeCount)
+}
+
+type slowRegionLogStats struct {
+	initialized   slowRegionGroupLogStats
+	initializing  slowRegionGroupLogStats
+	uninitialized slowRegionGroupLogStats
+	holes         holeLogStats
+}
+
+func (r *spanRegistry) collectSlowRegionLogStats(currTime time.Time) slowRegionLogStats {
+	var stats slowRegionLogStats
+	r.RLock()
+	defer r.RUnlock()
+	for subscriptionID, rt := range r.spans {
+		if rt == nil || rt.stopped.Load() {
+			continue
+		}
+		attr := rt.rangeLock.IterAll(nil)
+		if attr.LockedRegionCount > 0 {
+			ckptTime := oracle.GetTimeFromTS(attr.SlowestRegion.ResolvedTs)
+			resolvedTsLag := currTime.Sub(ckptTime)
+			if attr.SlowestRegion.Initialized {
+				if resolvedTsLag > 6*resolveLockMinInterval {
+					stats.initialized.add(subscriptionID, rt.span.TableID, attr.SlowestRegion, resolvedTsLag)
+				}
+			} else if initializeDuration := currTime.Sub(attr.SlowestRegion.Created); initializeDuration > 10*time.Minute {
+				stats.initializing.add(subscriptionID, rt.span.TableID, attr.SlowestRegion, initializeDuration)
+			} else if resolvedTsLag > 10*time.Minute {
+				stats.uninitialized.add(subscriptionID, rt.span.TableID, attr.SlowestRegion, resolvedTsLag)
+			}
+		}
+		if holeCount := len(attr.UnLockedRanges); holeCount > 0 {
+			stats.holes.add(subscriptionID, rt.span.TableID, holeCount)
+		}
+	}
+	return stats
+}
+
+func logSlowRegionGroupSummary(message, maxDurationField string, stats slowRegionGroupLogStats) {
+	if stats.count == 0 {
+		return
+	}
+	log.Info(message,
+		zap.Int("regionCount", stats.count),
+		zap.Duration(maxDurationField, stats.maxDuration),
+		zap.Uint64s("sampleSubscriptionIDs", stats.sampleSubscriptionIDs),
+		zap.Int64s("sampleTableIDs", stats.sampleTableIDs),
+		zap.Uint64s("sampleRegionIDs", stats.sampleRegionIDs),
+		zap.Uint64s("sampleResolvedTs", stats.sampleResolvedTs))
+}
+
+func (s slowRegionLogStats) log() {
+	logSlowRegionGroupSummary(
+		"subscription client finds initialized slow regions", "maxResolvedTsLag", s.initialized)
+	logSlowRegionGroupSummary(
+		"subscription client initializes regions too slowly", "maxInitializeDuration", s.initializing)
+	logSlowRegionGroupSummary(
+		"subscription client finds uninitialized slow regions", "maxResolvedTsLag", s.uninitialized)
+	if s.holes.subscriptionCount > 0 {
+		log.Info("subscription client finds holes",
+			zap.Int("subscriptionCount", s.holes.subscriptionCount),
+			zap.Int("holeCount", s.holes.holeCount),
+			zap.Int("maxHoleCount", s.holes.maxHoleCount),
+			zap.Uint64s("sampleSubscriptionIDs", s.holes.sampleSubscriptionIDs),
+			zap.Int64s("sampleTableIDs", s.holes.sampleTableIDs),
+			zap.Ints("sampleHoleCounts", s.holes.sampleHoleCounts))
+	}
+}
+
 func (r *spanRegistry) logSlowRegions(ctx context.Context) error {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(slowRegionLogInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -340,52 +458,6 @@ func (r *spanRegistry) logSlowRegions(ctx context.Context) error {
 		case <-ticker.C:
 		}
 
-		currTime := r.pdClock.CurrentTime()
-		r.RLock()
-		for subscriptionID, rt := range r.spans {
-			if rt == nil || rt.stopped.Load() {
-				continue
-			}
-			attr := rt.rangeLock.IterAll(nil)
-			if attr.LockedRegionCount > 0 {
-				ckptTime := oracle.GetTimeFromTS(attr.SlowestRegion.ResolvedTs)
-				if attr.SlowestRegion.Initialized {
-					if currTime.Sub(ckptTime) > 6*resolveLockMinInterval {
-						log.Info("subscription client finds a initialized slow region",
-							zap.Uint64("subscriptionID", uint64(subscriptionID)),
-							zap.Int64("tableID", rt.span.TableID),
-							zap.Uint64("regionID", attr.SlowestRegion.RegionID),
-							zap.Uint64("resolvedTs", attr.SlowestRegion.ResolvedTs),
-							zap.Any("slowRegion", attr.SlowestRegion),
-							zap.Duration("resolvedTsLag", currTime.Sub(ckptTime)))
-					}
-				} else if currTime.Sub(attr.SlowestRegion.Created) > 10*time.Minute {
-					log.Info("subscription client initializes a region too slow",
-						zap.Uint64("subscriptionID", uint64(subscriptionID)),
-						zap.Int64("tableID", rt.span.TableID),
-						zap.Uint64("regionID", attr.SlowestRegion.RegionID),
-						zap.Uint64("resolvedTs", attr.SlowestRegion.ResolvedTs),
-						zap.Any("slowRegion", attr.SlowestRegion),
-						zap.Duration("initializeDuration", currTime.Sub(attr.SlowestRegion.Created)))
-				} else if currTime.Sub(ckptTime) > 10*time.Minute {
-					log.Info("subscription client finds a uninitialized slow region",
-						zap.Uint64("subscriptionID", uint64(subscriptionID)),
-						zap.Int64("tableID", rt.span.TableID),
-						zap.Uint64("regionID", attr.SlowestRegion.RegionID),
-						zap.Uint64("resolvedTs", attr.SlowestRegion.ResolvedTs),
-						zap.Any("slowRegion", attr.SlowestRegion),
-						zap.Duration("resolvedTsLag", currTime.Sub(ckptTime)))
-				}
-			}
-			if len(attr.UnLockedRanges) > 0 {
-				log.Info("subscription client holes exist",
-					zap.Uint64("subscriptionID", uint64(subscriptionID)),
-					zap.Int64("tableID", rt.span.TableID),
-					zap.Int("lockedRegionCount", attr.LockedRegionCount),
-					zap.Int("holeCount", len(attr.UnLockedRanges)),
-					zap.Strings("holes", formatUnlockedRanges(attr.UnLockedRanges)))
-			}
-		}
-		r.RUnlock()
+		r.collectSlowRegionLogStats(r.pdClock.CurrentTime()).log()
 	}
 }

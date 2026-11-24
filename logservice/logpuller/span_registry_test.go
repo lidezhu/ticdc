@@ -18,12 +18,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/heartbeatpb"
 	"github.com/pingcap/ticdc/logservice/logpuller/regionlock"
 	"github.com/pingcap/ticdc/pkg/pdutil"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	"github.com/tikv/client-go/v2/oracle"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestSpanRegistryUpdateMetrics(t *testing.T) {
@@ -61,4 +65,65 @@ func TestSpanRegistryUpdateMetrics(t *testing.T) {
 
 	require.Equal(t, float64(3), testutil.ToFloat64(subscriptionClientSubscribedRegionCount))
 	require.InDelta(t, 5.0, testutil.ToFloat64(logPullerResolvedTsLag), 0.001)
+}
+
+func TestSlowRegionLogsUseBoundedSummaries(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	clock := pdutil.NewClockWithValue4Test(now)
+	registry := newSpanRegistry(nil, clock)
+
+	for i := range slowRegionLogSampleSize + 2 {
+		subID := SubscriptionID(i + 1)
+		span := newDebugTestSpan(subID, int64(i+1), now.Add(-2*time.Hour), clock)
+		state := lockDebugTestRegion(t, span, "a", "z", uint64(i+1), now.Add(-2*time.Hour), true)
+		state.Created = now.Add(-3 * time.Hour)
+		registry.Add(span)
+	}
+
+	initializing := newDebugTestSpan(100, 100, now.Add(-2*time.Hour), clock)
+	state := lockDebugTestRegion(t, initializing, "a", "z", 100, now.Add(-2*time.Hour), false)
+	state.Created = now.Add(-11 * time.Minute)
+	registry.Add(initializing)
+
+	uninitialized := newDebugTestSpan(101, 101, now.Add(-2*time.Hour), clock)
+	state = lockDebugTestRegion(t, uninitialized, "a", "z", 101, now.Add(-2*time.Hour), false)
+	state.Created = now.Add(-time.Minute)
+	registry.Add(uninitialized)
+
+	withHole := newDebugTestSpan(102, 102, now, clock)
+	state = lockDebugTestRegion(t, withHole, "a", "m", 102, now, true)
+	state.Created = now
+	registry.Add(withHole)
+
+	stopped := newDebugTestSpan(103, 103, now.Add(-2*time.Hour), clock)
+	state = lockDebugTestRegion(t, stopped, "a", "z", 103, now.Add(-2*time.Hour), true)
+	state.Created = now.Add(-3 * time.Hour)
+	stopped.stopped.Store(true)
+	registry.Add(stopped)
+
+	stats := registry.collectSlowRegionLogStats(now)
+	require.Equal(t, slowRegionLogSampleSize+2, stats.initialized.count)
+	require.Len(t, stats.initialized.sampleRegionIDs, slowRegionLogSampleSize)
+	require.Equal(t, 1, stats.initializing.count)
+	require.Equal(t, 11*time.Minute, stats.initializing.maxDuration)
+	require.Equal(t, 1, stats.uninitialized.count)
+	require.Equal(t, 2*time.Hour, stats.uninitialized.maxDuration)
+	require.Equal(t, 1, stats.holes.subscriptionCount)
+	require.Equal(t, 1, stats.holes.holeCount)
+	require.Equal(t, 1, stats.holes.maxHoleCount)
+
+	core, observedLogs := observer.New(zapcore.InfoLevel)
+	restore := log.ReplaceGlobals(zap.New(core), nil)
+	t.Cleanup(restore)
+	stats.log()
+
+	initializedLogs := observedLogs.FilterMessage("subscription client finds initialized slow regions").All()
+	require.Len(t, initializedLogs, 1)
+	require.EqualValues(t, slowRegionLogSampleSize+2, initializedLogs[0].ContextMap()["regionCount"])
+	samples, ok := initializedLogs[0].ContextMap()["sampleRegionIDs"].([]any)
+	require.True(t, ok)
+	require.Len(t, samples, slowRegionLogSampleSize)
+	require.Len(t, observedLogs.FilterMessage("subscription client initializes regions too slowly").All(), 1)
+	require.Len(t, observedLogs.FilterMessage("subscription client finds uninitialized slow regions").All(), 1)
+	require.Len(t, observedLogs.FilterMessage("subscription client finds holes").All(), 1)
 }

@@ -241,9 +241,6 @@ func removeDispatcher[T dispatcher.Dispatcher](e *DispatcherManager,
 	dispatcherItem, ok := dispatcherMap.Get(id)
 	if ok {
 		if dispatcherItem.GetTryRemoving() {
-			log.Info("dispatcher is already in removing state, skip repeated remove request",
-				zap.Stringer("changefeedID", changefeedID),
-				zap.Stringer("dispatcherID", id))
 			return
 		}
 
@@ -265,10 +262,6 @@ func removeDispatcher[T dispatcher.Dispatcher](e *DispatcherManager,
 		e.submitRemoveDispatcherTask(dispatcherItem)
 
 		dispatcherItem.SetTryRemoving()
-
-		log.Info("submitted async remove task",
-			zap.Stringer("changefeedID", changefeedID),
-			zap.Stringer("dispatcherID", id))
 	} else {
 		statusesChan <- dispatcher.TableSpanStatusWithSeq{
 			TableSpanStatus: &heartbeatpb.TableSpanStatus{
@@ -286,7 +279,6 @@ func (e *DispatcherManager) submitRemoveDispatcherTask(dispatcherItem dispatcher
 	task := &RemoveDispatcherTask{
 		manager:        e,
 		dispatcherItem: dispatcherItem,
-		retryCount:     0,
 	}
 	scheduler := GetRemoveDispatcherTaskScheduler()
 	taskHandle := scheduler.Submit(task, time.Now())

@@ -311,10 +311,6 @@ func (e *DispatcherManager) cleanRedoDispatcher(id common.DispatcherID, schemaID
 	} else {
 		e.metricRedoEventDispatcherCount.Dec()
 	}
-	log.Info("redo dispatcher completely stopped, and delete it from event dispatcher manager",
-		zap.Stringer("changefeedID", e.changefeedID),
-		zap.Stringer("dispatcherID", id),
-	)
 }
 
 func (e *DispatcherManager) closeRedoMeta(removeChangefeed bool) error {
