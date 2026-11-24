@@ -422,6 +422,88 @@ func TestRemovedConsumerStopsRegistrationRetriesAndHeartbeats(t *testing.T) {
 	}
 }
 
+func TestCongestedTargetDoesNotBlockOtherTargets(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	mc := mock.NewMockMessageCenter(gomock.NewController(t))
+	collector := &EventCollector{
+		serverId:              "local",
+		mc:                    mc,
+		dispatcherMessageChan: chann.NewAutoDrainChann[DispatcherMessage](),
+	}
+	targetA := node.ID("target-a")
+	targetB := node.ID("target-b")
+	firstTargetAAttempt := make(chan struct{})
+	targetBSent := make(chan struct{})
+	var targetAOnce sync.Once
+	var targetBOnce sync.Once
+	mc.EXPECT().SendCommand(gomock.Any()).DoAndReturn(func(message *messaging.TargetMessage) error {
+		switch message.To {
+		case targetA:
+			targetAOnce.Do(func() { close(firstTargetAAttempt) })
+			return errors.AppError{Type: errors.ErrorTypeMessageCongested}
+		case targetB:
+			targetBOnce.Do(func() { close(targetBSent) })
+			return nil
+		default:
+			return nil
+		}
+	}).AnyTimes()
+
+	var wg sync.WaitGroup
+	wg.Go(func() { _ = collector.sendDispatcherRequests(ctx) })
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+		collector.dispatcherMessageChan.CloseAndDrain()
+	})
+
+	collector.dispatcherMessageChan.In() <- newDispatcherMessage(
+		newRemoveDispatcherRequestMessage(targetA, 1), false, 0)
+	select {
+	case <-firstTargetAAttempt:
+	case <-time.After(time.Second):
+		require.FailNow(t, "timed out waiting for the congested send")
+	}
+
+	collector.dispatcherMessageChan.In() <- newDispatcherMessage(
+		newRemoveDispatcherRequestMessage(targetB, 2), false, 0)
+	select {
+	case <-targetBSent:
+	case <-time.After(200 * time.Millisecond):
+		require.FailNow(t, "another target was blocked by the congested target")
+	}
+}
+
+func TestDispatcherRequestsAreBatched(t *testing.T) {
+	queue := make([]DispatcherMessage, 0, 300)
+	for tableID := int64(1); tableID <= 300; tableID++ {
+		queue = append(queue, newDispatcherMessage(
+			newRemoveDispatcherRequestMessage("target", tableID), false, 0))
+	}
+
+	first, consumed := batchDispatcherMessages(queue)
+	require.Equal(t, dispatcherRequestBatchSize, consumed)
+	require.Len(t, first.Message.Message, dispatcherRequestBatchSize)
+	for index, payload := range first.Message.Message {
+		request := payload.(*messaging.DispatcherRequest)
+		require.Equal(t, int64(index+1), request.GetTableSpan().TableID)
+	}
+
+	second, consumed := batchDispatcherMessages(queue[consumed:])
+	require.Equal(t, 300-dispatcherRequestBatchSize, consumed)
+	require.Len(t, second.Message.Message, 300-dispatcherRequestBatchSize)
+}
+
+func newRemoveDispatcherRequestMessage(target node.ID, tableID int64) *messaging.TargetMessage {
+	request := &messaging.DispatcherRequest{DispatcherRequest: &eventpb.DispatcherRequest{
+		ActionType:   eventpb.ActionType_ACTION_TYPE_REMOVE,
+		DispatcherId: common.NewDispatcherID().ToPB(),
+		ChangefeedId: common.NewChangeFeedIDWithName("test", common.DefaultKeyspaceName).ToPB(),
+		TableSpan:    &heartbeatpb.TableSpan{TableID: tableID},
+	}}
+	return messaging.NewSingleTargetMessage(target, messaging.EventServiceTopic, request)
+}
+
 func TestPendingRegistrationRecoversAfterExpiry(t *testing.T) {
 	c := &EventCollector{serverId: "local", dispatcherMessageChan: chann.NewAutoDrainChann[DispatcherMessage]()}
 	defer c.dispatcherMessageChan.CloseAndDrain()

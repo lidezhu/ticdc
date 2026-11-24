@@ -87,9 +87,8 @@ type eventService struct {
 	// In-flight registrations keep the drain count positive during initialization.
 	registering atomic.Int64
 
-	// TODO: use a better way to cache the acceptorInfos
-	dispatcherInfoChan  chan DispatcherInfo
-	dispatcherHeartbeat chan *DispatcherHeartBeatWithServerID
+	dispatcherRequestInbox *dispatcherRequestInbox
+	dispatcherHeartbeat    chan *DispatcherHeartBeatWithServerID
 
 	tz *time.Location
 }
@@ -122,14 +121,14 @@ func New(
 		}
 	}
 	es := &eventService{
-		mc:                  mc,
-		eventStore:          eventStore,
-		schemaStore:         schemaStore,
-		nodeLiveness:        nodeLiveness,
-		tz:                  tz,
-		brokers:             make(map[uint64]*eventBroker),
-		dispatcherInfoChan:  make(chan DispatcherInfo, 32),
-		dispatcherHeartbeat: make(chan *DispatcherHeartBeatWithServerID, 32),
+		mc:                     mc,
+		eventStore:             eventStore,
+		schemaStore:            schemaStore,
+		nodeLiveness:           nodeLiveness,
+		tz:                     tz,
+		brokers:                make(map[uint64]*eventBroker),
+		dispatcherRequestInbox: newDispatcherRequestInbox(),
+		dispatcherHeartbeat:    make(chan *DispatcherHeartBeatWithServerID, 32),
 	}
 	es.mc.RegisterHandler(messaging.EventServiceTopic, es.handleMessage)
 	return es
@@ -151,7 +150,7 @@ func (s *eventService) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			dispatcherChanSize.Set(float64(len(s.dispatcherInfoChan)))
+			dispatcherChanSize.Set(float64(s.dispatcherRequestInbox.Len()))
 			heartbeatChanSize.Set(float64(len(s.dispatcherHeartbeat)))
 			// Serialize timeout removal with REGISTER/REMOVE/RESET. Store resources
 			// are keyed by dispatcher ID and must be released before ID reuse.
@@ -164,7 +163,11 @@ func (s *eventService) Run(ctx context.Context) error {
 			for _, broker := range brokers {
 				broker.removeInactiveDispatchers()
 			}
-		case info := <-s.dispatcherInfoChan:
+		case <-s.dispatcherRequestInbox.notify:
+			info, ok := s.dispatcherRequestInbox.Pop()
+			if !ok {
+				continue
+			}
 			switch info.GetActionType() {
 			case eventpb.ActionType_ACTION_TYPE_REGISTER:
 				s.registerDispatcher(ctx, info)
@@ -255,13 +258,7 @@ func (s *eventService) handleMessage(ctx context.Context, msg *messaging.TargetM
 		s.reportDispatcherCount(msg.From)
 	case messaging.TypeDispatcherRequest:
 		infos := msgToDispatcherInfo(msg)
-		for _, info := range infos {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case s.dispatcherInfoChan <- info:
-			}
-		}
+		s.dispatcherRequestInbox.Submit(infos)
 	case messaging.TypeDispatcherHeartbeat:
 		if len(msg.Message) != 1 {
 			log.Warn("invalid dispatcher heartbeat, ignore it", zap.Any("msg", msg))

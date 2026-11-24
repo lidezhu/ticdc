@@ -364,9 +364,9 @@ func TestPendingHeartbeatBeforeRegistration(t *testing.T) {
 			// depending on the service loop's select or background scans.
 			broker.close()
 			service := &eventService{
-				brokers:             map[uint64]*eventBroker{broker.tidbClusterID: broker},
-				dispatcherInfoChan:  make(chan DispatcherInfo, 1),
-				dispatcherHeartbeat: make(chan *DispatcherHeartBeatWithServerID, 1),
+				brokers:                map[uint64]*eventBroker{broker.tidbClusterID: broker},
+				dispatcherRequestInbox: newDispatcherRequestInbox(),
+				dispatcherHeartbeat:    make(chan *DispatcherHeartBeatWithServerID, 1),
 			}
 			info := newMockDispatcherInfoForTest(t)
 			registrations, schemaReferences := 0, 0
@@ -384,10 +384,12 @@ func TestPendingHeartbeatBeforeRegistration(t *testing.T) {
 			heartbeat := commonEvent.NewDispatcherHeartbeat()
 			heartbeat.ClusterID = info.clusterID
 			heartbeat.AddDispatcherProgress(info.id, 0, 0)
-			service.dispatcherInfoChan <- info
+			service.dispatcherRequestInbox.Submit([]DispatcherInfo{info})
 			service.dispatcherHeartbeat <- &DispatcherHeartBeatWithServerID{serverID: info.serverID, heartbeat: heartbeat}
 			service.handleDispatcherHeartbeat(<-service.dispatcherHeartbeat)
-			service.registerDispatcher(t.Context(), <-service.dispatcherInfoChan)
+			queuedInfo, ok := service.dispatcherRequestInbox.Pop()
+			require.True(t, ok)
+			service.registerDispatcher(t.Context(), queuedInfo)
 
 			if handshaked {
 				reset := *info
@@ -402,8 +404,10 @@ func TestPendingHeartbeatBeforeRegistration(t *testing.T) {
 			// The collector responds by retrying the same REGISTER.
 			response := (<-responses).Message[0].(*commonEvent.DispatcherHeartbeatResponse)
 			require.Equal(t, []commonEvent.DispatcherState{commonEvent.NewDispatcherState(info.id, commonEvent.DSStateRemoved)}, response.DispatcherStates)
-			service.dispatcherInfoChan <- info
-			service.registerDispatcher(t.Context(), <-service.dispatcherInfoChan)
+			service.dispatcherRequestInbox.Submit([]DispatcherInfo{info})
+			queuedInfo, ok = service.dispatcherRequestInbox.Pop()
+			require.True(t, ok)
+			service.registerDispatcher(t.Context(), queuedInfo)
 
 			require.Equal(t, 1, service.GetDispatcherCount())
 			current := broker.getDispatcher(info.id).Load()
@@ -445,8 +449,8 @@ func TestEventServiceSerializesDispatcherCleanup(t *testing.T) {
 	broker.close()
 	synctest.Test(t, func(t *testing.T) {
 		service := &eventService{
-			brokers:            map[uint64]*eventBroker{broker.tidbClusterID: broker},
-			dispatcherInfoChan: make(chan DispatcherInfo, 1),
+			brokers:                map[uint64]*eventBroker{broker.tidbClusterID: broker},
+			dispatcherRequestInbox: newDispatcherRequestInbox(),
 		}
 		info := newMockDispatcherInfoForTest(t)
 		require.NoError(t, broker.addDispatcher(info))
@@ -473,14 +477,14 @@ func TestEventServiceSerializesDispatcherCleanup(t *testing.T) {
 		// The map entry is gone, but cleanup still keeps the drain count positive.
 		require.Equal(t, 1, service.GetDispatcherCount())
 
-		service.dispatcherInfoChan <- info
+		service.dispatcherRequestInbox.Submit([]DispatcherInfo{info})
 		synctest.Wait()
 		// REGISTER stays queued until Run finishes unregistering the old resources.
-		require.Len(t, service.dispatcherInfoChan, 1)
+		require.Equal(t, 1, service.dispatcherRequestInbox.Len())
 		require.Nil(t, broker.getDispatcher(info.id))
 		releaseCleanup()
 		synctest.Wait()
-		require.Empty(t, service.dispatcherInfoChan)
+		require.Zero(t, service.dispatcherRequestInbox.Len())
 		require.NotNil(t, broker.getDispatcher(info.id))
 		require.Equal(t, 1, service.GetDispatcherCount())
 
@@ -955,6 +959,41 @@ func TestMsgToDispatcherInfoRejectsMalformedRequests(t *testing.T) {
 		validRegister,
 	}})
 	require.Equal(t, []DispatcherInfo{validRemove, validRegister}, infos)
+}
+
+func TestHandleMessageQueuesDispatcherRequestsWithoutConsumer(t *testing.T) {
+	service := &eventService{dispatcherRequestInbox: newDispatcherRequestInbox()}
+	changefeedID := common.NewChangeFeedIDWithName("test", common.DefaultKeyspaceName).ToPB()
+	const requestCount = 1000
+	requests := make([]messaging.IOTypeT, 0, requestCount)
+	for tableID := int64(1); tableID <= requestCount; tableID++ {
+		requests = append(requests, &messaging.DispatcherRequest{DispatcherRequest: &eventpb.DispatcherRequest{
+			ActionType:   eventpb.ActionType_ACTION_TYPE_REMOVE,
+			DispatcherId: common.NewDispatcherID().ToPB(),
+			ChangefeedId: changefeedID,
+			TableSpan:    &heartbeatpb.TableSpan{TableID: tableID},
+		}})
+	}
+	message := &messaging.TargetMessage{
+		Type:    messaging.TypeDispatcherRequest,
+		Message: requests,
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- service.handleMessage(t.Context(), message) }()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		require.FailNow(t, "dispatcher request handler blocked without a consumer")
+	}
+	require.Equal(t, requestCount, service.dispatcherRequestInbox.Len())
+	for tableID := int64(1); tableID <= requestCount; tableID++ {
+		info, ok := service.dispatcherRequestInbox.Pop()
+		require.True(t, ok)
+		require.Equal(t, tableID, info.GetTableSpan().TableID)
+	}
+	require.Zero(t, service.dispatcherRequestInbox.Len())
 }
 
 func newChangefeedStatusForTest(t testing.TB, info DispatcherInfo) *changefeedStatus {

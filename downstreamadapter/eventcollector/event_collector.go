@@ -21,7 +21,6 @@ import (
 
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/downstreamadapter/dispatcher"
-	"github.com/pingcap/ticdc/eventpb"
 	"github.com/pingcap/ticdc/pkg/common"
 	appcontext "github.com/pingcap/ticdc/pkg/common/context"
 	"github.com/pingcap/ticdc/pkg/common/event"
@@ -455,61 +454,6 @@ func (c *EventCollector) processDSFeedback(ctx context.Context) error {
 					v.(*changefeedStat).memoryReleaseCount.Add(1)
 				}
 				log.Info("release dispatcher memory in redo DS", zap.Any("dispatcherID", feedback.Path))
-			}
-		}
-	}
-}
-
-func (c *EventCollector) sendDispatcherRequests(ctx context.Context) error {
-	for {
-		select {
-		case <-ctx.Done():
-			return context.Cause(ctx)
-		case req := <-c.dispatcherMessageChan.Out():
-			if req.Message.Type == messaging.TypeDispatcherRequest {
-				// Failed sends go back to the queue tail, so a REGISTER retry can
-				// arrive after REMOVE and recreate an abandoned broker registration.
-				// Recheck the session before every send: the dispatcher may have been
-				// removed or stopped using this broker while the request was queued.
-				// Keep REMOVE requests even after local state disappears so remote
-				// cleanup can finish. Compact the batch in place, filtering only REGISTER.
-				requests := req.Message.Message[:0]
-				for _, payload := range req.Message.Message {
-					request := payload.(*messaging.DispatcherRequest)
-					if request.GetActionType() == eventpb.ActionType_ACTION_TYPE_REGISTER {
-						stat := c.getDispatcherStatByID(request.GetID())
-						if stat == nil || !stat.session.connState.hasRegistration(req.Message.To, c.serverId) {
-							continue
-						}
-					}
-					requests = append(requests, payload)
-				}
-				req.Message.Message = requests
-				if len(requests) == 0 {
-					continue
-				}
-			}
-			err := c.mc.SendCommand(req.Message)
-			if err != nil {
-				sleepInterval := 10 * time.Millisecond
-				// if the error is Congested, sleep a larger interval
-				if appErr, ok := err.(errors.AppError); ok && appErr.Type == errors.ErrorTypeMessageCongested {
-					sleepInterval = 1 * time.Second
-				}
-				log.Info("failed to send dispatcher request message, try again later",
-					zap.String("message", req.Message.String()),
-					zap.Duration("sleepInterval", sleepInterval),
-					zap.Error(err))
-				if !req.decrAndCheckRetry() {
-					log.Warn("dispatcher request retry limit exceeded, dropping request",
-						zap.String("message", req.Message.String()))
-					continue
-				}
-				// Put the request back to the channel for later retry.
-				c.dispatcherMessageChan.In() <- req
-				// Sleep a short time to avoid too many requests in a short time.
-				// TODO: requests can to different EventService, so we should improve the logic here.
-				time.Sleep(sleepInterval)
 			}
 		}
 	}
