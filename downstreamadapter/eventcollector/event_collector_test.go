@@ -504,7 +504,7 @@ func newRemoveDispatcherRequestMessage(target node.ID, tableID int64) *messaging
 	return messaging.NewSingleTargetMessage(target, messaging.EventServiceTopic, request)
 }
 
-func TestPendingRegistrationRecoversAfterExpiry(t *testing.T) {
+func TestPendingRegistrationIgnoresInitialLocalRemoved(t *testing.T) {
 	c := &EventCollector{serverId: "local", dispatcherMessageChan: chann.NewAutoDrainChann[DispatcherMessage]()}
 	defer c.dispatcherMessageChan.CloseAndDrain()
 	target := &mockEventDispatcher{
@@ -516,14 +516,24 @@ func TestPendingRegistrationRecoversAfterExpiry(t *testing.T) {
 	stat.session.startLocalRegistration()
 	stat.startRemoteProbing([]string{"remote"})
 	readDispatcherRequests(t, c, 2)
-	for _, server := range []node.ID{"local", "remote"} {
-		response := commonEvent.NewDispatcherHeartbeatResponse()
-		response.Append(commonEvent.NewDispatcherState(target.id, commonEvent.DSStateRemoved))
-		message := messaging.NewSingleTargetMessage(c.serverId, messaging.EventCollectorTopic, response)
-		message.From = server
-		c.handleDispatcherHeartbeatResponse(message.From, response)
-		requireDispatcherRequests(t, readDispatcherRequests(t, c, 1), dispatcherRequestRecord{to: server, action: eventpb.ActionType_ACTION_TYPE_REGISTER})
-	}
+	response := commonEvent.NewDispatcherHeartbeatResponse()
+	response.Append(commonEvent.NewDispatcherState(target.id, commonEvent.DSStateRemoved))
+
+	// Initial local registration is non-droppable. Do not amplify it while the
+	// EventService bootstrap queue has not reached it yet.
+	c.handleDispatcherHeartbeatResponse("local", response)
+	requireNoDispatcherRequest(t, c)
+
+	// Remote probing still retries normally.
+	c.handleDispatcherHeartbeatResponse("remote", response)
+	requireDispatcherRequests(t, readDispatcherRequests(t, c, 1), dispatcherRequestRecord{to: "remote", action: eventpb.ActionType_ACTION_TYPE_REGISTER})
+
+	// Once the dispatcher has advanced beyond initialization, local Removed
+	// retains the normal recovery behavior.
+	stat.currentEpoch.Store(newDispatcherEpochState(1, 0, target.GetStartTs()))
+	c.handleDispatcherHeartbeatResponse("local", response)
+	requireDispatcherRequests(t, readDispatcherRequests(t, c, 1), dispatcherRequestRecord{to: "local", action: eventpb.ActionType_ACTION_TYPE_REGISTER})
+
 	stat.remove()
 	readDispatcherRequests(t, c, 2)
 	require.False(t, stat.session.retryCurrentRegistrationIfRemovedFrom("remote"))

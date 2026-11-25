@@ -471,6 +471,14 @@ func (c *EventCollector) handleDispatcherHeartbeatResponse(
 				continue
 			}
 			stat := v.(*dispatcherStat)
+			// The initial local REGISTER is non-droppable and remains queued until
+			// MessageCenter accepts it. While EventService is still working through a
+			// large bootstrap backlog, retrying it on every Removed heartbeat only
+			// creates duplicate REGISTER requests and can starve the RESET behind them.
+			// Keep normal recovery after initialization and remote probing unchanged.
+			if from == c.serverId && stat.loadCurrentEpochState().epoch == 0 {
+				continue
+			}
 			stat.session.retryCurrentRegistrationIfRemovedFrom(from)
 		}
 	}
